@@ -5,16 +5,25 @@ use serde::{Deserialize, Serialize};
 use std::cmp;
 use std::ops;
 
+/// Version lanes: `MAX_THREADS` rounded up to a whole 128-bit SIMD register
+/// (8 × u16), so `join` / `partial_cmp` / `ahead` compile to single vector
+/// ops instead of five-lane scalar loops. The padding lanes
+/// `MAX_THREADS..LANES` are structurally zero: every write goes through a
+/// `thread::Id` index (`< MAX_THREADS`) or `join` (lane-max of two zeros),
+/// so they are inert in every comparison and invisible to `versions()`.
+const LANES: usize = (MAX_THREADS + 7) & !7;
+
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
 #[cfg_attr(feature = "checkpoint", derive(Serialize, Deserialize))]
+#[repr(align(16))]
 pub(crate) struct VersionVec {
-    versions: [u16; MAX_THREADS],
+    versions: [u16; LANES],
 }
 
 impl VersionVec {
     pub(crate) fn new() -> VersionVec {
         VersionVec {
-            versions: [0; MAX_THREADS],
+            versions: [0; LANES],
         }
     }
 
@@ -22,7 +31,7 @@ impl VersionVec {
         &self,
         execution_id: execution::Id,
     ) -> impl Iterator<Item = (thread::Id, u16)> + '_ {
-        self.versions
+        self.versions[..MAX_THREADS]
             .iter()
             .enumerate()
             .map(move |(thread_id, &version)| (thread::Id::new(execution_id, thread_id), version))
@@ -33,20 +42,26 @@ impl VersionVec {
     }
 
     pub(crate) fn join(&mut self, other: &VersionVec) {
-        for (i, &version) in other.versions.iter().enumerate() {
-            self.versions[i] = cmp::max(self.versions[i], version);
+        for i in 0..LANES {
+            self.versions[i] = cmp::max(self.versions[i], other.versions[i]);
         }
     }
 
     /// Returns the thread ID, if any, that is ahead of the current version.
     pub(crate) fn ahead(&self, other: &VersionVec) -> Option<usize> {
-        for (i, &version) in other.versions.iter().enumerate() {
-            if self.versions[i] < version {
-                return Some(i);
-            }
+        // Branchless lane compare + first-set-bit, rather than an early-out
+        // loop, so the whole check is one vector op. Padding lanes are 0 on
+        // both sides and can never set a bit.
+        let mut mask = 0u32;
+        for i in 0..LANES {
+            mask |= ((self.versions[i] < other.versions[i]) as u32) << i;
         }
 
-        None
+        if mask == 0 {
+            None
+        } else {
+            Some(mask.trailing_zeros() as usize)
+        }
     }
 }
 
@@ -54,20 +69,23 @@ impl cmp::PartialOrd for VersionVec {
     fn partial_cmp(&self, other: &VersionVec) -> Option<cmp::Ordering> {
         use cmp::Ordering::*;
 
-        let mut ret = Equal;
+        // Two vectorizable all-lane reductions instead of a stateful scalar
+        // scan: `self <= other` in every lane, and `self >= other` in every
+        // lane, decide the partial order exactly as the lane loop did.
+        let mut le = true;
+        let mut ge = true;
 
-        for i in 0..MAX_THREADS {
-            let a = self.versions[i];
-            let b = other.versions[i];
-            match a.cmp(&b) {
-                Equal => {}
-                Less if ret == Greater => return None,
-                Greater if ret == Less => return None,
-                ordering => ret = ordering,
-            }
+        for i in 0..LANES {
+            le &= self.versions[i] <= other.versions[i];
+            ge &= self.versions[i] >= other.versions[i];
         }
 
-        Some(ret)
+        match (le, ge) {
+            (true, true) => Some(Equal),
+            (true, false) => Some(Less),
+            (false, true) => Some(Greater),
+            (false, false) => None,
+        }
     }
 }
 

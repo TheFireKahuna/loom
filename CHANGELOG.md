@@ -21,6 +21,13 @@
    The runtime's internal atomic value representation was widened from
    `u64` to `u128` to model the full width losslessly.
 
+### Changed
+
+ - `VersionVec` is padded to a full SIMD register so its `join`,
+   `partial_cmp` and `ahead` lower to branchless, autovectorized lane
+   operations. Padding lanes are structurally zero and invisible to
+   `versions()`; exploration is unchanged.
+
 # 0.7.2
 
 This release bumps the MSRV to 1.65. (#332)
