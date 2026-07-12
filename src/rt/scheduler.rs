@@ -100,27 +100,48 @@ impl Scheduler {
         self.arm(0, Box::new(f), None);
         let mut used = 1;
 
-        loop {
-            if execution.threads.is_complete() {
-                // Every loom thread has terminated, so every armed
-                // coroutine has finished its closure and parked back at
-                // its recv point, ready for the next iteration.
-                return;
-            }
+        // The scoped-TLS state brackets the whole iteration, not each tick:
+        // set/unset plus a fresh `RefCell` per branch is pure overhead when
+        // the borrowed execution is the same one throughout. Inside the
+        // closure the execution is only reachable through `state` — the
+        // coroutines borrow it via `STATE` between resumes.
+        let mut queued_spawn = VecDeque::new();
+        let state = RefCell::new(State {
+            execution,
+            queued_spawn: &mut queued_spawn,
+        });
 
-            let active = execution.threads.active_id();
+        STATE.set(unsafe { transmute_lt(&state) }, || loop {
+            let active = {
+                let state = state.borrow();
 
-            let mut queued_spawn = Self::tick(&mut self.threads[active.as_usize()].gen, execution);
+                if state.execution.threads.is_complete() {
+                    // Every loom thread has terminated, so every armed
+                    // coroutine has finished its closure and parked back at
+                    // its recv point, ready for the next iteration.
+                    return;
+                }
 
-            while let Some(th) = queued_spawn.pop_front() {
+                state.execution.threads.active_id()
+            };
+
+            self.threads[active.as_usize()].gen.resume();
+
+            loop {
+                // Armed coroutines park at their recv point without running
+                // user code, so `arm` is safe under the live `STATE`.
+                let next = state.borrow_mut().queued_spawn.pop_front();
+
+                let Some(QueuedSpawn { f, stack_size }) = next else {
+                    break;
+                };
+
                 assert!(used < self.max_threads);
-
-                let QueuedSpawn { f, stack_size } = th;
 
                 self.arm(used, f, stack_size);
                 used += 1;
             }
-        }
+        });
     }
 
     /// Hand `f` to the pooled coroutine at `index` (loom thread id),
@@ -149,19 +170,6 @@ impl Scheduler {
         let gen = &mut self.threads[index].gen;
         gen.set_para(Some(f));
         gen.resume();
-    }
-
-    fn tick(thread: &mut Thread, execution: &mut Execution) -> VecDeque<QueuedSpawn> {
-        let mut queued_spawn = VecDeque::new();
-        let state = RefCell::new(State {
-            execution,
-            queued_spawn: &mut queued_spawn,
-        });
-
-        STATE.set(unsafe { transmute_lt(&state) }, || {
-            thread.resume();
-        });
-        queued_spawn
     }
 
     fn with_state<F, R>(f: F) -> R

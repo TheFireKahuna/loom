@@ -59,6 +59,10 @@
    exploration order. Measured 2.2–3.2× iterations/second on real
    3–4-thread models; exploration is unchanged.
 
+ - The scoped-TLS execution state is established once per iteration
+   instead of set/unset around every branch, and the per-tick `RefCell`
+   is removed. Exploration is unchanged.
+
 # 0.7.2
 
 This release bumps the MSRV to 1.65. (#332)
