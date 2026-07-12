@@ -36,6 +36,10 @@
    (`impl FnMut`) instead of `&mut dyn FnMut`, letting `happens_before`
    inline into the hottest loop. Exploration is unchanged.
 
+ - The atomic `State`'s store ring and per-thread access arrays are
+   boxed, shrinking every object-store `Entry` from 992 B to 272 B of
+   per-slot insert/clear/memmove traffic. Exploration is unchanged.
+
 # 0.7.2
 
 This release bumps the MSRV to 1.65. (#332)

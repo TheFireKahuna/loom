@@ -122,15 +122,21 @@ pub(super) struct State {
     /// peer's earlier plain load is never seen. The reorder DPOR owes for
     /// that conflict (the child prefix scheduled ahead of the peer's load)
     /// was then silently never explored.
-    last_access: [Option<Access>; MAX_THREADS],
+    ///
+    /// Boxed (with `last_non_load_access` and `stores`) to keep `State`
+    /// small: the object store's `Entry` enum is sized by its largest
+    /// variant, so an inline `State` (~1 KB) taxes every object slot's
+    /// insert/clear/memmove with its full width. The indirection is paid
+    /// once per atomic per iteration; the slot traffic is per operation.
+    last_access: Box<[Option<Access>; MAX_THREADS]>,
 
     /// Last time each thread accessed the atomic with a store or rmw
     /// operation.
-    last_non_load_access: [Option<Access>; MAX_THREADS],
+    last_non_load_access: Box<[Option<Access>; MAX_THREADS]>,
 
     /// Currently tracked stored values. This is the `MAX_ATOMIC_HISTORY` most
     /// recent stores to the atomic cell in loom execution order.
-    stores: [Store; MAX_ATOMIC_HISTORY],
+    stores: Box<[Store; MAX_ATOMIC_HISTORY]>,
 
     /// The total number of stores to the cell.
     cnt: u16,
@@ -857,7 +863,7 @@ impl State {
         action: Action,
         mut f: impl FnMut(&'a Access),
     ) {
-        let slots = match action {
+        let slots: &[Option<Access>; MAX_THREADS] = match action {
             Action::Load => &self.last_non_load_access,
             _ => &self.last_access,
         };
