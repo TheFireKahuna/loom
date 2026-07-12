@@ -9,6 +9,24 @@ use std::collections::VecDeque;
 
 pub(crate) struct Scheduler {
     max_threads: usize,
+
+    /// Coroutines pooled across iterations, indexed by loom thread id.
+    ///
+    /// After an iteration's closure returns, its coroutine parks back at
+    /// the recv point (`yield_`) and the next iteration re-arms it with a
+    /// fresh closure via `set_para`, so the per-iteration cost is a
+    /// context switch instead of a stack mmap/munmap plus `done!()`'s
+    /// panic-driven unwind. Termination happens in `Drop`.
+    threads: Vec<PooledThread>,
+}
+
+struct PooledThread {
+    gen: Thread,
+
+    /// The stack size the coroutine was built with (`None` = generator
+    /// crate default). A spawn requesting a different size cannot reuse
+    /// this stack; the coroutine is retired and rebuilt.
+    stack_size: Option<usize>,
 }
 
 type Thread = Generator<'static, Option<Box<dyn FnOnce()>>, ()>;
@@ -32,6 +50,7 @@ impl Scheduler {
     pub(crate) fn new(capacity: usize) -> Scheduler {
         Scheduler {
             max_threads: capacity,
+            threads: Vec::with_capacity(capacity),
         }
     }
 
@@ -78,33 +97,58 @@ impl Scheduler {
     where
         F: FnOnce() + Send + 'static,
     {
-        let mut threads = Vec::new();
-        threads.push(spawn_thread(Box::new(f), None));
-        threads[0].resume();
+        self.arm(0, Box::new(f), None);
+        let mut used = 1;
 
         loop {
             if execution.threads.is_complete() {
-                for thread in &mut threads {
-                    thread.resume();
-                    assert!(thread.is_done());
-                }
+                // Every loom thread has terminated, so every armed
+                // coroutine has finished its closure and parked back at
+                // its recv point, ready for the next iteration.
                 return;
             }
 
             let active = execution.threads.active_id();
 
-            let mut queued_spawn = Self::tick(&mut threads[active.as_usize()], execution);
+            let mut queued_spawn = Self::tick(&mut self.threads[active.as_usize()].gen, execution);
 
             while let Some(th) = queued_spawn.pop_front() {
-                assert!(threads.len() < self.max_threads);
+                assert!(used < self.max_threads);
 
-                let thread_id = threads.len();
                 let QueuedSpawn { f, stack_size } = th;
 
-                threads.push(spawn_thread(f, stack_size));
-                threads[thread_id].resume();
+                self.arm(used, f, stack_size);
+                used += 1;
             }
         }
+    }
+
+    /// Hand `f` to the pooled coroutine at `index` (loom thread id),
+    /// building or rebuilding the coroutine first if needed. On return
+    /// the coroutine is parked one `resume` away from entering `f`,
+    /// exactly like a freshly spawned thread.
+    fn arm(&mut self, index: usize, f: Box<dyn FnOnce()>, stack_size: Option<usize>) {
+        match self.threads.get_mut(index) {
+            Some(slot) if slot.stack_size == stack_size => {}
+            Some(slot) => {
+                retire(&mut slot.gen);
+                *slot = PooledThread {
+                    gen: park_thread(stack_size),
+                    stack_size,
+                };
+            }
+            None => {
+                debug_assert_eq!(index, self.threads.len(), "[loom internal bug]");
+                self.threads.push(PooledThread {
+                    gen: park_thread(stack_size),
+                    stack_size,
+                });
+            }
+        }
+
+        let gen = &mut self.threads[index].gen;
+        gen.set_para(Some(f));
+        gen.resume();
     }
 
     fn tick(thread: &mut Thread, execution: &mut Execution) -> VecDeque<QueuedSpawn> {
@@ -132,8 +176,26 @@ impl Scheduler {
     }
 }
 
-fn spawn_thread(f: Box<dyn FnOnce()>, stack_size: Option<usize>) -> Thread {
-    let body = move || {
+impl Drop for Scheduler {
+    fn drop(&mut self) {
+        // A panicking model unwinds through `run` with coroutines still
+        // suspended mid-closure; resuming one during the unwind would
+        // re-enter the model outside an execution. Leave them to the
+        // generator crate's own panicking-aware `Drop`.
+        if std::thread::panicking() {
+            return;
+        }
+
+        for th in &mut self.threads {
+            retire(&mut th.gen);
+        }
+    }
+}
+
+/// Build a coroutine and run it to its recv point, where it waits for
+/// `arm` to hand it a closure.
+fn park_thread(stack_size: Option<usize>) -> Thread {
+    let body = || {
         loop {
             let f: Option<Option<Box<dyn FnOnce()>>> = generator::yield_(());
 
@@ -141,19 +203,25 @@ fn spawn_thread(f: Box<dyn FnOnce()>, stack_size: Option<usize>) -> Thread {
                 generator::yield_with(());
                 f.unwrap()();
             } else {
-                break;
+                // Retired: a plain return completes the coroutine
+                // without `done!()`'s panic-driven stack unwind.
+                return;
             }
         }
-
-        generator::done!();
     };
     let mut g = match stack_size {
         Some(stack_size) => Gn::new_opt(stack_size, body),
         None => Gn::new(body),
     };
     g.resume();
-    g.set_para(Some(f));
     g
+}
+
+/// Resume the parked coroutine with no closure: its recv loop sees
+/// `None` and returns, completing the generator.
+fn retire(gen: &mut Thread) {
+    gen.resume();
+    assert!(gen.is_done(), "[loom internal bug] coroutine still live");
 }
 
 unsafe fn transmute_lt<'a, 'b>(state: &'a RefCell<State<'b>>) -> &'a RefCell<State<'static>> {

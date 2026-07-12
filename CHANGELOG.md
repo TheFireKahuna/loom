@@ -51,6 +51,14 @@
    inserted; exploration is bit-identical. Measured +10–30% iters/s on
    contended multi-thread models.
 
+ - The scheduler pools coroutines across iterations and retires them by
+   normal return instead of `generator::done!()`. This removes the
+   per-iteration stack mmap/munmap and the panic-driven unwind on every
+   thread completion (together the majority of wall time on long
+   explorations, measured on macOS/aarch64) without touching
+   exploration order. Measured 2.2–3.2× iterations/second on real
+   3–4-thread models; exploration is unchanged.
+
 # 0.7.2
 
 This release bumps the MSRV to 1.65. (#332)
