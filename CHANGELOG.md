@@ -63,6 +63,10 @@
    instead of set/unset around every branch, and the per-tick `RefCell`
    is removed. Exploration is unchanged.
 
+ - Thread switches skip the tracing dispatcher TLS lookup when both
+   spans are disabled (always, when no subscriber is installed).
+   Exploration is unchanged.
+
 # 0.7.2
 
 This release bumps the MSRV to 1.65. (#332)

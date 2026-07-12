@@ -260,15 +260,22 @@ impl Set {
     }
 
     pub(crate) fn set_active(&mut self, id: Option<Id>) {
-        tracing::dispatcher::get_default(|subscriber| {
-            if let Some(span_id) = self.active().span.id() {
-                subscriber.exit(&span_id)
-            }
+        // Disabled spans (no subscriber) have no id; skip the dispatcher's
+        // TLS lookup entirely rather than paying it on every branch.
+        let exit_span = self.active().span.id();
+        let enter_span = id.and_then(|id| self.threads.get(id.id)?.span.id());
 
-            if let Some(span_id) = id.and_then(|id| self.threads.get(id.id)?.span.id()) {
-                subscriber.enter(&span_id);
-            }
-        });
+        if exit_span.is_some() || enter_span.is_some() {
+            tracing::dispatcher::get_default(|subscriber| {
+                if let Some(span_id) = exit_span.clone() {
+                    subscriber.exit(&span_id)
+                }
+
+                if let Some(span_id) = enter_span.clone() {
+                    subscriber.enter(&span_id);
+                }
+            });
+        }
         self.active = id.map(Id::as_usize);
     }
 
