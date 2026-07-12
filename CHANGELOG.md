@@ -32,6 +32,10 @@
    zeroed default slots past the store count (a provably
    side-effect-free no-op elision). Exploration is unchanged.
 
+ - The DPOR dependent-access scan is generic over its visitor
+   (`impl FnMut`) instead of `&mut dyn FnMut`, letting `happens_before`
+   inline into the hottest loop. Exploration is unchanged.
+
 # 0.7.2
 
 This release bumps the MSRV to 1.65. (#332)

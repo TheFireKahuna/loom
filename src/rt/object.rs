@@ -214,11 +214,7 @@ impl Store {
     /// a single shared slot lets a thread's own access shadow a peer's,
     /// silently dropping the DPOR reorder owed to that conflict); the other
     /// object types keep their single last-access slot and yield it here.
-    pub(super) fn for_each_dependent_access(
-        &self,
-        operation: Operation,
-        f: &mut dyn FnMut(&Access),
-    ) {
+    pub(super) fn for_each_dependent_access(&self, operation: Operation, mut f: impl FnMut(&Access)) {
         match &self.entries[operation.obj.index] {
             Entry::Atomic(entry) => entry.for_each_dependent_access(operation.action.into(), f),
             Entry::Arc(entry) => {

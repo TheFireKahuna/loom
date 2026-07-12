@@ -152,7 +152,7 @@ impl Execution {
                 // Every dependent access that is concurrent with this
                 // operation (not ordered before it) is a race DPOR must
                 // explore both ways: track a backtrack point at each.
-                objects.for_each_dependent_access(operation, &mut |access| {
+                objects.for_each_dependent_access(operation, |access| {
                     if access.happens_before(&th.dpor_vv) {
                         // The previous access happened before this access,
                         // thus there is no race.
@@ -239,7 +239,7 @@ impl Execution {
             // recent one overall.
             {
                 let dpor_vv = &mut threads.active_mut().dpor_vv;
-                self.objects.for_each_dependent_access(operation, &mut |access| {
+                self.objects.for_each_dependent_access(operation, |access| {
                     dpor_vv.join(access.version());
                 });
             }

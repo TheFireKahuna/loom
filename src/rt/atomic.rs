@@ -855,7 +855,7 @@ impl State {
     pub(super) fn for_each_dependent_access<'a>(
         &'a self,
         action: Action,
-        f: &mut dyn FnMut(&'a Access),
+        mut f: impl FnMut(&'a Access),
     ) {
         let slots = match action {
             Action::Load => &self.last_non_load_access,
