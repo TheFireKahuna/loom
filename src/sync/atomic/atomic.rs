@@ -28,9 +28,29 @@ where
         self.state.load(location!(), order)
     }
 
+    /// Sub-word load: reads only the bits under `mask` (other bits zero). The
+    /// masked lane is independently coherent, so this may return a stale lane
+    /// value while another lane is seen fresh — the fidelity a single welded
+    /// ring cannot express. A load spanning more than one region still returns
+    /// a single consistent (non-torn) snapshot.
+    #[track_caller]
+    pub(crate) fn load_masked(&self, mask: T, order: Ordering) -> T {
+        T::from_u128(self.state.load_masked(location!(), mask.into_u128(), order))
+    }
+
     #[track_caller]
     pub(crate) fn store(&self, value: T, order: Ordering) {
         self.state.store(location!(), value, order)
+    }
+
+    /// Sub-word store: writes only the bits under `mask`, leaving the rest of
+    /// the cell untouched. Models an aligned lane store inside a wider
+    /// single-copy-atomic cell (spec carve-out #5) — a *weak* store to that
+    /// lane, independently coherent from the other lanes.
+    #[track_caller]
+    pub(crate) fn store_masked(&self, mask: T, value: T, order: Ordering) {
+        self.state
+            .store_masked(location!(), mask.into_u128(), value.into_u128(), order)
     }
 
     #[track_caller]
@@ -70,12 +90,28 @@ where
     /// these bits / write only these bits, preserving the rest verbatim" in
     /// `f`, and the whole operation is a single linearization point exactly
     /// like the hardware sub-word op it models.
+    /// Read-modify-write over only the bits under `mask` (one modelled step).
+    /// `f` receives the composed current value of the masked lane(s) — the
+    /// masked bits meaningful, the rest zero — and returns the new full value;
+    /// only the masked bits are written. The modelling primitive for a
+    /// *sub-word* RMW / masked CAS on a wider single-copy-atomic cell (spec
+    /// carve-out #5): the masked lane is independently coherent from the rest.
     #[track_caller]
-    pub(crate) fn rmw_conditional<F, E>(&self, success: Ordering, failure: Ordering, f: F) -> Result<T, E>
+    pub(crate) fn rmw_masked<F, E>(
+        &self,
+        mask: T,
+        success: Ordering,
+        failure: Ordering,
+        f: F,
+    ) -> Result<T, E>
     where
         F: FnOnce(T) -> Result<T, E>,
     {
-        self.try_rmw(success, failure, f)
+        self.state
+            .rmw_masked(location!(), mask.into_u128(), success, failure, |cur| {
+                f(T::from_u128(cur)).map(T::into_u128)
+            })
+            .map(T::from_u128)
     }
 
     #[track_caller]

@@ -54,10 +54,31 @@ macro_rules! atomic_int {
                 self.0.load(order)
             }
 
+            /// Sub-word load: reads only the bits under `mask` (other bits
+            /// zero). The masked lane is independently coherent — it may return
+            /// a stale lane value while another lane is seen fresh. Models an
+            /// aligned sub-word load inside a wider single-copy-atomic cell
+            /// (spec carve-out #5). A load spanning more than one region still
+            /// returns a single consistent (non-torn) snapshot.
+            #[track_caller]
+            pub fn load_masked(&self, mask: $int_type, order: Ordering) -> $int_type {
+                self.0.load_masked(mask, order)
+            }
+
             /// Stores a value into the atomic integer.
             #[track_caller]
             pub fn store(&self, val: $int_type, order: Ordering) {
                 self.0.store(val, order)
+            }
+
+            /// Sub-word store: writes only the bits under `mask`, leaving the
+            /// rest of the cell untouched (a *weak* store to that lane,
+            /// independently coherent from the other lanes). Models an aligned
+            /// sub-word store inside a wider single-copy-atomic cell (spec
+            /// carve-out #5).
+            #[track_caller]
+            pub fn store_masked(&self, mask: $int_type, val: $int_type, order: Ordering) {
+                self.0.store_masked(mask, val, order)
             }
 
             /// Stores a value into the atomic integer, returning the previous value.
@@ -149,22 +170,25 @@ macro_rules! atomic_int {
                 self.0.rmw(|v| v.min(val), order)
             }
 
-            /// Single-step read-modify-write with an arbitrary pure update
-            /// function, returning the previous value.
+            /// Single-step read-modify-write over only the bits under `mask`,
+            /// returning the previous value of those bits (other bits zero).
             ///
             /// Unlike [`Self::fetch_update`] (a load followed by a CAS — two
             /// modelled steps that can interleave), this is **one** modelled
-            /// atomic step reading the most recent value. It exists to model
-            /// *sub-word* atomic operations on a wider single-copy-atomic
-            /// cell (e.g. an aligned 4-byte store inside a 16-byte atomic —
-            /// spec carve-out #5): pass an `f` that rewrites only the target
-            /// lane and preserves every other bit verbatim.
+            /// atomic step reading the most recent value of the masked lane.
+            /// It models a *sub-word* RMW on a wider single-copy-atomic cell
+            /// (spec carve-out #5): the masked lane is independently coherent
+            /// from the rest of the cell. `f` receives the current value (only
+            /// the masked bits meaningful) and must depend only on those bits;
+            /// its result's masked bits are written.
             #[track_caller]
-            pub fn fetch_modify<F>(&self, f: F, order: Ordering) -> $int_type
+            pub fn fetch_modify<F>(&self, mask: $int_type, f: F, order: Ordering) -> $int_type
             where
                 F: FnOnce($int_type) -> $int_type,
             {
-                self.0.rmw(f, order)
+                self.0
+                    .rmw_masked::<_, ()>(mask, order, order, |v| Ok(f(v)))
+                    .unwrap()
             }
 
             /// Masked compare-exchange as **one** modelled atomic step: the
@@ -183,7 +207,7 @@ macro_rules! atomic_int {
                 success: Ordering,
                 failure: Ordering,
             ) -> Result<$int_type, $int_type> {
-                self.0.rmw_conditional(success, failure, |actual| {
+                self.0.rmw_masked(mask, success, failure, |actual| {
                     if actual & mask == current & mask {
                         Ok((actual & !mask) | (new & mask))
                     } else {
