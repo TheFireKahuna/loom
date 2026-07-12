@@ -41,6 +41,17 @@ impl VersionVec {
         self.versions[id.as_usize()] += 1;
     }
 
+    /// Read a single lane by raw index.
+    ///
+    /// Vector clocks are transitively closed, so for any operation `op`
+    /// stamped `(thread, tick)`, `v.lane(thread) >= tick` holds iff `v`
+    /// contains `op`'s *entire* causal snapshot — a one-lane read decides
+    /// full snapshot containment. `rt::atomic` uses this as its
+    /// modification-order marker test.
+    pub(crate) fn lane(&self, lane: usize) -> u16 {
+        self.versions[lane]
+    }
+
     pub(crate) fn join(&mut self, other: &VersionVec) {
         for i in 0..LANES {
             self.versions[i] = cmp::max(self.versions[i], other.versions[i]);

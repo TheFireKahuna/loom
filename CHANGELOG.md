@@ -2,6 +2,39 @@
 
 ### Fixed
 
+ - **RMW atomicity (C11 soundness, upstream-inherited):** an atomic
+   RMW's write must sit *immediately* after the store it read in the
+   cell's modification order — no other store may split the pair. The
+   CDSChecker port listed the rule in `rt/atomic.rs`'s module docs but
+   never implemented it: a plain store racing a committed
+   `compare_exchange` landed mo-*incomparable* to the CAS's write, so
+   the write survived as a permanently readable "zombie" candidate and
+   later loads (and RMWs) could observe values no real machine can
+   expose. Reproduces on upstream loom 0.7.2 (store 2 → spawned
+   `CAS(2→X)` → store 3 → join → final `Acquire` load returns `X`;
+   C11 forces 3). Fixed by recording, on every RMW write, the creation
+   stamp of the store it read, and closing every store's modification
+   order over the implication "mo-after the read ⇒ mo-after the write"
+   (`close_rmw_atomicity`, run at store creation and on load-coherence
+   joins, chased to fixpoint across RMW chains).
+ - Modification-order queries switched from whole-vector dominance
+   (`mo_a < mo_b`) to a single-lane creation-stamp marker
+   (`mo_before`): vector clocks are transitively closed, so
+   `b.modification_order[a.creator] >= a.tick` decides "`a` known
+   mo-before `b`" exactly, subsumes dominance, additionally catches
+   causality-only ancestry (a store whose creator heard of `a` without
+   reading it, while `a`'s vector had grown through coherence joins the
+   descendant never saw), and retires the known-flaky
+   `assert_ne!(mo_i, mo_j)` in the match loops ("TODO: this sometimes
+   fails"). Write-write coherence now also joins the vectors of
+   causality-ancestor stores at store creation, keeping recorded
+   ancestry transitive so the closure and marker compose.
+   `tests/atomic_rmw_mo.rs` pins both directions: the forbidden finals
+   are unreachable, and an exact-set coverage test proves the legal
+   weak outcomes (a store landing mo-after a concurrent RMW's write, a
+   store landing between two RMW pairs of a chain) are still all
+   explored — no false negatives introduced. The schedules the fix
+   prunes were exploring C11-impossible worlds.
  - DPOR dependent accesses are tracked per thread on atomic cells.
    Objects previously kept a single last-access slot, so a thread's own
    leading load overwrote the record of a peer's access and its

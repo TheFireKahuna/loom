@@ -37,6 +37,38 @@
 //!
 //! - RMW Atomicity:
 //!
+//!   An RMW's write is *immediately* after the store it read in modification
+//!   order — no other store may sit between them. Two obligations follow:
+//!
+//!   1. The RMW may only read a modification-order-maximal store
+//!      (`match_rmw_to_stores`).
+//!   2. Any store that is modification-order-after the RMW's read store is
+//!      modification-order-after the RMW's write. Each RMW write records the
+//!      identity of the store it read (`Store::rmw_read`), and every time a
+//!      store's `modification_order` is (re)computed — at creation and on
+//!      every load-coherence join — `close_rmw_atomicity` runs the
+//!      implication to fixpoint. Without this closure, a plain store racing
+//!      a committed RMW lands mo-*incomparable* to the RMW's write, and the
+//!      write survives as a permanently readable "zombie" candidate that no
+//!      real machine can still expose (C11 forces it mo-before the racing
+//!      store).
+//!
+//! # Modification-order representation
+//!
+//! `Store::modification_order` is a join of genuine causality snapshots:
+//! the storing thread's causality and the vectors of stores known mo-before
+//! it. Because vector clocks are transitively closed, "store `a` is known
+//! mo-before
+//! store `b`" is decided by the single-lane marker test
+//! `b.modification_order[a.creator] >= a.tick` (`mo_before`): the lane can
+//! only reach `a`'s creation tick by having joined a snapshot that causally
+//! contains `a`'s creation, and every such join site corresponds to a real
+//! C11 mo edge. This subsumes the old whole-vector dominance comparison
+//! (`mo_a < mo_b` implies the marker fires, never the reverse) and
+//! additionally catches causality-only ancestry — a store whose *creator*
+//! transitively heard of `a` without ever reading it — which dominance
+//! missed whenever `a`'s vector had grown through coherence joins the
+//! descendant never saw.
 //!
 //! # Fence modification order implications (figure 9)
 //!
@@ -162,9 +194,25 @@ struct Store {
     /// The causality of the thread when it stores the value.
     happens_before: VersionVec,
 
-    /// Tracks the modification order. Order is tracked as a partially-ordered
-    /// set.
+    /// Tracks the modification order: a join of the causality snapshots of
+    /// this store and every store known to be modification-order-before it.
+    /// Order is queried through the single-lane marker test (`mo_before`) —
+    /// see the module docs.
     modification_order: VersionVec,
+
+    /// Absolute store count at creation (`State::cnt`); identifies the store
+    /// across ring eviction within one execution.
+    id: u16,
+
+    /// Lane index of the storing thread. `(creator, tick())` is the store's
+    /// unique creation stamp — the coordinate the marker test reads.
+    creator: usize,
+
+    /// When this store is the write half of an RMW, the creation stamp of
+    /// the store the RMW read. Snapshotted (not a slot index) so the
+    /// atomicity closure keeps working after the read store is evicted from
+    /// the ring.
+    rmw_read: Option<RmwRead>,
 
     /// Manages causality transfers between threads
     sync: Synchronize,
@@ -174,6 +222,41 @@ struct Store {
 
     /// True when the store was done with `SeqCst` ordering
     seq_cst: bool,
+}
+
+/// Creation stamp of the store an RMW write read — the persistent record of
+/// the "nothing may split this pair" obligation.
+#[derive(Debug, Copy, Clone)]
+struct RmwRead {
+    /// `Store::id` of the read store, to exclude the read store itself from
+    /// the closure (it is mo-*before* its own RMW successor).
+    read_id: u16,
+
+    /// `Store::creator` of the read store.
+    creator: usize,
+
+    /// `Store::tick()` of the read store.
+    tick: u16,
+}
+
+impl Store {
+    /// The creating thread's clock component at creation — with `creator`,
+    /// the store's unique creation stamp.
+    fn tick(&self) -> u16 {
+        self.happens_before.lane(self.creator)
+    }
+}
+
+/// True when store `a` is known modification-order-before store `b`.
+///
+/// Single-lane marker test: `b`'s modification order joins only genuine
+/// causality snapshots, each joined along a real mo edge, so its `a.creator`
+/// lane reaches `a`'s creation tick iff some mo-ancestor of `b` (or `b`'s own
+/// creation) causally contains `a`'s creation — a real C11 mo edge in every
+/// case. Strictly more complete than whole-vector dominance and immune to
+/// the "vectors grew apart after the join" imprecision (see module docs).
+fn mo_before(a: &Store, b: &Store) -> bool {
+    a.id != b.id && b.modification_order.lane(a.creator) >= a.tick()
 }
 
 #[derive(Debug)]
@@ -487,6 +570,8 @@ impl State {
     ) {
         let index = index(self.cnt);
         let live = self.live_stores();
+        let id = self.cnt;
+        let creator = threads.active_id().as_usize();
 
         // Increment the count
         self.cnt += 1;
@@ -501,12 +586,27 @@ impl State {
 
         // Apply coherence rules
         for i in 0..live {
-            // READ-WRITE coherence
-            if self.stores[i].first_seen.is_seen_by_current(threads) {
-                let mo = self.stores[i].modification_order;
+            let store_i = &self.stores[i];
+
+            // READ-WRITE coherence: stores this thread has read are
+            // mo-before the new store.
+            //
+            // WRITE-WRITE coherence: stores in this thread's causality are
+            // mo-before it too. Their creation stamps are already inside
+            // `happens_before`, but their vectors carry mo edges (coherence
+            // and RMW-atomicity joins) the raw causality does not — joining
+            // them keeps known ancestry transitive.
+            if store_i.first_seen.is_seen_by_current(threads)
+                || happens_before.lane(store_i.creator) >= store_i.tick()
+            {
+                let mo = store_i.modification_order;
                 modification_order.join(&mo);
             }
         }
+
+        // RMW Atomicity: everything mo-after an RMW's read store is mo-after
+        // the RMW's write.
+        self.close_rmw_atomicity(&mut modification_order, id);
 
         sync.sync_store(threads, ordering);
 
@@ -518,6 +618,9 @@ impl State {
             value,
             happens_before,
             modification_order,
+            id,
+            creator,
+            rmw_read: None,
             sync,
             first_seen,
             seq_cst: is_seq_cst(ordering),
@@ -555,11 +658,25 @@ impl State {
                 // Perform load synchronization using the `success` ordering.
                 self.stores[index].sync.sync_load(threads, success);
 
+                // Capture the read store's creation stamp *before* the write
+                // half runs: if the ring is full and the read store is the
+                // oldest live store, the new store lands in its slot.
+                let rmw_read = RmwRead {
+                    read_id: self.stores[index].id,
+                    creator: self.stores[index].creator,
+                    tick: self.stores[index].tick(),
+                };
+
                 // Store the new value, initializing with the `sync` value from
                 // the load. This is our (hacky) way to establish a release
                 // sequence.
                 let sync = self.stores[index].sync;
                 self.store(threads, sync, next, success);
+
+                // RMW Atomicity: mark the write half with what it read, so
+                // every future store mo-after the read store gets closed to
+                // mo-after this write (`close_rmw_atomicity`).
+                self.stores[self::index(self.cnt - 1)].rmw_read = Some(rmw_read);
 
                 Ok(prev)
             }
@@ -587,6 +704,67 @@ impl State {
             if self.stores[i].happens_before < threads.active().causality {
                 let mo = self.stores[i].modification_order;
                 self.stores[index].modification_order.join(&mo);
+            }
+        }
+
+        // RMW Atomicity: the joins above may have taught the read store that
+        // it is mo-after some RMW's read store — close it to mo-after that
+        // RMW's write as well. (`VersionVec` is `Copy`; work on a scratch
+        // copy to keep the borrows disjoint.)
+        let self_id = self.stores[index].id;
+        let mut mo = self.stores[index].modification_order;
+        self.close_rmw_atomicity(&mut mo, self_id);
+        self.stores[index].modification_order = mo;
+    }
+
+    /// Run the RMW-atomicity implication to fixpoint on `mo`, the
+    /// modification order of the store identified by `self_id` (use the
+    /// about-to-be-created store's id at creation — it is not in the ring
+    /// yet, so nothing matches it).
+    ///
+    /// For every live RMW write `w` that read store `x`: if `mo` already
+    /// contains `x` (single-lane marker on `x`'s creation stamp) but not yet
+    /// `w`, then — because nothing may sit between `x` and `w` — the target
+    /// store is mo-after `w`; join `w`'s vector. Iterated because RMW writes
+    /// chain (`w` may itself be some other RMW's read store).
+    ///
+    /// Exclusions: `w` itself (a store is not mo-after itself), and the read
+    /// store `x` (it is mo-*before* its own RMW successor; without the
+    /// `read_id` check, `x`'s own vector trivially contains its own stamp
+    /// and the closure would wrongly order `x` after `w`).
+    fn close_rmw_atomicity(&self, mo: &mut VersionVec, self_id: u16) {
+        let live = self.live_stores();
+
+        loop {
+            let mut changed = false;
+
+            for i in 0..live {
+                let w = &self.stores[i];
+
+                if w.id == self_id {
+                    continue;
+                }
+
+                let read = match w.rmw_read {
+                    Some(read) => read,
+                    None => continue,
+                };
+
+                if read.read_id == self_id {
+                    continue;
+                }
+
+                let after_read = mo.lane(read.creator) >= read.tick;
+                let after_write = mo.lane(w.creator) >= w.tick();
+
+                if after_read && !after_write {
+                    mo.join(&w.modification_order);
+                    changed = true;
+                }
+            }
+
+            if !changed {
+                return;
             }
         }
     }
@@ -766,13 +944,7 @@ impl State {
                     continue;
                 }
 
-                let mo_i = store_i.modification_order;
-                let mo_j = store_j.modification_order;
-
-                // TODO: this sometimes fails
-                assert_ne!(mo_i, mo_j);
-
-                if mo_i < mo_j {
+                if mo_before(store_i, store_j) {
                     if store_j.first_seen.is_seen_by_current(threads) {
                         // Store `j` is newer, so don't store the current one.
                         continue 'outer;
@@ -804,7 +976,11 @@ impl State {
         let live = self.live_stores();
 
         // Unlike `match_load_to_stores`, rmw operations only load "newest"
-        // stores, in terms of modification order.
+        // stores, in terms of modification order: an RMW's write is
+        // immediately mo-after its read, so a store with any known mo
+        // successor is not a legal read. Stores that remain mo-incomparable
+        // are all offered — the exploration branches over the possible total
+        // extensions.
         'outer: for i in 0..live {
             let store_i = &self.stores[i];
 
@@ -815,12 +991,7 @@ impl State {
                     continue;
                 }
 
-                let mo_i = store_i.modification_order;
-                let mo_j = store_j.modification_order;
-
-                assert_ne!(mo_i, mo_j);
-
-                if mo_i < mo_j {
+                if mo_before(store_i, store_j) {
                     // There is a newer store.
                     continue 'outer;
                 }
@@ -904,6 +1075,12 @@ impl Default for Store {
             value: 0,
             happens_before: VersionVec::new(),
             modification_order: VersionVec::new(),
+            // Dead-slot id: real ids are assigned from `cnt` starting at 0
+            // and the ring evicts old ids long before the counter could
+            // reach `u16::MAX`.
+            id: u16::MAX,
+            creator: 0,
+            rmw_read: None,
             sync: Synchronize::new(),
             first_seen: FirstSeen::new(),
             seq_cst: false,
