@@ -2,6 +2,13 @@
 
 ### Fixed
 
+ - DPOR dependent accesses are tracked per thread on atomic cells.
+   Objects previously kept a single last-access slot, so a thread's own
+   leading load overwrote the record of a peer's access and its
+   following CAS was only dependence-checked against itself — the
+   reorder DPOR owed the peer's conflicting load was silently never
+   explored (regression test: `tests/sc_repro.rs`; present upstream in
+   0.7.2 as well).
  - An acquire fence now synchronizes only with stores the fencing
    thread has read or created (the C11 rule), not with every store
    merely present in its causality through another thread's read; the

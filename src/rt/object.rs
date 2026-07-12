@@ -1,5 +1,5 @@
 use crate::rt;
-use crate::rt::{Access, Execution, Location, VersionVec};
+use crate::rt::{thread, Access, Execution, Location, VersionVec};
 
 use std::fmt;
 use std::marker::PhantomData;
@@ -208,15 +208,49 @@ impl<T> Store<T> {
 }
 
 impl Store {
-    pub(super) fn last_dependent_access(&self, operation: Operation) -> Option<&Access> {
+    /// Calls `f` with every dependent access of the operation.
+    ///
+    /// Atomics track dependent accesses per thread (see `atomic::State` —
+    /// a single shared slot lets a thread's own access shadow a peer's,
+    /// silently dropping the DPOR reorder owed to that conflict); the other
+    /// object types keep their single last-access slot and yield it here.
+    pub(super) fn for_each_dependent_access(
+        &self,
+        operation: Operation,
+        f: &mut dyn FnMut(&Access),
+    ) {
         match &self.entries[operation.obj.index] {
-            Entry::Arc(entry) => entry.last_dependent_access(operation.action.into()),
-            Entry::Atomic(entry) => entry.last_dependent_access(operation.action.into()),
-            Entry::Mutex(entry) => entry.last_dependent_access(),
-            Entry::Condvar(entry) => entry.last_dependent_access(),
-            Entry::Notify(entry) => entry.last_dependent_access(),
-            Entry::RwLock(entry) => entry.last_dependent_access(),
-            Entry::Channel(entry) => entry.last_dependent_access(operation.action.into()),
+            Entry::Atomic(entry) => entry.for_each_dependent_access(operation.action.into(), f),
+            Entry::Arc(entry) => {
+                if let Some(access) = entry.last_dependent_access(operation.action.into()) {
+                    f(access);
+                }
+            }
+            Entry::Mutex(entry) => {
+                if let Some(access) = entry.last_dependent_access() {
+                    f(access);
+                }
+            }
+            Entry::Condvar(entry) => {
+                if let Some(access) = entry.last_dependent_access() {
+                    f(access);
+                }
+            }
+            Entry::Notify(entry) => {
+                if let Some(access) = entry.last_dependent_access() {
+                    f(access);
+                }
+            }
+            Entry::RwLock(entry) => {
+                if let Some(access) = entry.last_dependent_access() {
+                    f(access);
+                }
+            }
+            Entry::Channel(entry) => {
+                if let Some(access) = entry.last_dependent_access(operation.action.into()) {
+                    f(access);
+                }
+            }
             obj => panic!(
                 "object is not branchable {:?}; ref = {:?}",
                 obj, operation.obj
@@ -227,13 +261,14 @@ impl Store {
     pub(super) fn set_last_access(
         &mut self,
         operation: Operation,
+        thread_id: thread::Id,
         path_id: usize,
         dpor_vv: &VersionVec,
     ) {
         match &mut self.entries[operation.obj.index] {
             Entry::Arc(entry) => entry.set_last_access(operation.action.into(), path_id, dpor_vv),
             Entry::Atomic(entry) => {
-                entry.set_last_access(operation.action.into(), path_id, dpor_vv)
+                entry.set_last_access(operation.action.into(), thread_id, path_id, dpor_vv)
             }
             Entry::Mutex(entry) => entry.set_last_access(path_id, dpor_vv),
             Entry::Condvar(entry) => entry.set_last_access(path_id, dpor_vv),

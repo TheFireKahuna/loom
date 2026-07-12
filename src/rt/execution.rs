@@ -139,24 +139,29 @@ impl Execution {
 
         let curr_thread = self.threads.active_id();
 
-        for (th_id, th) in self.threads.iter() {
-            let operation = match th.operation {
-                Some(operation) => operation,
-                None => continue,
-            };
+        {
+            let objects = &self.objects;
+            let path = &mut self.path;
 
-            if let Some(access) = self.objects.last_dependent_access(operation) {
-                if access.happens_before(&th.dpor_vv) {
-                    // The previous access happened before this access, thus
-                    // there is no race.
-                    continue;
-                }
+            for (th_id, th) in self.threads.iter() {
+                let operation = match th.operation {
+                    Some(operation) => operation,
+                    None => continue,
+                };
 
-                // Get the point to backtrack to
-                let point = access.path_id();
+                // Every dependent access that is concurrent with this
+                // operation (not ordered before it) is a race DPOR must
+                // explore both ways: track a backtrack point at each.
+                objects.for_each_dependent_access(operation, &mut |access| {
+                    if access.happens_before(&th.dpor_vv) {
+                        // The previous access happened before this access,
+                        // thus there is no race.
+                        return;
+                    }
 
-                // Track backtracking point
-                self.path.backtrack(point, th_id);
+                    // Track backtracking point
+                    path.backtrack(access.path_id(), th_id);
+                });
             }
         }
 
@@ -229,14 +234,20 @@ impl Execution {
             let threads = &mut self.threads;
             let th_id = threads.active_id();
 
-            if let Some(access) = self.objects.last_dependent_access(operation) {
-                threads.active_mut().dpor_vv.join(access.version());
+            // The DPOR clock must dominate every conflicting predecessor,
+            // i.e. all threads' dependent accesses, not just the most
+            // recent one overall.
+            {
+                let dpor_vv = &mut threads.active_mut().dpor_vv;
+                self.objects.for_each_dependent_access(operation, &mut |access| {
+                    dpor_vv.join(access.version());
+                });
             }
 
             threads.active_mut().dpor_vv[th_id] += 1;
 
             self.objects
-                .set_last_access(operation, path_id, &threads.active().dpor_vv);
+                .set_last_access(operation, th_id, path_id, &threads.active().dpor_vv);
         }
 
         // Reactivate yielded threads, but only if the current active thread is

@@ -111,12 +111,22 @@ pub(super) struct State {
     /// access to the cell.
     is_mutating: bool,
 
-    /// Last time the atomic was accessed. This tracks the dependent access for
-    /// the DPOR algorithm.
-    last_access: Option<Access>,
+    /// Last time each thread accessed the atomic. This tracks the dependent
+    /// accesses for the DPOR algorithm.
+    ///
+    /// Per-thread, not a single shared slot (fork fix): with one slot, a
+    /// thread's own access overwrites the record of every peer's access — a
+    /// spawned thread whose prefix is `load; compare_exchange` records its
+    /// own load as the cell's last access, so its CAS is only ever checked
+    /// against that (trivially happens-before) and the conflict with a
+    /// peer's earlier plain load is never seen. The reorder DPOR owes for
+    /// that conflict (the child prefix scheduled ahead of the peer's load)
+    /// was then silently never explored.
+    last_access: [Option<Access>; MAX_THREADS],
 
-    /// Last time the atomic was accessed for a store or rmw operation.
-    last_non_load_access: Option<Access>,
+    /// Last time each thread accessed the atomic with a store or rmw
+    /// operation.
+    last_non_load_access: [Option<Access>; MAX_THREADS],
 
     /// Currently tracked stored values. This is the `MAX_ATOMIC_HISTORY` most
     /// recent stores to the atomic cell in loom execution order.
@@ -420,8 +430,8 @@ impl State {
             unsync_mut_at: VersionVec::new(),
             unsync_mut_locations: LocationSet::new(),
             is_mutating: false,
-            last_access: None,
-            last_non_load_access: None,
+            last_access: Default::default(),
+            last_non_load_access: Default::default(),
             stores: Default::default(),
             cnt: 0,
         };
@@ -834,24 +844,45 @@ impl State {
         one.iter_mut().chain(two.iter_mut())
     }
 
-    /// Returns the last dependent access
-    pub(super) fn last_dependent_access(&self, action: Action) -> Option<&Access> {
-        match action {
-            Action::Load => self.last_non_load_access.as_ref(),
-            _ => self.last_access.as_ref(),
+    /// Calls `f` with every thread's last dependent access.
+    ///
+    /// A load depends on each thread's last store/rmw; a store/rmw depends on
+    /// each thread's last access of any kind. Accesses by the querying thread
+    /// itself are included — they are program-ordered before the current
+    /// operation, so the caller's happens-before check filters them.
+    pub(super) fn for_each_dependent_access<'a>(
+        &'a self,
+        action: Action,
+        f: &mut dyn FnMut(&'a Access),
+    ) {
+        let slots = match action {
+            Action::Load => &self.last_non_load_access,
+            _ => &self.last_access,
+        };
+
+        for access in slots.iter().flatten() {
+            f(access);
         }
     }
 
-    /// Sets the last dependent access
-    pub(super) fn set_last_access(&mut self, action: Action, path_id: usize, version: &VersionVec) {
+    /// Sets the thread's last dependent access
+    pub(super) fn set_last_access(
+        &mut self,
+        action: Action,
+        thread_id: thread::Id,
+        path_id: usize,
+        version: &VersionVec,
+    ) {
+        let index = thread_id.as_usize();
+
         // Always set `last_access`
-        Access::set_or_create(&mut self.last_access, path_id, version);
+        Access::set_or_create(&mut self.last_access[index], path_id, version);
 
         match action {
             Action::Load => {}
             _ => {
                 // Stores / RMWs
-                Access::set_or_create(&mut self.last_non_load_access, path_id, version);
+                Access::set_or_create(&mut self.last_non_load_access[index], path_id, version);
             }
         }
     }
