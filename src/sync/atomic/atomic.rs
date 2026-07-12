@@ -62,6 +62,22 @@ where
         self.rmw(|_| val, order)
     }
 
+    /// Conditional read-modify-write: one modelled atomic step that applies
+    /// `f` to the most recent value and either commits its `Ok` result or
+    /// leaves the cell untouched on `Err`. This is the modelling primitive
+    /// for *sub-word* atomics on a wider cell (mixed-size access on one
+    /// 16-byte single-copy-atomic object): the caller expresses "compare only
+    /// these bits / write only these bits, preserving the rest verbatim" in
+    /// `f`, and the whole operation is a single linearization point exactly
+    /// like the hardware sub-word op it models.
+    #[track_caller]
+    pub(crate) fn rmw_conditional<F, E>(&self, success: Ordering, failure: Ordering, f: F) -> Result<T, E>
+    where
+        F: FnOnce(T) -> Result<T, E>,
+    {
+        self.try_rmw(success, failure, f)
+    }
+
     #[track_caller]
     pub(crate) fn compare_and_swap(&self, current: T, new: T, order: Ordering) -> T {
         use self::Ordering::*;

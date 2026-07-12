@@ -149,6 +149,49 @@ macro_rules! atomic_int {
                 self.0.rmw(|v| v.min(val), order)
             }
 
+            /// Single-step read-modify-write with an arbitrary pure update
+            /// function, returning the previous value.
+            ///
+            /// Unlike [`Self::fetch_update`] (a load followed by a CAS — two
+            /// modelled steps that can interleave), this is **one** modelled
+            /// atomic step reading the most recent value. It exists to model
+            /// *sub-word* atomic operations on a wider single-copy-atomic
+            /// cell (e.g. an aligned 4-byte store inside a 16-byte atomic —
+            /// spec carve-out #5): pass an `f` that rewrites only the target
+            /// lane and preserves every other bit verbatim.
+            #[track_caller]
+            pub fn fetch_modify<F>(&self, f: F, order: Ordering) -> $int_type
+            where
+                F: FnOnce($int_type) -> $int_type,
+            {
+                self.0.rmw(f, order)
+            }
+
+            /// Masked compare-exchange as **one** modelled atomic step: the
+            /// compare consults only the bits under `mask`, and on success
+            /// exactly those bits are replaced by `new`'s (all other bits
+            /// preserved verbatim from the value at the linearization
+            /// point). Models an aligned sub-word CAS inside a wider
+            /// single-copy-atomic cell (spec carve-out #5). Returns the full
+            /// previous value on both arms.
+            #[track_caller]
+            pub fn compare_exchange_masked(
+                &self,
+                mask: $int_type,
+                current: $int_type,
+                new: $int_type,
+                success: Ordering,
+                failure: Ordering,
+            ) -> Result<$int_type, $int_type> {
+                self.0.rmw_conditional(success, failure, |actual| {
+                    if actual & mask == current & mask {
+                        Ok((actual & !mask) | (new & mask))
+                    } else {
+                        Err(actual)
+                    }
+                })
+            }
+
             /// Fetches the value, and applies a function to it that returns an optional new value.
             /// Returns a [`Result`] of [`Ok`]`(previous_value)` if the function returned
             /// [`Some`]`(_)`, else [`Err`]`(previous_value)`.

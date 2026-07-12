@@ -76,6 +76,11 @@
    simulates atomics, so no hardware 128-bit atomic support is required).
    The runtime's internal atomic value representation was widened from
    `u64` to `u128` to model the full width losslessly.
+ - `fetch_modify` (a one-step RMW applying an arbitrary pure update) and
+   `compare_exchange_masked` (compare/replace only the bits under a
+   mask, preserving the rest at the linearization point), for modelling
+   aligned sub-word atomics that live inside a wider single-copy-atomic
+   cell as single modelled steps.
 
 ### Changed
 
