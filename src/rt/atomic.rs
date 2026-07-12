@@ -178,10 +178,19 @@ pub(crate) fn fence(ordering: Ordering) {
 fn fence_acq(execution: &mut Execution) {
     // Find all stores for all atomic objects and, if they have been read by
     // the current thread, establish an acquire synchronization.
+    //
+    // "Read by the current thread" is literal (C11 fence synchronization:
+    // some atomic operation *sequenced before this fence* must read the
+    // store) — a store that is merely in the thread's causality because some
+    // OTHER thread's relaxed read of it happens-before us does not qualify;
+    // syncing with those would over-approximate and hide real reorderings.
+    // A store this thread itself created also touches `first_seen`, which is
+    // harmless here: its release view is already contained in (or, for an
+    // RMW, legitimately acquired through) this thread's causality.
     for state in execution.objects.iter_mut::<State>() {
         // Iterate all the stores
         for store in state.stores_mut() {
-            if !store.first_seen.is_seen_by_current(&execution.threads) {
+            if !store.first_seen.is_touched_by(execution.threads.active_id()) {
                 continue;
             }
 
@@ -877,7 +886,18 @@ impl FirstSeen {
     }
 
     fn is_seen_by_current(&self, threads: &thread::Set) -> bool {
-        for (thread_id, version) in threads.active().causality.versions(threads.execution_id()) {
+        self.is_seen_in(&threads.active().causality, threads.execution_id())
+    }
+
+    /// True if the given thread has itself loaded from (or created) the
+    /// store, at any point.
+    fn is_touched_by(&self, thread_id: thread::Id) -> bool {
+        self.0[thread_id.as_usize()] != u16::MAX
+    }
+
+    /// True if some thread's first sight of the store is contained in `view`.
+    fn is_seen_in(&self, view: &VersionVec, execution_id: crate::rt::execution::Id) -> bool {
+        for (thread_id, version) in view.versions(execution_id) {
             match self.0[thread_id.as_usize()] {
                 u16::MAX => {}
                 v if v <= version => return true,

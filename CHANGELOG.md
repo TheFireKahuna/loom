@@ -1,5 +1,12 @@
 # Unreleased
 
+### Fixed
+
+ - An acquire fence now synchronizes only with stores the fencing
+   thread has read or created (the C11 rule), not with every store
+   merely present in its causality through another thread's read; the
+   old over-approximation could hide real reorderings.
+
 ### Added
 
  - Add `AtomicU128` and `AtomicI128`, available on every target (loom
