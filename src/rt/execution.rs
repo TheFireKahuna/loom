@@ -25,6 +25,11 @@ pub(crate) struct Execution {
 
     pub(crate) arc_objs: HashMap<*const (), std::sync::Arc<super::Arc>>,
 
+    /// The object whose access records the previous `schedule()` call
+    /// updated (via `set_last_access`), if any. This is what makes the
+    /// DPOR backtrack scan event-driven — see `schedule()`.
+    dpor_update: Option<object::Ref>,
+
     /// Maximum number of concurrent threads
     pub(super) max_threads: usize,
 
@@ -65,6 +70,7 @@ impl Execution {
             objects: object::Store::with_capacity(max_branches),
             raw_allocations: HashMap::new(),
             arc_objs: HashMap::new(),
+            dpor_update: None,
             max_threads,
             max_history: 7,
             location: false,
@@ -124,6 +130,8 @@ impl Execution {
             lazy_statics,
             raw_allocations,
             arc_objs,
+            // Object refs do not survive the iteration reset.
+            dpor_update: None,
             max_threads,
             max_history,
             location,
@@ -142,12 +150,33 @@ impl Execution {
         {
             let objects = &self.objects;
             let path = &mut self.path;
+            let dirty = self.dpor_update;
 
+            // Event-driven backtrack scan. A (pending op, object) pair can
+            // only produce a backtrack point it has not already produced
+            // when one of its inputs changed since the pair was last
+            // checked, and between two `schedule()` calls exactly three
+            // things change: the just-ran thread's pending operation (set
+            // immediately before this call), its `dpor_vv` (grown when the
+            // previous call activated it — and it is always `curr_thread`
+            // here), and the access records of the one object the previous
+            // call passed to `set_last_access` (`dirty`). Every other
+            // pair's check is a pure function of unchanged inputs whose
+            // marks were already inserted — `Path::backtrack` is
+            // idempotent and time-invariant within an iteration — so
+            // re-running it cannot alter exploration, only burn time.
+            // (A `dpor_vv` that grew can also *stop* producing a mark the
+            // stale inputs produced, but never start: version vectors only
+            // grow, so `happens_before` flips false→true only.)
             for (th_id, th) in self.threads.iter() {
                 let operation = match th.operation {
                     Some(operation) => operation,
                     None => continue,
                 };
+
+                if th_id != curr_thread && Some(operation.object()) != dirty {
+                    continue;
+                }
 
                 // Every dependent access that is concurrent with this
                 // operation (not ordered before it) is a race DPOR must
@@ -248,6 +277,13 @@ impl Execution {
 
             self.objects
                 .set_last_access(operation, th_id, path_id, &threads.active().dpor_vv);
+
+            // This is the only place access records change; the next
+            // `schedule()` call's backtrack scan re-examines exactly the
+            // pending operations targeting this object.
+            self.dpor_update = Some(operation.object());
+        } else {
+            self.dpor_update = None;
         }
 
         // Reactivate yielded threads, but only if the current active thread is

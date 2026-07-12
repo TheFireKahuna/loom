@@ -40,6 +40,17 @@
    boxed, shrinking every object-store `Entry` from 992 B to 272 B of
    per-slot insert/clear/memmove traffic. Exploration is unchanged.
 
+ - DPOR backtrack insertion is event-driven: `schedule()` no longer
+   re-checks every thread's pending operation against its object's
+   access records at every branch. Between two schedules only three
+   inputs change — the just-ran thread's pending op, its `dpor_vv`,
+   and the access records of the one object recorded by the previous
+   schedule — so only the just-ran thread and pending ops targeting
+   that object are re-examined. Every skipped check is a pure replay of
+   unchanged inputs whose idempotent backtrack marks were already
+   inserted; exploration is bit-identical. Measured +10–30% iters/s on
+   contended multi-thread models.
+
 # 0.7.2
 
 This release bumps the MSRV to 1.65. (#332)
