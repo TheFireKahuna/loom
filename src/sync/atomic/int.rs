@@ -195,3 +195,10 @@ atomic_int!(AtomicU64, u64);
 
 #[cfg(target_has_atomic = "64")]
 atomic_int!(AtomicI64, i64);
+
+// The 128-bit atomics are provided unconditionally: loom simulates atomic
+// operations, so no hardware 128-bit atomic support (`target_has_atomic =
+// "128"`) is required to model them.
+atomic_int!(AtomicU128, u128);
+
+atomic_int!(AtomicI128, i128);

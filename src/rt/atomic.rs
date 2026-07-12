@@ -140,8 +140,8 @@ pub(super) enum Action {
 
 #[derive(Debug)]
 struct Store {
-    /// The stored value. All atomic types can be converted to `u64`.
-    value: u64,
+    /// The stored value. All atomic types can be converted to `u128`.
+    value: u128,
 
     /// The causality of the thread when it stores the value.
     happens_before: VersionVec,
@@ -212,7 +212,7 @@ impl<T: Numeric> Atomic<T> {
     /// Create a new, atomic cell initialized with the provided value
     pub(crate) fn new(value: T, location: Location) -> Atomic<T> {
         rt::execution(|execution| {
-            let state = State::new(&mut execution.threads, value.into_u64(), location);
+            let state = State::new(&mut execution.threads, value.into_u128(), location);
             let state = execution.objects.insert(state);
 
             trace!(?state, "Atomic::new");
@@ -245,7 +245,7 @@ impl<T: Numeric> Atomic<T> {
 
             trace!(state = ?self.state, ?ordering, "Atomic::load");
 
-            T::from_u64(state.load(&mut execution.threads, index, location, ordering))
+            T::from_u128(state.load(&mut execution.threads, index, location, ordering))
         })
     }
 
@@ -265,7 +265,7 @@ impl<T: Numeric> Atomic<T> {
 
             // Return the value
             let index = index(state.cnt - 1);
-            T::from_u64(state.stores[index].value)
+            T::from_u128(state.stores[index].value)
         })
     }
 
@@ -288,7 +288,7 @@ impl<T: Numeric> Atomic<T> {
             state.store(
                 &mut execution.threads,
                 Synchronize::new(),
-                val.into_u64(),
+                val.into_u128(),
                 ordering,
             );
         })
@@ -329,9 +329,9 @@ impl<T: Numeric> Atomic<T> {
                     location,
                     success,
                     failure,
-                    |num| f(T::from_u64(num)).map(T::into_u64),
+                    |num| f(T::from_u128(num)).map(T::into_u128),
                 )
-                .map(T::from_u64)
+                .map(T::from_u128)
         })
     }
 
@@ -353,7 +353,7 @@ impl<T: Numeric> Atomic<T> {
 
             // Return the value of the most recent store
             let index = index(state.cnt - 1);
-            T::from_u64(state.stores[index].value)
+            T::from_u128(state.stores[index].value)
         });
 
         struct Reset<T: Numeric>(T, object::Ref<State>);
@@ -370,7 +370,7 @@ impl<T: Numeric> Atomic<T> {
                     // The value may have been mutated, so it must be placed
                     // back.
                     let index = index(state.cnt - 1);
-                    state.stores[index].value = T::into_u64(self.0);
+                    state.stores[index].value = T::into_u128(self.0);
 
                     if !std::thread::panicking() {
                         state.track_unsync_mut(&execution.threads);
@@ -399,7 +399,7 @@ impl<T: Numeric> Atomic<T> {
 // ===== impl State =====
 
 impl State {
-    fn new(threads: &mut thread::Set, value: u64, location: Location) -> State {
+    fn new(threads: &mut thread::Set, value: u128, location: Location) -> State {
         let mut state = State {
             created_location: location,
             loaded_at: VersionVec::new(),
@@ -438,7 +438,7 @@ impl State {
         index: usize,
         location: Location,
         ordering: Ordering,
-    ) -> u64 {
+    ) -> u128 {
         self.loaded_locations.track(location, threads);
         // Validate memory safety
         self.track_load(threads);
@@ -457,7 +457,7 @@ impl State {
         &mut self,
         threads: &mut thread::Set,
         mut sync: Synchronize,
-        value: u64,
+        value: u128,
         ordering: Ordering,
     ) {
         let index = index(self.cnt);
@@ -505,8 +505,8 @@ impl State {
         location: Location,
         success: Ordering,
         failure: Ordering,
-        f: impl FnOnce(u64) -> Result<u64, E>,
-    ) -> Result<u64, E> {
+        f: impl FnOnce(u128) -> Result<u128, E>,
+    ) -> Result<u128, E> {
         self.loaded_locations.track(location, threads);
 
         // Track the load is happening in order to ensure correct

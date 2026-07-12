@@ -1,3 +1,12 @@
+# Unreleased
+
+### Added
+
+ - Add `AtomicU128` and `AtomicI128`, available on every target (loom
+   simulates atomics, so no hardware 128-bit atomic support is required).
+   The runtime's internal atomic value representation was widened from
+   `u64` to `u128` to model the full width losslessly.
+
 # 0.7.2
 
 This release bumps the MSRV to 1.65. (#332)

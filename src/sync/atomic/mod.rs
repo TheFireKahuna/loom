@@ -14,6 +14,10 @@ pub use self::int::{AtomicU16, AtomicU32, AtomicU8, AtomicUsize};
 #[cfg(target_has_atomic = "64")]
 pub use self::int::{AtomicI64, AtomicU64};
 
+// Unlike `std`, the 128-bit atomics are available on every target: loom
+// simulates atomic operations, so hardware support is not required.
+pub use self::int::{AtomicI128, AtomicU128};
+
 mod ptr;
 pub use self::ptr::AtomicPtr;
 
