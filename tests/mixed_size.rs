@@ -20,7 +20,10 @@ use loom::sync::atomic::AtomicU128;
 use loom::thread;
 
 use std::collections::HashSet;
-use std::sync::atomic::Ordering::Relaxed;
+use std::sync::atomic::{
+    AtomicUsize,
+    Ordering::{Relaxed, SeqCst},
+};
 use std::sync::{Arc, Mutex};
 
 // Lane A = low 64 bits, lane B = high 64 bits.
@@ -234,6 +237,107 @@ fn nested_value_within_high() {
             assert!(value == 1 || value == 2, "torn HIGH CAS: {:?}", *seen);
         }
     }
+}
+
+/// The pruning must be **sound**: mask-filtering the dependence check must not
+/// let a thread's later access to one lane shadow its earlier access to
+/// another, or a peer op on the earlier lane is filtered out and the racing
+/// schedule is silently never explored. This is the cross-lane analog of
+/// `sc_repro.rs` (the DPOR shadowing hole).
+///
+/// A 2-thread race would not catch it — the reorder backtrack can re-anchor on
+/// the peer's (unshadowed) record. It needs three: thread A runs a lane-B CAS
+/// then a lane-A store (the shadower); thread C runs a competing lane-B CAS.
+/// A and C's CASes are the *only* lane-B ops, so the backtrack that schedules
+/// C's CAS ahead of A's can anchor only on A's lane-B record. If A's lane-A
+/// store shadowed it, that reorder is lost and C's CAS never wins — so the
+/// final value 2 becomes unreachable. RMWs (not plain loads) are essential:
+/// a CAS succeeds only on the true schedule order, not via stale-value
+/// branching. Per-region access records keep A's lane-B record alive, so both
+/// winners remain reachable. (Verified to FAIL when the shadow is injected.)
+#[test]
+fn pruning_does_not_shadow_across_lanes() {
+    let seen = Arc::new(Mutex::new(HashSet::new()));
+    let seen_ = seen.clone();
+    loom::model(move || {
+        let x = Arc::new(AtomicU128::new(0));
+
+        let a = {
+            let x = x.clone();
+            thread::spawn(move || {
+                // Lane-B CAS (the record that must not be shadowed) ...
+                let _ = x.compare_exchange_masked(LANE_B, 0, 1 << 64, SeqCst, SeqCst);
+                // ... then a lane-A store (the would-be shadower).
+                x.store_masked(LANE_A, 1, SeqCst);
+            })
+        };
+        let c = {
+            let x = x.clone();
+            thread::spawn(move || {
+                // Competing lane-B CAS; wins only if scheduled before A's.
+                let _ = x.compare_exchange_masked(LANE_B, 0, 2 << 64, SeqCst, SeqCst);
+            })
+        };
+
+        a.join().unwrap();
+        c.join().unwrap();
+        let b = (x.load(SeqCst) >> 64) as u64;
+        seen.lock().unwrap().insert(b);
+    });
+
+    let seen = seen_.lock().unwrap();
+    assert!(seen.contains(&1), "A's CAS never won: {:?}", *seen);
+    assert!(
+        seen.contains(&2),
+        "C's CAS never scheduled ahead of A's — A's lane-B record was shadowed \
+         by its later lane-A store: {:?}",
+        *seen
+    );
+}
+
+/// Mask-intersection DPOR pruning: two threads each writing a lane commute
+/// when the lanes are **disjoint** (no backtrack point between them, so the
+/// interleavings collapse), while the same writes to a **shared** lane are
+/// genuinely dependent and fully explored. The contrast is the pruning at
+/// work — it is what keeps the finer sub-location model from exploding the
+/// schedule space for genuinely independent lanes.
+#[test]
+fn dpor_prunes_disjoint_lanes() {
+    fn iterations(shared: bool) -> usize {
+        let n = Arc::new(AtomicUsize::new(0));
+        let n_ = n.clone();
+        loom::model(move || {
+            n.fetch_add(1, Relaxed);
+            let x = Arc::new(AtomicU128::new(0));
+            let t = {
+                let x = x.clone();
+                thread::spawn(move || {
+                    x.store_masked(LANE_A, 1, Relaxed);
+                    x.store_masked(LANE_A, 2, Relaxed);
+                    x.store_masked(LANE_A, 3, Relaxed);
+                })
+            };
+            // The main thread writes the disjoint high lane, or (shared) the
+            // same low lane the spawned thread writes.
+            let (mask, base) = if shared { (LANE_A, 0) } else { (LANE_B, 64) };
+            x.store_masked(mask, 4 << base, Relaxed);
+            x.store_masked(mask, 5 << base, Relaxed);
+            x.store_masked(mask, 6 << base, Relaxed);
+            t.join().unwrap();
+        });
+        n_.load(Relaxed)
+    }
+
+    let disjoint = iterations(false);
+    let shared = iterations(true);
+    // Disjoint lanes commute to essentially a single schedule; the shared lane
+    // fans out across all interleavings.
+    assert!(
+        disjoint * 5 <= shared,
+        "DPOR did not prune disjoint lanes: disjoint={} shared={}",
+        disjoint,
+        shared
+    );
 }
 
 /// Basic correctness: a masked store to one lane leaves the other lane's bits

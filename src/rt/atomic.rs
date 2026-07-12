@@ -218,28 +218,6 @@ pub(super) struct State {
     /// access to the cell.
     is_mutating: bool,
 
-    /// Last time each thread accessed the atomic. This tracks the dependent
-    /// accesses for the DPOR algorithm.
-    ///
-    /// Per-thread, not a single shared slot (fork fix): with one slot, a
-    /// thread's own access overwrites the record of every peer's access — a
-    /// spawned thread whose prefix is `load; compare_exchange` records its
-    /// own load as the cell's last access, so its CAS is only ever checked
-    /// against that (trivially happens-before) and the conflict with a
-    /// peer's earlier plain load is never seen. The reorder DPOR owes for
-    /// that conflict (the child prefix scheduled ahead of the peer's load)
-    /// was then silently never explored.
-    ///
-    /// Cell-wide, not per-region: the whole cell is one DPOR exploration
-    /// object, so disjoint-lane ops stay dependent (conservative — never
-    /// prunes a schedule the split might need). Boxed to keep `State` small:
-    /// the object store's `Entry` enum is sized by its largest variant.
-    last_access: Box<[Option<Access>; MAX_THREADS]>,
-
-    /// Last time each thread accessed the atomic with a store or rmw
-    /// operation.
-    last_non_load_access: Box<[Option<Access>; MAX_THREADS]>,
-
     /// The sub-word regions of the cell: pairwise-disjoint masks, each a
     /// self-contained store history. Starts as one full-width region and is
     /// refined by `ensure_partition` when a masked op cuts a region. A cell
@@ -271,18 +249,51 @@ struct Region {
 
     /// The total number of stores to the region.
     cnt: u16,
+
+    /// Last time each thread accessed **this region**. Tracks the dependent
+    /// accesses for the DPOR algorithm.
+    ///
+    /// Per-thread, not a single shared slot (fork fix): with one slot, a
+    /// thread's own access overwrites the record of every peer's — a spawned
+    /// thread whose prefix is `load; compare_exchange` records its own load as
+    /// the last access, so its CAS is only ever checked against that (trivially
+    /// happens-before) and the conflict with a peer's earlier plain load is
+    /// never seen; the reorder DPOR owes for it was then silently unexplored.
+    ///
+    /// Per-region, not cell-wide, so mask-intersection pruning is *sound*: a
+    /// thread's lane-A access must not shadow its earlier lane-B access, or a
+    /// later lane-B op would filter it out and miss the conflict. Splitting a
+    /// region clones these records into both halves (`split_off`).
+    last_access: Box<[Option<Access>; MAX_THREADS]>,
+
+    /// Last time each thread accessed this region with a store or rmw.
+    last_non_load_access: Box<[Option<Access>; MAX_THREADS]>,
 }
 
 #[derive(Debug, Copy, Clone, PartialEq)]
 pub(super) enum Action {
-    /// Atomic load
-    Load,
+    /// Atomic load of the bits under the mask
+    Load(u128),
 
-    /// Atomic store
-    Store,
+    /// Atomic store to the bits under the mask
+    Store(u128),
 
-    /// Atomic read-modify-write
-    Rmw,
+    /// Atomic read-modify-write of the bits under the mask
+    Rmw(u128),
+}
+
+impl Action {
+    /// The bits this action touches. Two atomic ops on one cell are
+    /// DPOR-dependent only when their masks intersect — disjoint lanes commute.
+    fn mask(self) -> u128 {
+        match self {
+            Action::Load(m) | Action::Store(m) | Action::Rmw(m) => m,
+        }
+    }
+
+    fn is_load(self) -> bool {
+        matches!(self, Action::Load(_))
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -518,7 +529,8 @@ impl<T: Numeric> Atomic<T> {
     /// of the lanes' readable sets — independent per-lane staleness — while the
     /// op stays one linearization point.
     pub(crate) fn load_masked(&self, location: Location, mask: u128, ordering: Ordering) -> u128 {
-        self.branch(Action::Load, location);
+        self.ensure_partition(mask);
+        self.branch(Action::Load(mask), location);
 
         super::synchronize(|execution| {
             let state = self.state.get_mut(&mut execution.objects);
@@ -526,7 +538,6 @@ impl<T: Numeric> Atomic<T> {
             state.loaded_locations.track(location, &execution.threads);
             // Validate memory safety (cell-wide).
             state.track_load(&execution.threads);
-            state.ensure_partition(mask);
 
             trace!(state = ?self.state, ?ordering, ?mask, "Atomic::load_masked");
 
@@ -595,7 +606,8 @@ impl<T: Numeric> Atomic<T> {
     /// full store passes `FULL_MASK` and writes every region as one event
     /// (one shared SC position).
     pub(crate) fn store_masked(&self, location: Location, mask: u128, val: u128, ordering: Ordering) {
-        self.branch(Action::Store, location);
+        self.ensure_partition(mask);
+        self.branch(Action::Store(mask), location);
 
         super::synchronize(|execution| {
             let state = self.state.get_mut(&mut execution.objects);
@@ -604,7 +616,6 @@ impl<T: Numeric> Atomic<T> {
             // An atomic store counts as a read access to the underlying memory
             // cell (cell-wide).
             state.track_store(&execution.threads);
-            state.ensure_partition(mask);
 
             trace!(state = ?self.state, ?ordering, ?mask, "Atomic::store_masked");
 
@@ -647,7 +658,8 @@ impl<T: Numeric> Atomic<T> {
     where
         F: FnOnce(u128) -> Result<u128, E>,
     {
-        self.branch(Action::Rmw, location);
+        self.ensure_partition(mask);
+        self.branch(Action::Rmw(mask), location);
 
         super::synchronize(|execution| {
             let state = self.state.get_mut(&mut execution.objects);
@@ -656,7 +668,6 @@ impl<T: Numeric> Atomic<T> {
             // Track the load is happening in order to ensure correct
             // synchronization to the underlying cell (cell-wide).
             state.track_load(&execution.threads);
-            state.ensure_partition(mask);
 
             trace!(state = ?self.state, ?success, ?failure, ?mask, "Atomic::rmw_masked");
 
@@ -781,6 +792,23 @@ impl<T: Numeric> Atomic<T> {
                 an invalid memory location."
         );
     }
+
+    /// Refine the region partition to `mask` **before** the DPOR branch, so
+    /// `set_last_access` records the access on the final per-lane regions — the
+    /// mask-intersection pruning needs each op's record scoped to exactly the
+    /// lanes it touched, or a coarse-then-split record would leak the access
+    /// into a disjoint lane and spuriously couple them. A full-width mask never
+    /// splits, so it is skipped.
+    fn ensure_partition(&self, mask: u128) {
+        if mask == FULL_MASK {
+            return;
+        }
+        rt::execution(|execution| {
+            self.state
+                .get_mut(&mut execution.objects)
+                .ensure_partition(mask);
+        });
+    }
 }
 
 // ===== impl State =====
@@ -798,8 +826,6 @@ impl State {
             unsync_mut_at: VersionVec::new(),
             unsync_mut_locations: LocationSet::new(),
             is_mutating: false,
-            last_access: Default::default(),
-            last_non_load_access: Default::default(),
             regions: vec![Region::new(FULL_MASK)],
             op_clock: 0,
         };
@@ -1038,28 +1064,34 @@ impl State {
         self.unsync_mut_at.join(current);
     }
 
-    /// Calls `f` with every thread's last dependent access.
+    /// Calls `f` with every thread's last dependent access **that shares bits
+    /// with this op** (mask-intersection DPOR pruning): only regions the op's
+    /// mask touches are consulted, so disjoint-lane ops generate no backtrack
+    /// point against each other. A load depends on each thread's last
+    /// store/rmw; a store/rmw depends on each thread's last access of any kind.
+    /// Accesses by the querying thread itself are included — they are
+    /// program-ordered before the current op, so the caller's happens-before
+    /// check filters them.
     ///
-    /// A load depends on each thread's last store/rmw; a store/rmw depends on
-    /// each thread's last access of any kind. Accesses by the querying thread
-    /// itself are included — they are program-ordered before the current
-    /// operation, so the caller's happens-before check filters them.
+    /// A wide op's access is recorded in every region it wrote, so a peer op is
+    /// reported once per shared region; `Path::backtrack` and the DPOR clock
+    /// join are idempotent, so the redundancy costs work, never correctness.
     pub(super) fn for_each_dependent_access<'a>(
         &'a self,
         action: Action,
         mut f: impl FnMut(&'a Access),
     ) {
-        let slots: &[Option<Access>; MAX_THREADS] = match action {
-            Action::Load => &self.last_non_load_access,
-            _ => &self.last_access,
-        };
+        let mask = action.mask();
+        let is_load = action.is_load();
 
-        for access in slots.iter().flatten() {
-            f(access);
+        for region in &self.regions {
+            if region.mask & mask != 0 {
+                region.for_each_dependent_access(is_load, &mut f);
+            }
         }
     }
 
-    /// Sets the thread's last dependent access
+    /// Sets the thread's last dependent access in every region the op touches.
     pub(super) fn set_last_access(
         &mut self,
         action: Action,
@@ -1067,16 +1099,13 @@ impl State {
         path_id: usize,
         version: &VersionVec,
     ) {
+        let mask = action.mask();
+        let is_load = action.is_load();
         let index = thread_id.as_usize();
 
-        // Always set `last_access`
-        Access::set_or_create(&mut self.last_access[index], path_id, version);
-
-        match action {
-            Action::Load => {}
-            _ => {
-                // Stores / RMWs
-                Access::set_or_create(&mut self.last_non_load_access[index], path_id, version);
+        for region in &mut self.regions {
+            if region.mask & mask != 0 {
+                region.set_last_access(is_load, index, path_id, version);
             }
         }
     }
@@ -1090,13 +1119,18 @@ impl Region {
             mask,
             stores: Default::default(),
             cnt: 0,
+            last_access: Default::default(),
+            last_non_load_access: Default::default(),
         }
     }
 
     /// Keep the `keep_mask` bits of this region in place; split the remaining
-    /// bits into a new region that inherits a full copy of the history. Both
-    /// halves start perfectly coherent (identical stores) and diverge only as
-    /// future masked ops touch one but not the other.
+    /// bits into a new region that inherits a full copy of the history **and
+    /// the DPOR access records**. Both halves start perfectly coherent
+    /// (identical stores) and carry the same past accesses — a peer op that
+    /// conflicted with the pre-split region conflicts with whichever half it
+    /// still overlaps — and diverge only as future masked ops touch one but
+    /// not the other.
     fn split_off(&mut self, keep_mask: u128) -> Region {
         let other_mask = self.mask & !keep_mask;
         self.mask &= keep_mask;
@@ -1105,6 +1139,37 @@ impl Region {
             mask: other_mask,
             stores: self.stores.clone(),
             cnt: self.cnt,
+            last_access: self.last_access.clone(),
+            last_non_load_access: self.last_non_load_access.clone(),
+        }
+    }
+
+    /// Report this region's dependent accesses (a load depends on this thread's
+    /// last store/rmw; a store/rmw on any last access).
+    fn for_each_dependent_access<'a>(&'a self, is_load: bool, f: &mut impl FnMut(&'a Access)) {
+        let slots = if is_load {
+            &self.last_non_load_access
+        } else {
+            &self.last_access
+        };
+
+        for access in slots.iter().flatten() {
+            f(access);
+        }
+    }
+
+    /// Record a thread's last access to this region.
+    fn set_last_access(
+        &mut self,
+        is_load: bool,
+        thread_id: usize,
+        path_id: usize,
+        version: &VersionVec,
+    ) {
+        Access::set_or_create(&mut self.last_access[thread_id], path_id, version);
+
+        if !is_load {
+            Access::set_or_create(&mut self.last_non_load_access[thread_id], path_id, version);
         }
     }
 
