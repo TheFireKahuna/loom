@@ -480,6 +480,7 @@ impl State {
         ordering: Ordering,
     ) {
         let index = index(self.cnt);
+        let live = self.live_stores();
 
         // Increment the count
         self.cnt += 1;
@@ -493,7 +494,7 @@ impl State {
         let mut modification_order = happens_before;
 
         // Apply coherence rules
-        for i in 0..self.stores.len() {
+        for i in 0..live {
             // READ-WRITE coherence
             if self.stores[i].first_seen.is_seen_by_current(threads) {
                 let mo = self.stores[i].modification_order;
@@ -564,7 +565,7 @@ impl State {
     }
 
     fn apply_load_coherence(&mut self, threads: &mut thread::Set, index: usize) {
-        for i in 0..self.stores.len() {
+        for i in 0..self.live_stores() {
             // Skip if the is current.
             if index == i {
                 continue;
@@ -738,7 +739,7 @@ impl State {
         ordering: Ordering,
     ) -> usize {
         let mut n = 0;
-        let cnt = self.cnt as usize;
+        let live = self.live_stores();
 
         // We only need to consider loads as old as the **most** recent load
         // seen by each thread in the current causality.
@@ -749,18 +750,13 @@ impl State {
         //
         // Add all stores **unless** a newer store has already been seen by the
         // current thread's causality.
-        'outer: for i in 0..self.stores.len() {
+        'outer: for i in 0..live {
             let store_i = &self.stores[i];
 
-            if i >= cnt {
-                // Not a real store
-                continue;
-            }
-
-            for j in 0..self.stores.len() {
+            for j in 0..live {
                 let store_j = &self.stores[j];
 
-                if i == j || j >= cnt {
+                if i == j {
                     continue;
                 }
 
@@ -799,22 +795,17 @@ impl State {
 
     fn match_rmw_to_stores(&self, dst: &mut [u8]) -> usize {
         let mut n = 0;
-        let cnt = self.cnt as usize;
+        let live = self.live_stores();
 
         // Unlike `match_load_to_stores`, rmw operations only load "newest"
         // stores, in terms of modification order.
-        'outer: for i in 0..self.stores.len() {
+        'outer: for i in 0..live {
             let store_i = &self.stores[i];
 
-            if i >= cnt {
-                // Not a real store
-                continue;
-            }
-
-            for j in 0..self.stores.len() {
+            for j in 0..live {
                 let store_j = &self.stores[j];
 
-                if i == j || j >= cnt {
+                if i == j {
                     continue;
                 }
 
@@ -835,6 +826,17 @@ impl State {
         }
 
         n
+    }
+
+    /// Number of `stores` slots holding a real store.
+    ///
+    /// The ring fills positions `0..cnt` in order and wraps once full, so
+    /// positions at and past `min(cnt, MAX_ATOMIC_HISTORY)` are the
+    /// zeroed `Default` — their all-MAX `first_seen` matches no thread
+    /// and their zero `modification_order` joins as a no-op, so skipping
+    /// them never changes a result, only the work.
+    fn live_stores(&self) -> usize {
+        cmp::min(self.cnt as usize, MAX_ATOMIC_HISTORY)
     }
 
     fn stores_mut(&mut self) -> impl DoubleEndedIterator<Item = &mut Store> {

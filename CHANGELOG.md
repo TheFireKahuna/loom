@@ -28,6 +28,10 @@
    operations. Padding lanes are structurally zero and invisible to
    `versions()`; exploration is unchanged.
 
+ - Atomic history scans are bounded to the live stores, skipping the
+   zeroed default slots past the store count (a provably
+   side-effect-free no-op elision). Exploration is unchanged.
+
 # 0.7.2
 
 This release bumps the MSRV to 1.65. (#332)
