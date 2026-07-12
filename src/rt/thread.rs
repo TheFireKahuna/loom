@@ -23,6 +23,14 @@ pub(crate) struct Thread {
     /// Tracks the view of the lastest release fence
     pub released: VersionVec,
 
+    /// S-position of this thread's most recent `SeqCst` fence, or `None` if it
+    /// has executed none. A load sequenced after such a fence is restricted
+    /// against the SC writes visible *as of that fence* (C++20 [atomics.order]
+    /// p4/p6): see `rt::atomic::State::match_load_to_stores`. The most recent
+    /// fence subsumes all earlier ones — its position is the largest, hence
+    /// its as-of view is the furthest along the SC order.
+    pub sc_fence_pos: Option<u32>,
+
     /// Tracks DPOR relations
     pub dpor_vv: VersionVec,
 
@@ -54,6 +62,19 @@ pub(crate) struct Set {
     /// Sequential consistency causality. All sequentially consistent operations
     /// synchronize with this causality.
     pub seq_cst_causality: VersionVec,
+
+    /// Next position to hand out in the single total order S over `SeqCst`
+    /// operations (C++20 [atomics.order]). Every SC store and every SC fence
+    /// takes the next value at the point it commits in the explored schedule,
+    /// so S *is* commit order; permutation testing covers every S consistent
+    /// with happens-before. SC loads consult S but need no position of their
+    /// own — nothing in the model refers back to a load's place in S.
+    ///
+    /// This is the one order shared by SC accesses (`rt::atomic`) and SC
+    /// fences: an SC fence tags the stores sequenced before it with its own
+    /// position (`begin_sc_fence`), which is how a fence in one thread comes to
+    /// sit in S against an SC access in another.
+    sc_clock: u32,
 
     /// `tracing` span used as the parent for new thread spans.
     iteration_span: tracing::Span,
@@ -98,6 +119,7 @@ impl Thread {
             operation: None,
             causality: VersionVec::new(),
             released: VersionVec::new(),
+            sc_fence_pos: None,
             dpor_vv: VersionVec::new(),
             last_yield: None,
             yield_count: 0,
@@ -202,6 +224,7 @@ impl Set {
             threads,
             active: Some(0),
             seq_cst_causality: VersionVec::new(),
+            sc_clock: 0,
             iteration_span,
         }
     }
@@ -341,10 +364,16 @@ impl Set {
     /// - The "promising semantics" paper, which propose an intuitive semantics of SeqCst fence in
     ///   the absence of SC accesses. https://sf.snu.ac.kr/promise-concurrency/
     pub(crate) fn seq_cst(&mut self) {
-        // The previous implementation of sequential consistency was incorrect (though it's correct
-        // for `fence(SeqCst)`-only scenario; use `seq_cst_fence` for `fence(SeqCst)`).
-        // As a quick fix, just disable it. This may fail to model correct code,
-        // but will not silently allow bugs.
+        // Intentionally a no-op. `SeqCst` *accesses* are modelled in
+        // `rt::atomic` by the C++20 SC read rule (`match_load_to_stores`) and
+        // per-location SC/mo consistency (`State::store`) — a read restriction
+        // only. Joining causality here would manufacture happens-before that
+        // SC accesses do not have. `fence(SeqCst)` is handled separately, by
+        // the `seq_cst_fence` causality frontier together with the SC-order
+        // position it takes in `begin_sc_fence`. Callers reach this as a
+        // "sequential consistency point" for the lock primitives, whose
+        // surrounding acquire/release edges already carry the ordering they
+        // need.
     }
 
     pub(crate) fn seq_cst_fence(&mut self) {
@@ -353,6 +382,30 @@ impl Set {
             .join(&self.seq_cst_causality);
         self.seq_cst_causality
             .join(&self.threads[self.active.unwrap()].causality);
+    }
+
+    /// Allocate the next position in the SC total order S and hand it to the
+    /// caller. Called once per SC store (from `rt::atomic::State::store`).
+    pub(crate) fn next_sc_pos(&mut self) -> u32 {
+        let pos = self.sc_clock;
+        self.sc_clock += 1;
+        pos
+    }
+
+    /// Commit the active thread's `SeqCst` fence into S: allocate its position,
+    /// record it as the thread's most recent fence position (for the p4/p6
+    /// fence-read restriction), and return it so the caller can tag the stores
+    /// sequenced before the fence with it (promotion; p5/p7). Distinct from
+    /// `seq_cst_fence`, which drives the separate fence *causality* frontier.
+    pub(crate) fn begin_sc_fence(&mut self) -> u32 {
+        let pos = self.next_sc_pos();
+        self.threads[self.active.unwrap()].sc_fence_pos = Some(pos);
+        pos
+    }
+
+    /// S-position of the active thread's most recent `SeqCst` fence, if any.
+    pub(crate) fn active_sc_fence_pos(&self) -> Option<u32> {
+        self.active().sc_fence_pos
     }
 
     pub(crate) fn clear(&mut self, execution_id: execution::Id) {
@@ -364,6 +417,7 @@ impl Set {
         self.execution_id = execution_id;
         self.active = Some(0);
         self.seq_cst_causality = VersionVec::new();
+        self.sc_clock = 0;
     }
 
     pub(crate) fn iter(&self) -> impl ExactSizeIterator<Item = (Id, &Thread)> + '_ {

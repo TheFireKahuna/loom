@@ -2,6 +2,29 @@
 
 ### Fixed
 
+ - `SeqCst` operations — accesses *and* fences — participate in a single
+   sequentially-consistent total order S (C++20 [atomics.order]),
+   closing #180. S is the order SC operations commit in each explored
+   schedule, tracked by an integer position per SC store and per SC
+   fence. Three rules realize it, all per-location and creating no
+   happens-before between SC operations. (1) SC/mo consistency: an SC
+   store is modification-ordered after every SC-ranked store already
+   committed to the same cell. (2) Promotion: an SC fence ranks every
+   store sequenced before it into S at the fence's position, so a store
+   published under a fence is visible to a later SC access (the fence
+   rules p5/p7). (3) SC read restriction: a load may not return a store
+   modification-order-before an SC-ranked store to the cell within the
+   load's scope — all of S for an SC load, or the most recent
+   `SeqCst` fence's position for a load sequenced after one (the
+   fence-read rules p4/p6). This forbids the store-buffering, IRIW and
+   read-write-causality outcomes that acquire/release permits — whether
+   spelled with SC accesses, SC fences, or a mix of the two, e.g. a
+   `fence(SeqCst)` in one thread ordering against an SC access in
+   another — while leaving mo-incomparable concurrent stores readable, so
+   nearby relaxed accesses keep their full legal weak behavior. A second,
+   independent mechanism (`seq_cst_fence`, a causality frontier) supplies
+   the happens-before that ordered fence pairs require. Litmus coverage
+   in `tests/litmus.rs` and `tests/sc_fence_access.rs`.
  - **RMW atomicity (C11 soundness, upstream-inherited):** an atomic
    RMW's write must sit *immediately* after the store it read in the
    cell's modification order — no other store may split the pair. The

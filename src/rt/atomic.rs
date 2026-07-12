@@ -29,9 +29,62 @@
 //!   store that happened in the thread causality will be earlier in the
 //!   modification order.
 //!
+//! # Sequential consistency
+//!
+//! `SeqCst` operations — accesses *and* fences — are ordered by a single total
+//! order S (C++20 [atomics.order]). S is modelled as the order in which those
+//! operations commit in the current schedule, tracked by an integer position
+//! handed out per SC store and per SC fence (`thread::Set::next_sc_pos`); a
+//! store also carries its position in `Store::sc_rank`. Because permutation
+//! testing explores every schedule, every S consistent with happens-before is
+//! explored. The rules below key on the cell (per-location) and never create
+//! happens-before between SeqCst operations.
+//!
+//! A store is *SC-ranked* (`Store::sc_rank` is `Some`) when it participates in
+//! S as a write. That is so in two ways:
+//!
+//! - it was itself a `SeqCst` store, ranked at its own commit; or
+//! - it was sequenced before a `SeqCst` fence that has since executed, which
+//!   promotes it into S at the fence's position (`promote_sc_writes`; C++20
+//!   [atomics.order] p5/p7). Promotion is what lets a `fence(SeqCst)` in one
+//!   thread order against an SC *access* in another.
+//!
+//! Rules:
+//!
 //! - Seq-cst/MO Consistency:
 //!
-//! - Seq-cst Write-Read Coherence:
+//!   The SC-ranked stores to a cell are totally ordered by S, and modification
+//!   order must agree with S. On `store`, a SeqCst store joins the
+//!   `modification_order` of every SC-ranked store already committed to the
+//!   cell, so they form an mo-chain in commit order (`State::store`).
+//!
+//! - Seq-cst Read Restriction:
+//!
+//!   A load obeys the SC read rule within a *scope* — how far into S it must
+//!   respect. A `SeqCst` load's scope is all of S; a load sequenced after a
+//!   `SeqCst` fence has the fence's position as its scope (the fence-read rules
+//!   p4/p6); any other load is unconstrained. The load may not return a store
+//!   that is modification-order-before an SC-ranked store to the cell whose
+//!   rank lies within scope (`match_load_to_stores`). Only genuine `mo_before`
+//!   edges gate the exclusion, so a store promoted late (mo-early yet given a
+//!   high rank, e.g. a cell's initial store under a `SeqCst` fence in its
+//!   creating thread) can never masquerade as a newer witness. Enforcing this
+//!   forbids the store-buffering, IRIW and read-write-causality outcomes that
+//!   plain acquire/release permits — spelled with SC accesses, SC fences, or a
+//!   mix of the two — while mo-incomparable concurrent stores stay readable so
+//!   no legal weak behavior is lost.
+//!
+//!   The read half of a SeqCst RMW (and a failed SeqCst compare-exchange)
+//!   needs no check: it reads an mo-maximal store, which is never mo-before any
+//!   other store to the cell.
+//!
+//! `fence(SeqCst)` participates in two cooperating mechanisms. Its position in
+//! S (above) supplies the access↔fence interaction — promotion and the
+//! fence-read scope. A separate causality frontier
+//! (`thread::Set::seq_cst_fence`) supplies fence↔fence ordering (p6/p7 among
+//! fences) by propagating happens-before. The two are independent: the S rules
+//! are read restrictions that create no happens-before, while the frontier
+//! carries the happens-before that ordered fence pairs require.
 //!
 //! - RMW/MO Consistency: Subsumed by Write-Write Coherence?
 //!
@@ -56,9 +109,10 @@
 //! # Modification-order representation
 //!
 //! `Store::modification_order` is a join of genuine causality snapshots:
-//! the storing thread's causality and the vectors of stores known mo-before
-//! it. Because vector clocks are transitively closed, "store `a` is known
-//! mo-before
+//! the storing thread's causality, the vectors of stores known mo-before it,
+//! and (for a `SeqCst` store) the vectors of the SC-ranked stores already
+//! committed to the same cell (SC/mo consistency). Because vector clocks are
+//! transitively closed, "store `a` is known mo-before
 //! store `b`" is decided by the single-lane marker test
 //! `b.modification_order[a.creator] >= a.tick` (`mo_before`): the lane can
 //! only reach `a`'s creation tick by having joined a snapshot that causally
@@ -220,8 +274,17 @@ struct Store {
     /// Tracks when each thread first saw value
     first_seen: FirstSeen,
 
-    /// True when the store was done with `SeqCst` ordering
-    seq_cst: bool,
+    /// This store's rank in the SC total order S, or `None` if it does not
+    /// participate in S. A store is SC-ranked either because it was itself a
+    /// `SeqCst` store (ranked at its own commit, `State::store`) or because it
+    /// was sequenced before a `SeqCst` fence that has since executed and
+    /// promoted it (ranked at the fence's position, `promote_sc_writes`;
+    /// C++20 [atomics.order] p5/p7). Two SC-ranked stores to this cell are
+    /// ordered in S by their positions, and S agrees with modification order,
+    /// so `a.sc_rank < b.sc_rank` implies `a` is mo-before `b` — the fact the
+    /// SC read rule uses to exclude superseded writes without needing a
+    /// materialized mo edge (see `match_load_to_stores`).
+    sc_rank: Option<u32>,
 }
 
 /// Creation stamp of the store an RMW write read — the persistent record of
@@ -314,6 +377,20 @@ fn fence_acqrel(execution: &mut Execution) {
 fn fence_seqcst(execution: &mut Execution) {
     fence_acqrel(execution);
     execution.threads.seq_cst_fence();
+
+    // Join this fence into the single SC total order S. It takes the next
+    // position and promotes every store sequenced before it — i.e. every store
+    // this thread created — into S at that position (C++20 [atomics.order]
+    // p5/p7). This is what lets a fence in one thread order against an SC
+    // *access* in another: a promoted store is then an ordinary SC-ranked
+    // witness for the SC read rule, and the fence's position bounds the
+    // fence-read scope of later loads in this thread (p4/p6). Independent of
+    // the `seq_cst_fence` causality frontier above, which handles fence↔fence.
+    let pos = execution.threads.begin_sc_fence();
+    let creator = execution.threads.active_id().as_usize();
+    for state in execution.objects.iter_mut::<State>() {
+        state.promote_sc_writes(creator, pos);
+    }
 }
 
 impl<T: Numeric> Atomic<T> {
@@ -339,7 +416,15 @@ impl<T: Numeric> Atomic<T> {
         super::synchronize(|execution| {
             let state = self.state.get_mut(&mut execution.objects);
 
-            // If necessary, generate the list of stores to permute through
+            // If necessary, generate the list of stores to permute through.
+            //
+            // A `SeqCst` load participates in the SC total order S; a load past
+            // a `SeqCst` fence is bounded by the fence's position in S. Which
+            // stores either may return is restricted inside
+            // `match_load_to_stores` (keyed off `ordering` and the thread's
+            // fence position) — see there. It is a read-side rule only: no
+            // happens-before is created between SC operations, so nearby
+            // relaxed accesses keep their full legal weak behavior.
             if execution.path.is_traversed() {
                 let mut seed = [0; MAX_ATOMIC_HISTORY];
 
@@ -392,7 +477,8 @@ impl<T: Numeric> Atomic<T> {
 
             trace!(state = ?self.state, ?ordering, "Atomic::store");
 
-            // Do the store
+            // Do the store. A `SeqCst` store's SC/mo-consistency edges are
+            // established inside `State::store`.
             state.store(
                 &mut execution.threads,
                 Synchronize::new(),
@@ -430,6 +516,12 @@ impl<T: Numeric> Atomic<T> {
 
             trace!(state = ?self.state, ?success, ?failure, "Atomic::rmw");
 
+            // The read half of an SC RMW needs no SC restriction: an RMW only
+            // reads a modification-order-maximal store (`match_rmw_to_stores`),
+            // which can never be mo-before another store to the cell, so the SC
+            // read rule is satisfied automatically. The write half routes
+            // through `State::store` with the `success` ordering, where the
+            // store takes its SC position and SC/mo consistency is enforced.
             state
                 .rmw(
                     &mut execution.threads,
@@ -584,6 +676,11 @@ impl State {
         // Starting with the thread's causality covers WRITE-WRITE coherence
         let mut modification_order = happens_before;
 
+        // Whether this store participates in the modelled SC total order S,
+        // and, if so, its position in S (= commit order among SC operations).
+        let sc = is_seq_cst(ordering);
+        let sc_rank = if sc { Some(threads.next_sc_pos()) } else { None };
+
         // Apply coherence rules
         for i in 0..live {
             let store_i = &self.stores[i];
@@ -596,8 +693,19 @@ impl State {
             // `happens_before`, but their vectors carry mo edges (coherence
             // and RMW-atomicity joins) the raw causality does not — joining
             // them keeps known ancestry transitive.
+            //
+            // SC/MO consistency: the SC-ranked stores to a cell are totally
+            // ordered by S, and mo must agree with S. Every SC-ranked store
+            // already committed — whether an SC store or one a fence promoted
+            // (`promote_sc_writes`) — is therefore mo-before this SeqCst store.
+            // This is a per-location, S-only mo edge — joined into
+            // `modification_order`, never into causality (the S edge orders the
+            // writes without manufacturing happens-before). Timing is exact:
+            // only stores already SC-ranked when this store commits are joined,
+            // matching that only they precede it in S.
             if store_i.first_seen.is_seen_by_current(threads)
                 || happens_before.lane(store_i.creator) >= store_i.tick()
+                || (sc && store_i.sc_rank.is_some())
             {
                 let mo = store_i.modification_order;
                 modification_order.join(&mo);
@@ -623,7 +731,7 @@ impl State {
             rmw_read: None,
             sync,
             first_seen,
-            seq_cst: is_seq_cst(ordering),
+            sc_rank,
         };
     }
 
@@ -681,6 +789,11 @@ impl State {
                 Ok(prev)
             }
             Err(e) => {
+                // A failed compare-exchange is a load. With `SeqCst` failure
+                // ordering it is an SC read, but it reads the store chosen by
+                // `match_rmw_to_stores` (modification-order-maximal), which is
+                // never mo-before another store to the cell, so the SC read
+                // rule holds with no extra work.
                 self.stores[index].sync.sync_load(threads, failure);
                 Err(e)
             }
@@ -916,6 +1029,15 @@ impl State {
     }
 
     /// Find all stores that could be returned by an atomic load.
+    ///
+    /// A load obeying the C++20 SC read rule ([atomics.order]) may not return a
+    /// store that is modification-order-before some SC-ranked store to this
+    /// cell that lies within the load's SC *scope* — all of S for a `SeqCst`
+    /// load, or the position of the most recent `SeqCst` fence for a load
+    /// sequenced after one (the fence-read rules p4/p6). See the `sc_scope`
+    /// comment below and the module SC notes. The rule is per-location and
+    /// exact: mo-incomparable concurrent stores stay readable, so legal weak
+    /// behaviors of nearby relaxed accesses are preserved.
     fn match_load_to_stores(
         &self,
         threads: &thread::Set,
@@ -924,6 +1046,34 @@ impl State {
     ) -> usize {
         let mut n = 0;
         let live = self.live_stores();
+
+        // The SC read rule reaches this load through a *scope* — how far into
+        // the SC total order S the load must respect (C++20 [atomics.order]):
+        //
+        // - A `SeqCst` load participates in S directly; its scope is all of S
+        //   (`u32::MAX`). It may not read a store mo-before any SC-ranked store
+        //   to this cell (the SC read rule for accesses).
+        //
+        // - A non-SC load sequenced after a `SeqCst` fence is bounded by that
+        //   fence's position (p4/p6): it may not read a store mo-before an
+        //   SC-ranked store that is *as-early-as-or-before that fence in S*
+        //   (`sc_rank <= limit`). The most recent fence's position is used — a
+        //   later fence reaches further into S and subsumes all earlier ones.
+        //
+        // - Any other load is unconstrained by SC (`None`).
+        //
+        // Enforced by the fold in the coherence loop below: a candidate is
+        // dropped once some in-scope SC-ranked store is found mo-after it. Only
+        // genuine `mo_before` edges are consulted — never a rank comparison —
+        // so a store promoted late (given a high `sc_rank` by a fence though it
+        // is mo-early, e.g. a cell's initial store) can never masquerade as a
+        // newer witness and wrongly supersede a mo-later write. mo-incomparable
+        // concurrent stores stay readable, so no legal weak behavior is lost.
+        let sc_scope = if is_seq_cst(ordering) {
+            Some(u32::MAX)
+        } else {
+            threads.active_sc_fence_pos()
+        };
 
         // We only need to consider loads as old as the **most** recent load
         // seen by each thread in the current causality.
@@ -945,6 +1095,15 @@ impl State {
                 }
 
                 if mo_before(store_i, store_j) {
+                    // SC read rule: `store_i` is mo-before `store_j`; if
+                    // `store_j` is SC-ranked within this load's scope, `store_i`
+                    // is superseded in S and may not be read.
+                    if let Some(limit) = sc_scope {
+                        if store_j.sc_rank.is_some_and(|r| r <= limit) {
+                            continue 'outer;
+                        }
+                    }
+
                     if store_j.first_seen.is_seen_by_current(threads) {
                         // Store `j` is newer, so don't store the current one.
                         continue 'outer;
@@ -953,11 +1112,6 @@ impl State {
                     if store_i.first_seen.is_seen_before_yield(threads) {
                         // Saw this load before the previous yield. In order to
                         // advance the model, don't return it again.
-                        continue 'outer;
-                    }
-
-                    if is_seq_cst(ordering) && store_i.seq_cst && store_j.seq_cst {
-                        // There is a newer SeqCst store
                         continue 'outer;
                     }
                 }
@@ -969,6 +1123,20 @@ impl State {
         }
 
         n
+    }
+
+    /// Promote every live store this thread created (hence sequenced before an
+    /// executing `SeqCst` fence) into the SC total order S at the fence's
+    /// position `pos` (C++20 [atomics.order] p5/p7). A store already SC-ranked
+    /// keeps its own — necessarily earlier — position. After this, a later SC
+    /// load, or a load past a fence that follows `pos` in S, sees the promoted
+    /// write through the ordinary SC read rule.
+    pub(super) fn promote_sc_writes(&mut self, creator: usize, pos: u32) {
+        for store in self.stores_mut() {
+            if store.creator == creator && store.sc_rank.is_none() {
+                store.sc_rank = Some(pos);
+            }
+        }
     }
 
     fn match_rmw_to_stores(&self, dst: &mut [u8]) -> usize {
@@ -1083,7 +1251,7 @@ impl Default for Store {
             rmw_read: None,
             sync: Synchronize::new(),
             first_seen: FirstSeen::new(),
-            seq_cst: false,
+            sc_rank: None,
         }
     }
 }
