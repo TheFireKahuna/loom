@@ -123,7 +123,7 @@ impl Mutex {
                         let location = operation.location();
                         trace!(state = ?self.state, thread = ?id,
                             "Mutex::post_acquire");
-                        thread.set_blocked(location);
+                        thread.set_blocked(location, false);
                     }
                 }
             }

@@ -96,8 +96,17 @@ impl Id {
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum State {
-    Runnable { unparked: bool },
-    Blocked(#[allow(dead_code)] Location),
+    Runnable {
+        unparked: bool,
+    },
+    Blocked {
+        #[allow(dead_code)]
+        location: Location,
+        /// A timed block (`Condvar::wait_timeout`) can always end on its
+        /// own — its timeout fires. `Execution::schedule` wakes such
+        /// threads instead of declaring a deadlock.
+        timed: bool,
+    },
     Yield,
     Terminated,
 }
@@ -135,12 +144,16 @@ impl Thread {
         self.state = State::Runnable { unparked: false };
     }
 
-    pub(crate) fn set_blocked(&mut self, location: Location) {
-        self.state = State::Blocked(location);
+    pub(crate) fn set_blocked(&mut self, location: Location, timed: bool) {
+        self.state = State::Blocked { location, timed };
     }
 
     pub(crate) fn is_blocked(&self) -> bool {
-        matches!(self.state, State::Blocked(..))
+        matches!(self.state, State::Blocked { .. })
+    }
+
+    pub(crate) fn is_blocked_timed(&self) -> bool {
+        matches!(self.state, State::Blocked { timed: true, .. })
     }
 
     pub(crate) fn is_yield(&self) -> bool {

@@ -124,7 +124,7 @@ impl Channel {
                             && operation.action() == object::Action::Channel(Action::MsgRecv)
                         {
                             let location = operation.location();
-                            thread.set_blocked(location);
+                            thread.set_blocked(location, false);
                         }
                     }
                 }

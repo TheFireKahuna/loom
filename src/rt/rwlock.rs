@@ -214,7 +214,7 @@ impl RwLock {
 
                 if op.action() == Action::Write {
                     let location = op.location();
-                    th.set_blocked(location);
+                    th.set_blocked(location, false);
                 }
             }
 
@@ -249,7 +249,7 @@ impl RwLock {
                 match th.operation.as_ref() {
                     Some(op) if op.object() == self.state.erase() => {
                         let location = op.location();
-                        th.set_blocked(location);
+                        th.set_blocked(location, false);
                     }
                     _ => continue,
                 };

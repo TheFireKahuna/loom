@@ -369,7 +369,7 @@ impl<T: Object<Entry = Entry>> Ref<T> {
 
             if is_locked {
                 // The mutex is currently blocked, cannot make progress
-                execution.threads.active_mut().set_blocked(location);
+                execution.threads.active_mut().set_blocked(location, false);
             }
         })
     }
@@ -399,7 +399,7 @@ impl<T: Object<Entry = Entry>> Ref<T> {
 
             if disable {
                 // Cannot make progress.
-                execution.threads.active_mut().set_blocked(location);
+                execution.threads.active_mut().set_blocked(location, false);
             }
         })
     }

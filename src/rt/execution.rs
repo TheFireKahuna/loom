@@ -194,6 +194,24 @@ impl Execution {
             }
         }
 
+        // A thread blocked in a timed wait can always end its block on its
+        // own — its timeout fires. If no thread can run otherwise, time is
+        // the only mover left: fire every pending timeout instead of
+        // reporting a deadlock the clock would have resolved. The woken
+        // wait tells a timeout apart from a notification by its wait-queue
+        // entry (see `rt::Condvar::wait`).
+        if !self
+            .threads
+            .iter()
+            .any(|(_, th)| th.is_runnable() || th.is_yield())
+        {
+            for (_, th) in self.threads.iter_mut() {
+                if th.is_blocked_timed() {
+                    th.set_runnable();
+                }
+            }
+        }
+
         // It's important to avoid pre-emption as much as possible
         let mut initial = Some(self.threads.active_id());
 

@@ -6,6 +6,7 @@ use loom::thread;
 
 use std::sync::atomic::Ordering::SeqCst;
 use std::sync::Arc;
+use std::time::Duration;
 
 #[test]
 fn notify_one() {
@@ -37,6 +38,144 @@ fn notify_all() {
         for th in waiters {
             th.join().expect("waiter");
         }
+    });
+}
+
+/// With a concurrent notifier, `wait_timeout` must explore both outcomes:
+/// woken by the notification, and the timeout firing first.
+#[test]
+fn wait_timeout_explores_both_outcomes() {
+    // `std` atomics: accumulated across iterations, checked after the model.
+    static TIMED_OUT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    static WOKEN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+    loom::model(|| {
+        let pair = Arc::new((Mutex::new(false), Condvar::new()));
+
+        let notifier = {
+            let pair = pair.clone();
+            thread::spawn(move || {
+                let (mutex, condvar) = &*pair;
+                *mutex.lock().unwrap() = true;
+                condvar.notify_one();
+            })
+        };
+
+        let (mutex, condvar) = &*pair;
+        let mut ready = mutex.lock().unwrap();
+        let mut timed_out = false;
+
+        while !*ready {
+            let (guard, result) = condvar.wait_timeout(ready, Duration::from_millis(1)).unwrap();
+            ready = guard;
+
+            if result.timed_out() {
+                timed_out = true;
+                break;
+            }
+        }
+
+        drop(ready);
+        notifier.join().unwrap();
+
+        if timed_out {
+            TIMED_OUT.fetch_add(1, SeqCst);
+        } else {
+            WOKEN.fetch_add(1, SeqCst);
+        }
+    });
+
+    assert!(TIMED_OUT.load(SeqCst) > 0, "timed-out branch never explored");
+    assert!(WOKEN.load(SeqCst) > 0, "notified branch never explored");
+}
+
+/// A `wait_timeout` no notification can ever reach must resolve via the
+/// timeout — never a reported deadlock.
+#[test]
+fn wait_timeout_without_notifier_times_out() {
+    loom::model(|| {
+        let mutex = Mutex::new(());
+        let condvar = Condvar::new();
+
+        let guard = mutex.lock().unwrap();
+        let (guard, result) = condvar.wait_timeout(guard, Duration::from_millis(1)).unwrap();
+
+        assert!(result.timed_out());
+        drop(guard);
+    });
+}
+
+/// The timeout rescue also fires with other (untimed) waiters in the mix:
+/// a joiner blocked on the timed-out thread must not be reported as a
+/// deadlock either.
+#[test]
+fn wait_timeout_without_notifier_cross_thread() {
+    loom::model(|| {
+        thread::spawn(|| {
+            let mutex = Mutex::new(());
+            let condvar = Condvar::new();
+
+            let guard = mutex.lock().unwrap();
+            let (_guard, result) =
+                condvar.wait_timeout(guard, Duration::from_millis(1)).unwrap();
+
+            assert!(result.timed_out());
+        })
+        .join()
+        .unwrap();
+    });
+}
+
+/// Untimed `wait` explores spurious wakeups: a wake with the predicate
+/// still false (no notification has been sent at that point). The
+/// re-check loop must absorb it and the wait must still complete.
+#[test]
+fn wait_explores_spurious_wakeup() {
+    static SPURIOUS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+    loom::model(|| {
+        let pair = Arc::new((Mutex::new(false), Condvar::new()));
+
+        let notifier = {
+            let pair = pair.clone();
+            thread::spawn(move || {
+                let (mutex, condvar) = &*pair;
+                *mutex.lock().unwrap() = true;
+                condvar.notify_one();
+            })
+        };
+
+        let (mutex, condvar) = &*pair;
+        let mut ready = mutex.lock().unwrap();
+
+        while !*ready {
+            ready = condvar.wait(ready).unwrap();
+
+            // The notifier sets the flag before notifying, so waking with
+            // the flag still clear is a spurious wakeup.
+            if !*ready {
+                SPURIOUS.fetch_add(1, SeqCst);
+            }
+        }
+
+        drop(ready);
+        notifier.join().unwrap();
+    });
+
+    assert!(SPURIOUS.load(SeqCst) > 0, "spurious wakeup never explored");
+}
+
+/// Spurious wakeups must not erase deadlock detection: an untimed wait no
+/// notification can ever reach is still a deadlock.
+#[test]
+#[should_panic]
+fn wait_without_notifier_deadlocks() {
+    loom::model(|| {
+        let mutex = Mutex::new(());
+        let condvar = Condvar::new();
+
+        let guard = mutex.lock().unwrap();
+        let _guard = condvar.wait(guard).unwrap();
     });
 }
 

@@ -85,12 +85,23 @@ where
 
 /// Marks the current thread as blocked
 pub(crate) fn park(location: Location) {
+    park_impl(location, false);
+}
+
+/// Marks the current thread as blocked in a timed wait: the block can end
+/// on its own (the wait's timeout firing), which `Execution::schedule`
+/// models by waking the thread when nothing else can run.
+pub(crate) fn park_timed(location: Location) {
+    park_impl(location, true);
+}
+
+fn park_impl(location: Location, timed: bool) {
     let switch = execution(|execution| {
         use thread::State;
         let thread = execution.threads.active_id();
         let active = execution.threads.active_mut();
 
-        trace!(?thread, ?active.state, "park");
+        trace!(?thread, ?active.state, ?timed, "park");
 
         match active.state {
             // The thread was previously unparked while it was active. Instead
@@ -100,10 +111,9 @@ pub(crate) fn park(location: Location) {
                 return false;
             }
             // The thread doesn't have a saved unpark; set its state to blocked.
-            _ => active.set_blocked(location),
+            _ => active.set_blocked(location, timed),
         };
 
-        execution.threads.active_mut().set_blocked(location);
         execution.threads.active_mut().operation = None;
         execution.schedule()
     });
