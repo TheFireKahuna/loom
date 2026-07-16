@@ -1,3 +1,4 @@
+use super::lane::{LaneU32Of64, LaneU32Of128, LaneU64Of128};
 use super::Atomic;
 
 use std::sync::atomic::Ordering;
@@ -55,10 +56,14 @@ macro_rules! atomic_int {
             }
 
             /// Sub-word load: reads only the bits under `mask` (other bits
-            /// zero). The masked lane is independently coherent — it may return
-            /// a stale lane value while another lane is seen fresh. Models an
-            /// aligned sub-word load inside a wider single-copy-atomic cell
-            /// (spec carve-out #5). A load spanning more than one region still
+            /// zero). The masked lane is independently coherent for separate
+            /// masked stores — it may return a stale lane value while another
+            /// lane is seen fresh — but **cell-coherent** against whole-cell
+            /// ops: it can never read the lane from behind a multi-lane op
+            /// the thread has already observed through any lane (single-copy
+            /// atomicity; `rt::atomic` module docs). Models an aligned
+            /// sub-word load inside a wider single-copy-atomic cell (spec
+            /// carve-out #5). A load spanning more than one region still
             /// returns a single consistent (non-torn) snapshot.
             #[track_caller]
             pub fn load_masked(&self, mask: $int_type, order: Ordering) -> $int_type {
@@ -251,6 +256,34 @@ atomic_int!(AtomicU8, u8);
 atomic_int!(AtomicU16, u16);
 atomic_int!(AtomicU32, u32);
 atomic_int!(AtomicUsize, usize);
+
+// Typed sub-word lane views (see `lane`): the modelled counterpart of a
+// production pointer-cast `&AtomicU32`/`&AtomicU64` into an aligned slice of
+// a wider single-copy-atomic cell. Byte offsets index the cell's
+// little-endian representation; constructors assert alignment and bounds.
+
+#[cfg(target_has_atomic = "64")]
+impl AtomicU64 {
+    /// An aligned 32-bit lane view at `byte_offset` (0 or 4).
+    #[track_caller]
+    pub fn lane_u32(&self, byte_offset: usize) -> LaneU32Of64<'_> {
+        LaneU32Of64::new(&self.0, byte_offset)
+    }
+}
+
+impl AtomicU128 {
+    /// An aligned 32-bit lane view at `byte_offset` (0, 4, 8, or 12).
+    #[track_caller]
+    pub fn lane_u32(&self, byte_offset: usize) -> LaneU32Of128<'_> {
+        LaneU32Of128::new(&self.0, byte_offset)
+    }
+
+    /// An aligned 64-bit lane view at `byte_offset` (0 or 8).
+    #[track_caller]
+    pub fn lane_u64(&self, byte_offset: usize) -> LaneU64Of128<'_> {
+        LaneU64Of128::new(&self.0, byte_offset)
+    }
+}
 
 atomic_int!(AtomicI8, i8);
 atomic_int!(AtomicI16, i16);

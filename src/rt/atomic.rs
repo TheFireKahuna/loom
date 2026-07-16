@@ -27,6 +27,19 @@
 //!   every region sharing one SC position. Reading the newest-per-region at one
 //!   step *is* the single-copy-atomic snapshot, while the histories stay
 //!   independent between wide ops.
+//! - **Cell coherence across loads** (`filter_seen_op_floors`): a load of one
+//!   region may never return a store that is modification-order-before the
+//!   sibling (same `op_id`) of a *multi-region* op the loading thread has
+//!   already observed through any other region of the cell. Single-copy
+//!   atomicity makes a wide op one indivisible event on the one cell: having
+//!   seen any part of it, a thread reading a sibling lane older than it would
+//!   travel backwards through that event — the witnessed futex failure was a
+//!   broadcaster whose masked queue-lane load missed a committed 128-bit push
+//!   CAS it had already observed through the value lane. Separate masked ops
+//!   share no `op_id`, so genuinely independent lanes stay independently
+//!   coherent (the per-lane staleness the region model exists to express),
+//!   and mo-*incomparable* racing stores stay readable — only genuine
+//!   travelled-backwards candidates are excluded.
 //! - **DPOR dependence stays cell-wide** (the whole cell is one exploration
 //!   object): disjoint-lane ops are still treated as dependent, so this is a
 //!   fidelity change only — it never prunes a schedule, only widens the set of
@@ -600,6 +613,10 @@ impl<T: Numeric> Atomic<T> {
                         ordering,
                     );
 
+                    // Cell coherence: never read this region from behind a
+                    // whole-cell op the thread already observed elsewhere.
+                    n = state.filter_seen_op_floors(ri, &execution.threads, &mut seed[..], n);
+
                     if multi {
                         // Keep only candidates consistent with the wide-op
                         // visibility earlier regions committed to.
@@ -926,6 +943,78 @@ impl State {
             .filter(|(_, r)| r.mask & mask != 0)
             .map(|(i, _)| i)
             .collect()
+    }
+
+    /// Cell coherence for sub-word loads (module docs): drop every candidate
+    /// in `seed[..n]` that is modification-order-before a region-`ri` store
+    /// belonging to a multi-region op the active thread has already observed
+    /// through *another* region of this cell. Returns the retained count.
+    ///
+    /// A region-`ri` store `f` is a **floor** when some other region holds a
+    /// store with the same `op_id` whose `first_seen` is inside the active
+    /// thread's causality — the thread has provably seen that whole-cell op
+    /// (its own earlier lane read, or a synchronized-with observation), so a
+    /// candidate mo-before `f` would read this lane from behind one
+    /// indivisible single-copy-atomic event. Only genuine `mo_before` edges
+    /// exclude: a racing store mo-incomparable to `f` stays readable (per-byte
+    /// coherence permits either order until something orders them), and
+    /// same-region observations need no floor — the plain coherence rules in
+    /// `match_load_to_stores` already cover them.
+    ///
+    /// The result can never be empty: a floor `f` is itself never mo-before
+    /// `f`, and every store excluded by the "seen a newer store" rule is
+    /// superseded by a store mo-after it, which also satisfies every floor.
+    ///
+    /// The RMW read path needs no such filter: `match_rmw_to_stores` offers
+    /// only modification-order-maximal stores, and a candidate mo-before a
+    /// floor has a known mo successor — it was never offered.
+    fn filter_seen_op_floors(
+        &self,
+        ri: usize,
+        threads: &thread::Set,
+        seed: &mut [u8],
+        n: usize,
+    ) -> usize {
+        // A cell never touched by a masked op has one region — no siblings.
+        if self.regions.len() <= 1 {
+            return n;
+        }
+
+        let region = &self.regions[ri];
+        let mut w = 0;
+
+        'candidate: for k in 0..n {
+            let c = &region.stores[seed[k] as usize];
+
+            for f_idx in 0..region.live_stores() {
+                let f = &region.stores[f_idx];
+                if !mo_before(c, f) {
+                    continue;
+                }
+                // `c` is mo-before `f`: exclude `c` iff `f` is the sibling of
+                // an op the thread has seen through another region.
+                for (rj, other) in self.regions.iter().enumerate() {
+                    if rj == ri {
+                        continue;
+                    }
+                    for j in 0..other.live_stores() {
+                        let d = &other.stores[j];
+                        if d.op_id == f.op_id && d.first_seen.is_seen_by_current(threads) {
+                            continue 'candidate;
+                        }
+                    }
+                }
+            }
+
+            seed[w] = seed[k];
+            w += 1;
+        }
+
+        assert!(
+            w > 0,
+            "[loom internal bug] cell-coherence floor filter emptied a readable set"
+        );
+        w
     }
 
     /// Compose the newest value across every region (each region contributes

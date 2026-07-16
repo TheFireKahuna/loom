@@ -29,10 +29,13 @@ where
     }
 
     /// Sub-word load: reads only the bits under `mask` (other bits zero). The
-    /// masked lane is independently coherent, so this may return a stale lane
-    /// value while another lane is seen fresh — the fidelity a single welded
-    /// ring cannot express. A load spanning more than one region still returns
-    /// a single consistent (non-torn) snapshot.
+    /// masked lane is independently coherent for separate masked stores, so
+    /// this may return a stale lane value while another lane is seen fresh —
+    /// the fidelity a single welded ring cannot express. It is nonetheless
+    /// **cell-coherent**: it can never read the lane from behind a whole-cell
+    /// op the thread has already observed through any lane (single-copy
+    /// atomicity; `rt::atomic` module docs). A load spanning more than one
+    /// region still returns a single consistent (non-torn) snapshot.
     #[track_caller]
     pub(crate) fn load_masked(&self, mask: T, order: Ordering) -> T {
         T::from_u128(self.state.load_masked(location!(), mask.into_u128(), order))

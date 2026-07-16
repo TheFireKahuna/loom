@@ -340,6 +340,82 @@ fn dpor_prunes_disjoint_lanes() {
     );
 }
 
+/// Cell coherence (the single-copy-atomicity claim): a masked load may never
+/// return a lane older than a **whole-cell** op the thread has already
+/// observed through another lane. A wide store is one indivisible event on
+/// the one 16-byte cell — having read its lane-B half, reading lane A from
+/// before it would travel backwards through that event, a schedule the
+/// production ISAs forbid (witnessed in ntlib as a broadcaster missing a
+/// committed 128-bit push it had already seen through the value lane).
+/// Contrast `masked_lanes_reorder_independently`: *separate* masked stores
+/// stay independently observable — only wide-op siblings couple.
+#[test]
+fn masked_load_never_travels_behind_seen_wide_op() {
+    loom::model(|| {
+        let x = Arc::new(AtomicU128::new(0));
+
+        // Split the cell into lane A / lane B.
+        x.store_masked(LANE_A, 0, Relaxed);
+
+        let w = {
+            let x = x.clone();
+            thread::spawn(move || {
+                // The wide op: both lanes in one single-copy-atomic event.
+                x.store(1u128 | (1u128 << 64), Relaxed);
+            })
+        };
+
+        // Observe the wide op through lane B ...
+        if x.load_masked(LANE_B, Relaxed) >> 64 == 1 {
+            // ... then lane A may never read from before it.
+            assert_eq!(
+                x.load_masked(LANE_A, Relaxed),
+                1,
+                "lane A read travelled behind a wide op already seen via lane B"
+            );
+        }
+
+        w.join().unwrap();
+    });
+}
+
+/// The synchronized-observation variant: the wide op is known through a
+/// release/acquire edge on a *different* atomic rather than the thread's own
+/// lane read. Pins that per-region write-read coherence (first-seen inside
+/// the acquired causality) covers the happens-before route — the floor filter
+/// is only needed for the same-thread cross-lane route above.
+#[test]
+fn masked_load_respects_wide_op_in_causality() {
+    use loom::sync::atomic::AtomicU32;
+
+    loom::model(|| {
+        let x = Arc::new(AtomicU128::new(0));
+        let flag = Arc::new(AtomicU32::new(0));
+
+        // Split the cell.
+        x.store_masked(LANE_A, 0, Relaxed);
+
+        let w = {
+            let x = x.clone();
+            let flag = flag.clone();
+            thread::spawn(move || {
+                x.store(1u128 | (1u128 << 64), Relaxed);
+                flag.store(1, SeqCst);
+            })
+        };
+
+        if flag.load(SeqCst) == 1 {
+            assert_eq!(
+                x.load_masked(LANE_A, Relaxed),
+                1,
+                "lane A read travelled behind a wide op in this thread's causality"
+            );
+        }
+
+        w.join().unwrap();
+    });
+}
+
 /// Basic correctness: a masked store to one lane leaves the other lane's bits
 /// exactly as they were.
 #[test]
