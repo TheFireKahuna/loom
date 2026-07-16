@@ -340,17 +340,18 @@ fn dpor_prunes_disjoint_lanes() {
     );
 }
 
-/// Cell coherence (the single-copy-atomicity claim): a masked load may never
-/// return a lane older than a **whole-cell** op the thread has already
+/// Lane-load cell coherence (the single-copy-atomicity claim): a typed lane
+/// `load()` is one coherent whole-cell read projected to the lane, so it may
+/// never return a lane older than a **whole-cell** op the thread has already
 /// observed through another lane. A wide store is one indivisible event on
 /// the one 16-byte cell — having read its lane-B half, reading lane A from
 /// before it would travel backwards through that event, a schedule the
 /// production ISAs forbid (witnessed in ntlib as a broadcaster missing a
 /// committed 128-bit push it had already seen through the value lane).
-/// Contrast `masked_lanes_reorder_independently`: *separate* masked stores
-/// stay independently observable — only wide-op siblings couple.
+/// Contrast `masked_lanes_reorder_independently`: `load_masked` itself stays
+/// independently coherent — the lane views carry the stronger model.
 #[test]
-fn masked_load_never_travels_behind_seen_wide_op() {
+fn lane_load_never_travels_behind_seen_wide_op() {
     loom::model(|| {
         let x = Arc::new(AtomicU128::new(0));
 
@@ -366,10 +367,10 @@ fn masked_load_never_travels_behind_seen_wide_op() {
         };
 
         // Observe the wide op through lane B ...
-        if x.load_masked(LANE_B, Relaxed) >> 64 == 1 {
+        if x.lane_u64(8).load(Relaxed) == 1 {
             // ... then lane A may never read from before it.
             assert_eq!(
-                x.load_masked(LANE_A, Relaxed),
+                x.lane_u64(0).load(Relaxed),
                 1,
                 "lane A read travelled behind a wide op already seen via lane B"
             );
@@ -379,11 +380,46 @@ fn masked_load_never_travels_behind_seen_wide_op() {
     });
 }
 
+/// The written-sibling route of the same claim: a thread that just *wrote*
+/// lane A still reads its own write through a lane view, and its lane-B
+/// projection stays coherent (never torn, never an invented value) against
+/// a racing wide CAS.
+#[test]
+fn lane_load_after_sibling_write_stays_coherent() {
+    loom::model(|| {
+        let x = Arc::new(AtomicU128::new(0));
+
+        // Split the cell.
+        x.store_masked(LANE_A, 0, Relaxed);
+
+        let w = {
+            let x = x.clone();
+            thread::spawn(move || {
+                let _ = x.compare_exchange(0, 1u128 | (1u128 << 64), SeqCst, SeqCst);
+            })
+        };
+
+        // Write lane A, then read lane B and lane A through lane views: if
+        // the wide CAS won (our lane-A write came second), the lane-B read
+        // must see its half.
+        x.lane_u64(0).store(2, SeqCst);
+        let b = x.lane_u64(8).load(SeqCst);
+        let a = x.lane_u64(0).load(SeqCst);
+        // Our own lane-A store is program-ordered before the reads: lane A
+        // reads back 2 always (the CAS lost or won before it).
+        assert_eq!(a, 2, "own lane store not visible to own lane load");
+        // And the lane-B read is a coherent projection: 0 or 1, never torn.
+        assert!(b == 0 || b == 1, "invented lane-B value {b}");
+
+        w.join().unwrap();
+    });
+}
+
 /// The synchronized-observation variant: the wide op is known through a
 /// release/acquire edge on a *different* atomic rather than the thread's own
 /// lane read. Pins that per-region write-read coherence (first-seen inside
-/// the acquired causality) covers the happens-before route — the floor filter
-/// is only needed for the same-thread cross-lane route above.
+/// the acquired causality) covers the happens-before route for plain masked
+/// loads too.
 #[test]
 fn masked_load_respects_wide_op_in_causality() {
     use loom::sync::atomic::AtomicU32;

@@ -11,10 +11,15 @@
 //! - stores/RMWs touch only the lane's region — the untouched bits are
 //!   physically preserved, and disjoint-lane ops keep their DPOR independence
 //!   (mask-intersection pruning);
-//! - loads are **cell-coherent**: independently stale per lane for separate
-//!   masked stores, but never behind a whole-cell op the loading thread has
-//!   already observed through any lane (`rt::atomic` module docs — the
-//!   single-copy-atomicity claim).
+//! - loads are **whole-cell projections**: one coherent full-cell read,
+//!   projected to the lane. This is deliberately stronger than the
+//!   independently-coherent `load_masked` — it models the carve-out's
+//!   normative claim (16-byte single-copy atomicity + same-line coherence:
+//!   an aligned lane load can never read the cell older than a whole-cell
+//!   op the thread has already observed through *any* lane, whether it read
+//!   or wrote that lane; the witnessed counter-schedule was a broadcaster's
+//!   queue-lane load missing a committed 128-bit push CAS). Consumers whose
+//!   hardware claim is weaker use `load_masked` directly.
 //!
 //! Byte offsets are offsets into the cell's **little-endian** in-memory
 //! representation — offset `k` names value bits `8k..8k+width` — matching a
@@ -85,10 +90,11 @@ macro_rules! lane_type {
                 self.from_cell(prior)
             }
 
-            /// Loads the lane's value (cell-coherent — module docs).
+            /// Loads the lane's value — one coherent whole-cell read
+            /// projected to the lane (module docs).
             #[track_caller]
             pub fn load(&self, order: Ordering) -> $lane {
-                self.from_cell(self.cell.load_masked(self.mask(), order))
+                self.from_cell(self.cell.load(order))
             }
 
             /// Stores into the lane, preserving every other bit of the cell.

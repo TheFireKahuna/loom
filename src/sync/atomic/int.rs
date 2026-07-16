@@ -56,15 +56,13 @@ macro_rules! atomic_int {
             }
 
             /// Sub-word load: reads only the bits under `mask` (other bits
-            /// zero). The masked lane is independently coherent for separate
-            /// masked stores — it may return a stale lane value while another
-            /// lane is seen fresh — but **cell-coherent** against whole-cell
-            /// ops: it can never read the lane from behind a multi-lane op
-            /// the thread has already observed through any lane (single-copy
-            /// atomicity; `rt::atomic` module docs). Models an aligned
-            /// sub-word load inside a wider single-copy-atomic cell (spec
-            /// carve-out #5). A load spanning more than one region still
-            /// returns a single consistent (non-torn) snapshot.
+            /// zero). The masked lane is independently coherent — it may return
+            /// a stale lane value while another lane is seen fresh (the typed
+            /// lane views' `load` is the stronger, whole-cell-projection
+            /// alternative). Models an aligned sub-word load inside a wider
+            /// single-copy-atomic cell (spec carve-out #5). A load spanning
+            /// more than one region still returns a single consistent
+            /// (non-torn) snapshot.
             #[track_caller]
             pub fn load_masked(&self, mask: $int_type, order: Ordering) -> $int_type {
                 self.0.load_masked(mask, order)
