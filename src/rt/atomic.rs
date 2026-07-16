@@ -165,6 +165,7 @@ use crate::rt::{
     self, thread, Access, Numeric, Synchronize, VersionVec, MAX_ATOMIC_HISTORY, MAX_THREADS,
 };
 
+use smallvec::SmallVec;
 use std::cmp;
 use std::marker::PhantomData;
 use std::sync::atomic::Ordering;
@@ -231,6 +232,16 @@ pub(super) struct State {
     /// ops to different lanes get distinct ids (independence). The genesis
     /// store is id 0.
     op_clock: u64,
+
+    /// Bitset (one bit per thread id) of threads that have *touched a store's
+    /// `first_seen`* in this cell — i.e. loaded, stored, or rmw'd it, plus the
+    /// creating thread for the genesis store. A `fence(Acquire)` synchronizes
+    /// only with stores the active thread has touched, and a `fence(SeqCst)`
+    /// only promotes stores the active thread created; both are impossible in
+    /// a cell whose bit for the active thread is clear, so such cells are
+    /// skipped wholesale instead of scanning their stores. Maintained wherever
+    /// `first_seen.touch` runs (see `track_load`/`track_store`).
+    touched_by: u32,
 }
 
 /// One sub-word region of a cell: a bit-mask and the store history over just
@@ -387,8 +398,15 @@ fn mo_before(a: &Store, b: &Store) -> bool {
     a.id != b.id && b.modification_order.lane(a.creator) >= a.tick()
 }
 
+/// Per-thread "version at which this thread first saw the store", padded to
+/// `VersionVec::LANES` so `is_seen_in` is a single branchless all-lane compare
+/// against a `VersionVec`'s lane array. The padding lanes
+/// `MAX_THREADS..LANES` are held at `u16::MAX` (matches no view lane, which is
+/// `<= MAX_THREADS`-bounded and structurally zero in padding), so they are
+/// inert in every comparison — exactly like the real lanes of a thread that
+/// has not seen the store.
 #[derive(Debug, Clone)]
-struct FirstSeen([u16; MAX_THREADS]);
+struct FirstSeen([u16; VersionVec::LANES]);
 
 /// Implements atomic fence behavior
 pub(crate) fn fence(ordering: Ordering) {
@@ -414,7 +432,13 @@ fn fence_acq(execution: &mut Execution) {
     // A store this thread itself created also touches `first_seen`, which is
     // harmless here: its release view is already contained in (or, for an
     // RMW, legitimately acquired through) this thread's causality.
+    let active_bit = 1u32 << execution.threads.active_id().as_usize();
     for state in execution.objects.iter_mut::<State>() {
+        // No store in this cell was ever touched by the active thread, so
+        // `is_touched_by` below is false for all of them — skip the scan.
+        if state.touched_by & active_bit == 0 {
+            continue;
+        }
         // Iterate every region's stores
         for store in state.all_stores_mut() {
             if !store.first_seen.is_touched_by(execution.threads.active_id()) {
@@ -453,7 +477,14 @@ fn fence_seqcst(execution: &mut Execution) {
     // the `seq_cst_fence` causality frontier above, which handles fence↔fence.
     let pos = execution.threads.begin_sc_fence();
     let creator = execution.threads.active_id().as_usize();
+    let creator_bit = 1u32 << creator;
     for state in execution.objects.iter_mut::<State>() {
+        // Promotion only affects stores whose `creator` is this thread, and
+        // every such store set this thread's `touched_by` bit — so a cell
+        // without the bit has nothing to promote.
+        if state.touched_by & creator_bit == 0 {
+            continue;
+        }
         state.promote_sc_writes(creator, pos);
     }
 }
@@ -551,7 +582,7 @@ impl<T: Numeric> Atomic<T> {
             // ops to different lanes share no `op_id`, so this never couples
             // independent lanes — they stay free to be read in either order.
             let multi = covered.len() > 1;
-            let mut resolved: Vec<(u64, bool)> = Vec::new();
+            let mut resolved: SmallVec<[(u64, bool); 8]> = SmallVec::new();
             let mut result = 0u128;
 
             for ri in covered {
@@ -674,7 +705,7 @@ impl<T: Numeric> Atomic<T> {
             // Read the current value: each covered region's RMW reads a
             // modification-order-maximal store (`match_rmw_to_stores`).
             let mut current = 0u128;
-            let mut reads: Vec<(usize, usize)> = Vec::new();
+            let mut reads: SmallVec<[(usize, usize); 4]> = SmallVec::new();
 
             for ri in state.covered(mask) {
                 if execution.path.is_traversed() {
@@ -828,6 +859,9 @@ impl State {
             is_mutating: false,
             regions: vec![Region::new(FULL_MASK)],
             op_clock: 0,
+            // The genesis store's `first_seen` is touched by the creating
+            // thread, so seed its bit.
+            touched_by: 1 << threads.active_id().as_usize(),
         };
 
         // All subsequent accesses must happen-after.
@@ -885,7 +919,7 @@ impl State {
     /// Indices of the regions covered by `mask` (those whose bits intersect
     /// it). After `ensure_partition(mask)` every such region is fully inside
     /// the mask.
-    fn covered(&self, mask: u128) -> Vec<usize> {
+    fn covered(&self, mask: u128) -> SmallVec<[usize; 4]> {
         self.regions
             .iter()
             .enumerate()
@@ -921,6 +955,11 @@ impl State {
     /// Track an atomic load
     fn track_load(&mut self, threads: &thread::Set) {
         assert!(!self.is_mutating, "atomic cell is in `with_mut` call");
+
+        // This op will `touch` a store's `first_seen` (a load reads one; an rmw
+        // reads then writes). Record the active thread so acquire fences can
+        // skip this cell if no thread of theirs ever touched it.
+        self.touched_by |= 1 << threads.active_id().as_usize();
 
         let current = &threads.active().causality;
 
@@ -971,6 +1010,11 @@ impl State {
     /// Track an atomic store
     fn track_store(&mut self, threads: &thread::Set) {
         assert!(!self.is_mutating, "atomic cell is in `with_mut` call");
+
+        // This op creates a store whose `first_seen` is touched by the active
+        // thread; record it so seqcst fences can skip promoting cells this
+        // thread never wrote (and acquire fences can skip it entirely).
+        self.touched_by |= 1 << threads.active_id().as_usize();
 
         let current = &threads.active().causality;
 
@@ -1218,7 +1262,7 @@ impl Region {
     /// implies, so later regions of the same multi-region load stay consistent
     /// with it. Every live op in this region is resolved by the read's mo
     /// position relative to it.
-    fn record_resolutions(&self, c_index: usize, resolved: &mut Vec<(u64, bool)>) {
+    fn record_resolutions(&self, c_index: usize, resolved: &mut SmallVec<[(u64, bool); 8]>) {
         let c = &self.stores[c_index];
         for i in 0..self.live_stores() {
             let d = &self.stores[i];
@@ -1634,7 +1678,7 @@ impl Default for Store {
 
 impl FirstSeen {
     fn new() -> FirstSeen {
-        FirstSeen([u16::max_value(); MAX_THREADS])
+        FirstSeen([u16::max_value(); VersionVec::LANES])
     }
 
     fn touch(&mut self, threads: &thread::Set) {
@@ -1644,7 +1688,7 @@ impl FirstSeen {
     }
 
     fn is_seen_by_current(&self, threads: &thread::Set) -> bool {
-        self.is_seen_in(&threads.active().causality, threads.execution_id())
+        self.is_seen_in(&threads.active().causality)
     }
 
     /// True if the given thread has itself loaded from (or created) the
@@ -1654,16 +1698,20 @@ impl FirstSeen {
     }
 
     /// True if some thread's first sight of the store is contained in `view`.
-    fn is_seen_in(&self, view: &VersionVec, execution_id: crate::rt::execution::Id) -> bool {
-        for (thread_id, version) in view.versions(execution_id) {
-            match self.0[thread_id.as_usize()] {
-                u16::MAX => {}
-                v if v <= version => return true,
-                _ => {}
-            }
+    ///
+    /// Branchless all-lane form: for every lane, the store is seen through that
+    /// thread iff its first-seen version is real (`!= u16::MAX`) and `<=` the
+    /// view's version for that thread. Padding lanes hold `u16::MAX` on the
+    /// left and `0` on the right, so they never contribute — identical result
+    /// to the old per-thread scan over `0..MAX_THREADS`, minus the branches.
+    fn is_seen_in(&self, view: &VersionVec) -> bool {
+        let lanes = view.lanes();
+        let mut mask = 0u32;
+        for i in 0..VersionVec::LANES {
+            let fs = self.0[i];
+            mask |= ((fs != u16::MAX) as u32) & ((fs <= lanes[i]) as u32);
         }
-
-        false
+        mask != 0
     }
 
     fn is_seen_before_yield(&self, threads: &thread::Set) -> bool {

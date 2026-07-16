@@ -1,7 +1,7 @@
 use crate::rt::alloc::Allocation;
 use crate::rt::{lazy_static, object, thread, Path};
 
-use std::collections::HashMap;
+use rustc_hash::FxHashMap;
 use std::fmt;
 
 use tracing::info;
@@ -21,9 +21,9 @@ pub(crate) struct Execution {
     pub(super) objects: object::Store,
 
     /// Maps raw allocations to LeakTrack objects
-    pub(super) raw_allocations: HashMap<usize, Allocation>,
+    pub(super) raw_allocations: FxHashMap<usize, Allocation>,
 
-    pub(crate) arc_objs: HashMap<*const (), std::sync::Arc<super::Arc>>,
+    pub(crate) arc_objs: FxHashMap<*const (), std::sync::Arc<super::Arc>>,
 
     /// The object whose access records the previous `schedule()` call
     /// updated (via `set_last_access`), if any. This is what makes the
@@ -68,8 +68,8 @@ impl Execution {
             threads,
             lazy_statics: lazy_static::Set::new(),
             objects: object::Store::with_capacity(max_branches),
-            raw_allocations: HashMap::new(),
-            arc_objs: HashMap::new(),
+            raw_allocations: FxHashMap::default(),
+            arc_objs: FxHashMap::default(),
             dpor_update: None,
             max_threads,
             max_history: 7,

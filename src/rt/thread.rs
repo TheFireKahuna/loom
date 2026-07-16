@@ -250,10 +250,6 @@ impl Set {
         }
     }
 
-    pub(crate) fn execution_id(&self) -> execution::Id {
-        self.execution_id
-    }
-
     /// Create a new thread
     pub(crate) fn new_thread(&mut self) -> Id {
         assert!(self.threads.len() < self.max());

@@ -27,6 +27,16 @@ futures = []
 cfg-if = "1.0.0"
 scoped-tls = "1.0.0"
 
+# Small-vector optimization for the atomic model's per-op scratch buffers
+# (region cover sets, wide-op resolution lists) — these are almost always
+# 1-4 elements and were heap-allocating on every modeled atomic access.
+smallvec = "1.11"
+
+# Faster (non-DoS-resistant) hashing for the internal pointer-keyed maps of
+# raw allocations and Arc objects. Keys are process addresses / small ints;
+# the default SipHash is pure overhead here.
+rustc-hash = "2"
+
 # Provides a generator based runtime
 generator = "0.8.1"
 

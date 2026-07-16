@@ -1,4 +1,4 @@
-use crate::rt::{execution, thread, MAX_THREADS};
+use crate::rt::{thread, MAX_THREADS};
 
 #[cfg(feature = "checkpoint")]
 use serde::{Deserialize, Serialize};
@@ -21,20 +21,23 @@ pub(crate) struct VersionVec {
 }
 
 impl VersionVec {
+    /// Number of physical lanes (`MAX_THREADS` rounded up to a SIMD register).
+    /// Padding lanes `MAX_THREADS..LANES` are structurally zero — see the
+    /// module-level invariant.
+    pub(crate) const LANES: usize = LANES;
+
     pub(crate) fn new() -> VersionVec {
         VersionVec {
             versions: [0; LANES],
         }
     }
 
-    pub(crate) fn versions(
-        &self,
-        execution_id: execution::Id,
-    ) -> impl Iterator<Item = (thread::Id, u16)> + '_ {
-        self.versions[..MAX_THREADS]
-            .iter()
-            .enumerate()
-            .map(move |(thread_id, &version)| (thread::Id::new(execution_id, thread_id), version))
+    /// The raw lane array, including the always-zero padding lanes. Exposed so
+    /// callers holding a parallel `[u16; LANES]` (e.g. `FirstSeen`) can do a
+    /// single branchless all-lane comparison instead of a per-thread scalar
+    /// scan.
+    pub(crate) fn lanes(&self) -> &[u16; LANES] {
+        &self.versions
     }
 
     pub(crate) fn inc(&mut self, id: thread::Id) {
