@@ -2,7 +2,7 @@ use crate::rt::execution;
 use crate::rt::object::Operation;
 use crate::rt::vv::VersionVec;
 
-use std::{any::Any, collections::HashMap, fmt, ops};
+use std::{any::Any, fmt, ops};
 
 use super::Location;
 pub(crate) struct Thread {
@@ -111,7 +111,13 @@ pub(crate) enum State {
     Terminated,
 }
 
-type LocalMap = HashMap<LocalKeyId, LocalValue>;
+/// Locals, keyed by the `LocalKey`'s address, in creation order.
+///
+/// Creation order is load-bearing twice over: destructors run in *reverse*
+/// creation order (`take_next_local`), and the order must be deterministic
+/// across iterations — destructors run tracked ops, so a randomized (hash)
+/// order would make one iteration's path diverge from its replay.
+type LocalMap = Vec<(LocalKeyId, LocalValue)>;
 
 #[derive(Eq, PartialEq, Hash, Copy, Clone)]
 struct LocalKeyId(usize);
@@ -132,7 +138,7 @@ impl Thread {
             dpor_vv: VersionVec::new(),
             last_yield: None,
             yield_count: 0,
-            locals: HashMap::new(),
+            locals: Vec::new(),
         }
     }
 
@@ -174,15 +180,17 @@ impl Thread {
         self.state = State::Terminated;
     }
 
-    pub(crate) fn drop_locals(&mut self) -> Box<dyn std::any::Any> {
-        let mut locals = Vec::with_capacity(self.locals.len());
-
-        // run the Drop impls of any mock thread-locals created by this thread.
-        for local in self.locals.values_mut() {
-            locals.push(local.0.take());
-        }
-
-        Box::new(locals)
+    /// Take the most recently created local that has not yet been
+    /// destroyed, leaving its tombstone in place: later accesses to the key
+    /// error with `AccessError` ("already destroyed"), like `std` during
+    /// TLS teardown. Reverse creation order matches the usual destructor
+    /// convention — a later local's destructor may still read an earlier
+    /// one.
+    pub(crate) fn take_next_local(&mut self) -> Option<Box<dyn Any>> {
+        self.locals
+            .iter_mut()
+            .rev()
+            .find_map(|(_, local)| local.0.take())
     }
 
     pub(crate) fn unpark(&mut self, unparker: &Thread) {
@@ -465,10 +473,13 @@ impl Set {
         &mut self,
         key: &'static crate::thread::LocalKey<T>,
     ) -> Option<Result<&T, AccessError>> {
+        let key = LocalKeyId::new(key);
+
         self.active_mut()
             .locals
-            .get(&LocalKeyId::new(key))
-            .map(|local_value| local_value.get())
+            .iter()
+            .find(|(k, _)| *k == key)
+            .map(|(_, local_value)| local_value.get())
     }
 
     pub(crate) fn local_init<T: 'static>(
@@ -476,11 +487,11 @@ impl Set {
         key: &'static crate::thread::LocalKey<T>,
         value: T,
     ) {
-        assert!(self
-            .active_mut()
-            .locals
-            .insert(LocalKeyId::new(key), LocalValue::new(value))
-            .is_none())
+        let key = LocalKeyId::new(key);
+        let locals = &mut self.active_mut().locals;
+
+        assert!(locals.iter().all(|(k, _)| *k != key));
+        locals.push((key, LocalValue::new(value)));
     }
 }
 

@@ -166,6 +166,13 @@ where
             });
 
             *result.lock().unwrap() = Some(Ok(f()));
+
+            // Run this thread's `thread_local` destructors before notifying
+            // the join handle, so their effects happen-before `join`
+            // returns — mirroring real TLS destructors, which run before
+            // the thread can be observed as finished.
+            rt::drop_locals();
+
             notify.notify(location);
         })
     };

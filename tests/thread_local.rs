@@ -48,6 +48,71 @@ fn nested_with() {
 }
 
 #[test]
+fn tracked_drop_runs_before_join() {
+    use loom::sync::atomic::AtomicUsize as LoomAtomicUsize;
+    use std::sync::Arc;
+
+    struct TrackedDrop(Arc<LoomAtomicUsize>);
+
+    impl Drop for TrackedDrop {
+        fn drop(&mut self) {
+            // A loom-tracked RMW: it must run as an ordinary explored op
+            // of the dying thread, inside the execution.
+            self.0.fetch_add(1, Ordering::AcqRel);
+        }
+    }
+
+    loom::thread_local! {
+        static TRACKED: RefCell<Option<TrackedDrop>> = RefCell::new(None);
+    }
+
+    loom::model(|| {
+        let counter = Arc::new(LoomAtomicUsize::new(0));
+
+        {
+            let counter = counter.clone();
+            thread::spawn(move || {
+                TRACKED.with(|local| *local.borrow_mut() = Some(TrackedDrop(counter)));
+            })
+            .join()
+            .unwrap();
+        }
+
+        // TLS destructors run on the exiting thread, before `join`
+        // observes it as finished — in every schedule.
+        assert_eq!(counter.load(Ordering::Acquire), 1);
+    });
+}
+
+#[test]
+fn tracked_drop_on_main_thread() {
+    use loom::sync::atomic::AtomicUsize as LoomAtomicUsize;
+    use std::sync::Arc;
+
+    struct TrackedDrop(Arc<LoomAtomicUsize>);
+
+    impl Drop for TrackedDrop {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::AcqRel);
+        }
+    }
+
+    loom::thread_local! {
+        static TRACKED: RefCell<Option<TrackedDrop>> = RefCell::new(None);
+    }
+
+    loom::model(|| {
+        let counter = Arc::new(LoomAtomicUsize::new(0));
+
+        TRACKED.with(|local| *local.borrow_mut() = Some(TrackedDrop(counter)));
+
+        // The main thread's local drops at execution end, still inside
+        // the execution: the tracked op in the destructor must not trip
+        // the outside-a-model guard.
+    });
+}
+
+#[test]
 fn drop() {
     static DROPS: AtomicUsize = AtomicUsize::new(0);
 

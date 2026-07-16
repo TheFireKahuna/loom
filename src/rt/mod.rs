@@ -273,17 +273,37 @@ where
     Scheduler::with_execution(f)
 }
 
+/// Run the active thread's `thread_local` destructors, on the thread,
+/// inside the execution: each value is taken out under the execution
+/// borrow, then dropped as ordinary user code, so tracked operations in
+/// `Drop` impls are explored like any other op. Values drop in reverse
+/// creation order. A destructor may access (or lazily create) other
+/// locals: newly created values are destroyed in a later pass, and
+/// re-accessing a destroyed key errors (`AccessError`), like `std`.
+pub(crate) fn drop_locals() {
+    loop {
+        let local = execution(|execution| {
+            let thread = execution.threads.active_id();
+            let local = execution.threads.active_mut().take_next_local();
+
+            trace!(?thread, dropping = local.is_some(), "drop_locals");
+
+            local
+        });
+
+        match local {
+            // Drop as user code of the still-live thread.
+            Some(local) => drop(local),
+            None => return,
+        }
+    }
+}
+
 pub fn thread_done() {
-    let locals = execution(|execution| {
-        let thread = execution.threads.active_id();
-
-        trace!(?thread, "thread_done: drop locals");
-
-        execution.threads.active_mut().drop_locals()
-    });
-
-    // Drop outside of the execution context
-    drop(locals);
+    // Locals are normally dropped earlier, before the join handle is
+    // notified (see `thread::spawn_internal`); sweep up any created since,
+    // e.g. by a `lazy_static` value's own teardown.
+    drop_locals();
 
     execution(|execution| {
         let thread = execution.threads.active_id();

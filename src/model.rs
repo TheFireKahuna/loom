@@ -193,6 +193,11 @@ impl Builder {
             scheduler.run(&mut execution, move || {
                 f();
 
+                // Run the main thread's `thread_local` destructors before
+                // the lazy_statics tear down: a TLS destructor may still
+                // read a static, never the reverse.
+                rt::drop_locals();
+
                 let lazy_statics = rt::execution(|execution| execution.lazy_statics.drop());
 
                 // drop outside of execution
