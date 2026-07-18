@@ -37,6 +37,6 @@ impl Access {
     }
 
     pub(crate) fn happens_before(&self, version: &VersionVec) -> bool {
-        self.dpor_vv <= *version
+        self.dpor_vv.is_le(version)
     }
 }

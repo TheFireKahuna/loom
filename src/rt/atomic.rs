@@ -943,6 +943,12 @@ impl State {
     /// it). After `ensure_partition(mask)` every such region is fully inside
     /// the mask.
     fn covered(&self, mask: u128) -> SmallVec<[usize; 4]> {
+        // Regions partition the cell, so a full-width mask covers all of them:
+        // skip the per-region intersection test on the common path.
+        if mask == FULL_MASK {
+            return (0..self.regions.len()).collect();
+        }
+
         self.regions
             .iter()
             .enumerate()
@@ -1154,12 +1160,34 @@ impl State {
         let region = &self.regions[ri];
         let mut w = 0;
 
+        // `op_seen_through_other_region` is an O(regions x stores^2) sweep whose
+        // answer depends only on the floor slot (`f.op_id` is a function of
+        // `f_idx` — one region holds one store per op). The candidate loop
+        // re-asks it for the same floors up to `n` times, so resolve each slot
+        // at most once. `None` = not yet asked; the floor is only consulted
+        // when `mo_before` holds, so this stays lazy.
+        let live = region.live_stores();
+        let mut seen_memo: [Option<bool>; MAX_ATOMIC_HISTORY] = [None; MAX_ATOMIC_HISTORY];
+
         'candidate: for k in 0..n {
             let c = &region.stores[seed[k] as usize];
 
-            for f_idx in 0..region.live_stores() {
+            for f_idx in 0..live {
                 let f = &region.stores[f_idx];
-                if mo_before(c, f) && self.op_seen_through_other_region(ri, f.op_id, threads) {
+                if !mo_before(c, f) {
+                    continue;
+                }
+
+                let seen = match seen_memo[f_idx] {
+                    Some(seen) => seen,
+                    None => {
+                        let seen = self.op_seen_through_other_region(ri, f.op_id, threads);
+                        seen_memo[f_idx] = Some(seen);
+                        seen
+                    }
+                };
+
+                if seen {
                     continue 'candidate;
                 }
             }
@@ -1809,8 +1837,20 @@ impl Region {
         //
         // Add all stores **unless** a newer store has already been seen by the
         // current thread's causality.
+        //
+        // `is_seen_by_current` is an all-lane compare that depends only on `j`,
+        // yet the pair loop can re-ask it for the same store once per `i`.
+        // Resolve each store at most once, and only if some `mo_before` edge
+        // actually reaches it — a lazy memo does no work the pair loop did not
+        // already require.
+        let mut seen_memo: [Option<bool>; MAX_ATOMIC_HISTORY] = [None; MAX_ATOMIC_HISTORY];
+
         'outer: for i in 0..live {
             let store_i = &self.stores[i];
+
+            // Depends only on `i`; the `mo_before` guard below still gates
+            // whether it is consulted at all.
+            let seen_before_yield_i = store_i.first_seen.is_seen_before_yield(threads);
 
             for j in 0..live {
                 let store_j = &self.stores[j];
@@ -1829,12 +1869,21 @@ impl Region {
                         }
                     }
 
-                    if store_j.first_seen.is_seen_by_current(threads) {
+                    let seen_j = match seen_memo[j] {
+                        Some(seen) => seen,
+                        None => {
+                            let seen = store_j.first_seen.is_seen_by_current(threads);
+                            seen_memo[j] = Some(seen);
+                            seen
+                        }
+                    };
+
+                    if seen_j {
                         // Store `j` is newer, so don't store the current one.
                         continue 'outer;
                     }
 
-                    if store_i.first_seen.is_seen_before_yield(threads) {
+                    if seen_before_yield_i {
                         // Saw this load before the previous yield. In order to
                         // advance the model, don't return it again.
                         continue 'outer;

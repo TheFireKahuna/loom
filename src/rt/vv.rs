@@ -61,6 +61,20 @@ impl VersionVec {
         }
     }
 
+    /// True when `self <= other` in every lane.
+    ///
+    /// The one-sided form of `partial_cmp`, which computes the `ge` reduction
+    /// as well and discards it. This is the happens-before test on the DPOR
+    /// scan (`Access::happens_before`), the hottest comparison in the runtime,
+    /// where the `ge` half is never consulted.
+    pub(crate) fn is_le(&self, other: &VersionVec) -> bool {
+        let mut le = true;
+        for i in 0..LANES {
+            le &= self.versions[i] <= other.versions[i];
+        }
+        le
+    }
+
     /// Returns the thread ID, if any, that is ahead of the current version.
     pub(crate) fn ahead(&self, other: &VersionVec) -> Option<usize> {
         // Branchless lane compare + first-set-bit, rather than an early-out
