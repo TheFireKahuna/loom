@@ -452,6 +452,138 @@ fn masked_load_respects_wide_op_in_causality() {
     });
 }
 
+/// The headline of the refined lane load: a value-lane `load()` commutes with
+/// disjoint queue-lane CAS traffic. The ntlib futex-word shape — the value
+/// dword (bytes 12..16) read while a peer churns the group-S qword (bytes
+/// 0..8) with CASes — is exactly the "value traffic vs queue traffic" mix the
+/// lane load used to serialize when it read the whole cell. The mask-scoped
+/// `load()` is dependent only with ops touching the value bytes, disjoint from
+/// group S, so the two threads commute and the schedule space collapses. The
+/// baseline is a full-cell `AtomicU128::load` — precisely what the lane load
+/// compiled to before F12 (`Action::Load(FULL_MASK)`, dependent with every
+/// group-S CAS). Same coherence, dramatically fewer schedules.
+#[test]
+fn refined_lane_load_commutes_with_disjoint_lane_cas() {
+    fn iterations(whole_cell: bool) -> usize {
+        let n = Arc::new(AtomicUsize::new(0));
+        let n_ = n.clone();
+        loom::model(move || {
+            n.fetch_add(1, Relaxed);
+            let x = Arc::new(AtomicU128::new(0));
+
+            let t = {
+                let x = x.clone();
+                thread::spawn(move || {
+                    // Group-S (low qword) queue churn.
+                    let q = x.lane_u64(0);
+                    let _ = q.compare_exchange(0, 1, Relaxed, Relaxed);
+                    let _ = q.compare_exchange(1, 2, Relaxed, Relaxed);
+                    let _ = q.compare_exchange(2, 3, Relaxed, Relaxed);
+                })
+            };
+
+            if whole_cell {
+                // The pre-F12 cost: reading the whole cell is dependent with
+                // every group-S CAS.
+                let _ = x.load(Relaxed);
+                let _ = x.load(Relaxed);
+                let _ = x.load(Relaxed);
+            } else {
+                // Disjoint value-dword reads (bytes 12..16 — the VALUE lane).
+                let v = x.lane_u32(12);
+                v.load(Relaxed);
+                v.load(Relaxed);
+                v.load(Relaxed);
+            }
+
+            t.join().unwrap();
+        });
+        n_.load(Relaxed)
+    }
+
+    let refined = iterations(false);
+    let whole = iterations(true);
+    assert!(
+        refined * 4 <= whole,
+        "refined lane load did not prune disjoint-lane dependence: refined={} whole_cell={}",
+        refined,
+        whole
+    );
+}
+
+/// Coherence is preserved under the refined (mask-scoped) load — the RMW /
+/// written-sibling route of single-copy atomicity. A thread whose own lane-A
+/// RMW landed *after* a wide op (its swap returned the wide op's lane-A half)
+/// has provably passed that one indivisible 16-byte event, so a subsequent
+/// lane-B read may not travel behind it. Pruning the DPOR dependence must not
+/// weaken this: `filter_seen_op_floors` excludes the pre-wide-op lane-B value
+/// once the thread's lane-A store is seen mo-after the wide op's sibling.
+#[test]
+fn refined_lane_load_after_passing_wide_op_is_coherent() {
+    loom::model(|| {
+        let x = Arc::new(AtomicU128::new(0));
+        x.store_masked(LANE_A, 0, Relaxed); // split into lane A / lane B
+
+        let w = {
+            let x = x.clone();
+            thread::spawn(move || {
+                let _ = x.compare_exchange(0, 1u128 | (1u128 << 64), SeqCst, SeqCst);
+            })
+        };
+
+        // Our own lane-A swap: the value it returns tells us whether we landed
+        // after the wide CAS (we read its lane-A half, 1).
+        let prev_a = x.lane_u64(0).swap(2, SeqCst);
+        let b = x.lane_u64(8).load(SeqCst);
+        if prev_a == 1 {
+            assert_eq!(
+                b, 1,
+                "lane B read travelled behind a wide op this thread's lane-A RMW passed"
+            );
+        }
+
+        w.join().unwrap();
+    });
+}
+
+/// Pruning soundness for loads across an *overlapping* lane: the refined value
+/// load must stay dependent with an op it shares bytes with. The value dword
+/// (bytes 12..16) is nested in the high qword (bytes 8..16); a value load
+/// racing a high-qword store must still explore both orders, so both the stale
+/// and the fresh value remain reachable. (The mask-scoped dependence prunes
+/// only genuinely disjoint lanes — `refined_lane_load_commutes_...` — never
+/// overlapping ones.)
+#[test]
+fn refined_value_load_stays_dependent_on_overlapping_high() {
+    let seen = Arc::new(Mutex::new(HashSet::new()));
+    let seen_ = seen.clone();
+    loom::model(move || {
+        let x = Arc::new(AtomicU128::new(0));
+
+        let w = {
+            let x = x.clone();
+            thread::spawn(move || {
+                // Write the whole high qword (owner+value); the value dword is
+                // its top half.
+                x.lane_u64(8).store(7u64 | (9u64 << 32), Relaxed);
+            })
+        };
+
+        // Read just the value dword (top 32 bits of the high qword): 0 (initial)
+        // or 9 (the store), both reachable because the ops overlap.
+        let v = x.lane_u32(12).load(Relaxed);
+        seen_.lock().unwrap().insert(v);
+
+        w.join().unwrap();
+    });
+    let seen = Arc::try_unwrap(seen).unwrap().into_inner().unwrap();
+    assert!(
+        seen.contains(&0) && seen.contains(&9),
+        "overlapping value load lost an outcome (dependence wrongly pruned): {:?}",
+        seen
+    );
+}
+
 /// Basic correctness: a masked store to one lane leaves the other lane's bits
 /// exactly as they were.
 #[test]
@@ -463,5 +595,43 @@ fn masked_store_preserves_other_lane() {
         let v = x.load(Relaxed);
         assert_eq!(v & LANE_A, 5, "lane A wrong: {:#x}", v);
         assert_eq!(v & LANE_B, 1u128 << 64, "lane B clobbered: {:#x}", v);
+    });
+}
+
+/// A wide load must find a consistent whole-cell snapshot even when one region
+/// is already pinned by plain coherence to a store that sees a wide op while an
+/// earlier-resolved region still has candidates that do not.
+///
+/// The walk resolves regions in `covered` order, so the value dword is split
+/// off first here to make it resolve *before* the low qword — the pinned
+/// region must come second or the constraint is discovered early and nothing
+/// dead-ends (the shape's whole subtlety). The reader then sees the wide store
+/// through the low qword, which read-read coherence pins to it, while the value
+/// dword may still read the initial store. Filtering only against what earlier
+/// regions committed to lets the value dword choose not-seeing, leaving the
+/// pinned region with nothing: a dead end the walk cannot back out of, once
+/// reported as `[loom internal bug] no consistent store for a wide load` rather
+/// than as any property of the model.
+#[test]
+fn wide_load_completes_when_a_region_is_pinned_to_a_wide_op() {
+    loom::model(|| {
+        let x = Arc::new(AtomicU128::new(0));
+        // Split the value dword off FIRST so it resolves before the low qword.
+        x.store_masked(VALUE, 0, Relaxed);
+        x.store_masked(S_MASK, 0, Relaxed);
+
+        let w = {
+            let x = x.clone();
+            thread::spawn(move || x.store(!0u128, Relaxed))
+        };
+
+        // Pin the low qword to the wide op, then take a whole-cell snapshot:
+        // single-copy atomicity means every region must agree it happened.
+        if x.load_masked(S_MASK, Relaxed) != 0 {
+            let v = x.load(Relaxed);
+            assert_eq!(v & S_MASK, S_MASK, "wide op seen in one region only");
+        }
+
+        w.join().unwrap();
     });
 }

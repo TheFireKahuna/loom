@@ -11,15 +11,16 @@
 //! - stores/RMWs touch only the lane's region — the untouched bits are
 //!   physically preserved, and disjoint-lane ops keep their DPOR independence
 //!   (mask-intersection pruning);
-//! - loads are **whole-cell projections**: one coherent full-cell read,
-//!   projected to the lane. This is deliberately stronger than the
-//!   independently-coherent `load_masked` — it models the carve-out's
-//!   normative claim (16-byte single-copy atomicity + same-line coherence:
-//!   an aligned lane load can never read the cell older than a whole-cell
-//!   op the thread has already observed through *any* lane, whether it read
-//!   or wrote that lane; the witnessed counter-schedule was a broadcaster's
-//!   queue-lane load missing a committed 128-bit push CAS). Consumers whose
-//!   hardware claim is weaker use `load_masked` directly.
+//! - loads are **whole-cell-coherent lane reads**: the lane reads its own bits
+//!   only — DPOR-scoped to the lane, so it commutes with disjoint-lane traffic
+//!   just like the stores — but its readable set is narrowed so it can never
+//!   read the lane older than a whole-cell op the thread has already observed
+//!   through *any* sibling, whether it read or wrote that lane (16-byte
+//!   single-copy atomicity + same-line coherence; the witnessed
+//!   counter-schedule was a broadcaster's queue-lane load missing a committed
+//!   128-bit push CAS). This is deliberately stronger in *coherence* than the
+//!   independently-coherent `load_masked`, yet just as cheap in *dependence*.
+//!   Consumers whose hardware claim is weaker use `load_masked` directly.
 //!
 //! Byte offsets are offsets into the cell's **little-endian** in-memory
 //! representation — offset `k` names value bits `8k..8k+width` — matching a
@@ -90,11 +91,15 @@ macro_rules! lane_type {
                 self.from_cell(prior)
             }
 
-            /// Loads the lane's value — one coherent whole-cell read
-            /// projected to the lane (module docs).
+            /// Loads the lane's value — a whole-cell-coherent lane read
+            /// (module docs): it reads only the lane's own bits, DPOR-scoped to
+            /// the lane so it commutes with disjoint-lane traffic, but its
+            /// readable set is narrowed so it can never travel behind a
+            /// whole-cell op this thread has already observed through any
+            /// sibling lane.
             #[track_caller]
             pub fn load(&self, order: Ordering) -> $lane {
-                self.from_cell(self.cell.load(order))
+                self.from_cell(self.cell.load_coherent_lane(self.mask(), order))
             }
 
             /// Stores into the lane, preserving every other bit of the cell.

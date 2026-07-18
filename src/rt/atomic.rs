@@ -27,19 +27,26 @@
 //!   every region sharing one SC position. Reading the newest-per-region at one
 //!   step *is* the single-copy-atomic snapshot, while the histories stay
 //!   independent between wide ops.
-//! - **Typed lane loads are whole-cell projections** (`sync::atomic` lane
-//!   views): a lane `load()` performs one coherent full-cell read and
-//!   projects the lane — deliberately stronger than a masked load, modelling
-//!   the consumer-facing claim that an aligned lane load is coherent with
-//!   the whole single-copy-atomic cell (a lane read never travels behind a
-//!   whole-cell op the thread has already observed; the witnessed failure
-//!   mode was a broadcaster's queue-lane load missing a committed 128-bit
-//!   push CAS). `load_masked` itself stays independently coherent per lane —
-//!   the weaker, per-byte-coherence model — for consumers that want it.
-//! - **DPOR dependence stays cell-wide** (the whole cell is one exploration
-//!   object): disjoint-lane ops are still treated as dependent, so this is a
-//!   fidelity change only — it never prunes a schedule, only widens the set of
-//!   readable values. The mask-intersection pruning is a separate, later step.
+//! - **Typed lane loads are whole-cell-coherent lane reads**
+//!   (`load_coherent_lane`, the model of a `sync::atomic` lane view's
+//!   `load()`): the lane reads its *own* region(s) only, but its readable set
+//!   is narrowed so it can never travel behind a whole-cell (multi-region) op
+//!   the thread has already observed through another region — whether it read
+//!   or wrote that sibling (`filter_seen_op_floors`). This is the
+//!   consumer-facing claim that an aligned lane load is coherent with the
+//!   whole single-copy-atomic cell (the witnessed failure mode was a
+//!   broadcaster's queue-lane load missing a committed 128-bit push CAS it had
+//!   seen through the value lane). `load_masked` itself stays independently
+//!   coherent per lane — the weaker, per-byte-coherence model — for consumers
+//!   that want it.
+//! - **DPOR dependence is mask-scoped** (`Action::Load(mask)`): a lane load is
+//!   dependent only with ops whose mask it intersects, so it commutes with
+//!   disjoint-lane traffic (a value-lane load no longer serializes against
+//!   every queue-lane CAS). The coherence floor above reads only already-fixed
+//!   causality, so it adds no cross-lane dependence — the one op that can move
+//!   the lane's own value, a wide store, carries `FULL_MASK` and is already
+//!   dependent on the lane's region. This composes with the mask-intersection
+//!   store pruning: loads were the last op still re-coupling decoupled lanes.
 //!
 //! # Modification order implications (figure 7)
 //!
@@ -171,7 +178,7 @@ use crate::rt::execution::Execution;
 use crate::rt::location::{self, Location, LocationSet};
 use crate::rt::object;
 use crate::rt::{
-    self, thread, Access, Numeric, Synchronize, VersionVec, MAX_ATOMIC_HISTORY, MAX_THREADS,
+    self, thread, Access, Numeric, Path, Synchronize, VersionVec, MAX_ATOMIC_HISTORY, MAX_THREADS,
 };
 
 use smallvec::SmallVec;
@@ -582,63 +589,70 @@ impl<T: Numeric> Atomic<T> {
             trace!(state = ?self.state, ?ordering, ?mask, "Atomic::load_masked");
 
             let covered = state.covered(mask);
+            // `apply_floor = false`: `load_masked` is documented
+            // independently-coherent per lane — each masked lane orders on its
+            // own history alone. The stronger whole-cell-coherent projection is
+            // the typed lane views' `load_coherent_lane`.
+            state.compose_load(
+                &mut execution.path,
+                &mut execution.threads,
+                &covered,
+                ordering,
+                false,
+            )
+        })
+    }
 
-            // A load spanning more than one region must return a single
-            // consistent snapshot: wide (multi-region) ops are seen all-or-none
-            // so a 128-bit load never tears one. `resolved` carries the wide-op
-            // visibility fixed by the regions already read; each region's
-            // readable set is filtered to agree with it. Two *separate* masked
-            // ops to different lanes share no `op_id`, so this never couples
-            // independent lanes — they stay free to be read in either order.
-            let multi = covered.len() > 1;
-            let mut resolved: SmallVec<[(u64, bool); 8]> = SmallVec::new();
-            let mut result = 0u128;
+    /// Loads the bits under `mask` as a **whole-cell-coherent lane
+    /// projection** — the model of a typed lane view's `load()` (`sync::atomic`
+    /// lane views). Identical to [`Self::load_masked`] in every respect but
+    /// two, both deliberate:
+    ///
+    /// 1. **DPOR scope.** The dependence branch is `Action::Load(mask)`, scoped
+    ///    to the lane, so a lane load commutes with disjoint-lane traffic — a
+    ///    value-lane load no longer serializes against every queue-lane CAS.
+    ///    (`load_masked` shares this; the whole-cell `load` does not.)
+    ///
+    /// 2. **Cell coherence.** The readable set is additionally narrowed by
+    ///    [`State::filter_seen_op_floors`] so the lane can never travel behind a
+    ///    whole-cell (multi-region) op the active thread has already observed
+    ///    through a region *outside* this load — whether it read or wrote that
+    ///    sibling. An aligned lane access is coherent with the whole
+    ///    single-copy-atomic cell (spec carve-out #5); this is the property a
+    ///    plain per-lane masked load does not carry.
+    ///
+    /// The floor consults sibling regions but reads only *already-fixed*
+    /// causality (stores this thread has seen or written before this op), so it
+    /// creates no new cross-lane DPOR dependence: it is a function of state a
+    /// concurrent peer cannot change, and the only op that can move the lane's
+    /// own value — a wide store — carries `FULL_MASK` and is already dependent
+    /// on this region. Reading only the lane's own regions is what preserves
+    /// the pruning (2) grants (module docs, "Sub-word sub-locations").
+    pub(crate) fn load_coherent_lane(
+        &self,
+        location: Location,
+        mask: u128,
+        ordering: Ordering,
+    ) -> u128 {
+        self.ensure_partition(mask);
+        self.branch(Action::Load(mask), location);
 
-            for ri in covered {
-                // If necessary, generate the list of stores to permute through
-                // for this region.
-                //
-                // A `SeqCst` load participates in the SC total order S; a load
-                // past a `SeqCst` fence is bounded by the fence's position. The
-                // readable set is restricted inside `match_load_to_stores`.
-                if execution.path.is_traversed() {
-                    let mut seed = [0; MAX_ATOMIC_HISTORY];
-                    let mut n = state.regions[ri].match_load_to_stores(
-                        &execution.threads,
-                        &mut seed[..],
-                        ordering,
-                    );
+        super::synchronize(|execution| {
+            let state = self.state.get_mut(&mut execution.objects);
 
-                    if multi {
-                        // Keep only candidates consistent with the wide-op
-                        // visibility earlier regions committed to.
-                        let mut w = 0;
-                        for r in 0..n {
-                            if state.regions[ri].is_consistent(seed[r] as usize, &resolved) {
-                                seed[w] = seed[r];
-                                w += 1;
-                            }
-                        }
-                        assert!(
-                            w > 0,
-                            "[loom internal bug] no consistent store for a wide load"
-                        );
-                        n = w;
-                    }
+            state.loaded_locations.track(location, &execution.threads);
+            state.track_load(&execution.threads);
 
-                    execution.path.push_load(&seed[..n]);
-                }
+            trace!(state = ?self.state, ?ordering, ?mask, "Atomic::load_coherent_lane");
 
-                let index = execution.path.branch_load();
-                if multi {
-                    state.regions[ri].record_resolutions(index, &mut resolved);
-                }
-                let mask_ri = state.regions[ri].mask;
-                let v = state.regions[ri].load(&mut execution.threads, index, ordering);
-                result |= v & mask_ri;
-            }
-
-            result
+            let covered = state.covered(mask);
+            state.compose_load(
+                &mut execution.path,
+                &mut execution.threads,
+                &covered,
+                ordering,
+                true,
+            )
         })
     }
 
@@ -946,6 +960,248 @@ impl State {
             value |= region.stores[index].value & region.mask;
         }
         value
+    }
+
+    /// Compose the value an atomic load returns across the regions the mask
+    /// covers, taking the one per-region *value* branch each (`push_load` /
+    /// `branch_load`) — the DPOR *dependence* branch is the caller's single
+    /// `branch(Action::Load(mask))`. Shared by `load_masked` (`apply_floor =
+    /// false`) and `load_coherent_lane` (`apply_floor = true`).
+    ///
+    /// A multi-region load must return a single consistent snapshot: wide
+    /// (multi-region) ops are seen all-or-none so a load never tears one.
+    /// `resolved` carries the wide-op visibility fixed by the regions already
+    /// read; each region's readable set is filtered to agree with it. Two
+    /// *separate* masked ops to different lanes share no `op_id`, so this never
+    /// couples independent lanes — they stay free to be read in either order.
+    ///
+    /// With `apply_floor`, each region's readable set is additionally narrowed
+    /// by `filter_seen_op_floors` to the whole-cell-coherent projection the
+    /// typed lane views promise.
+    fn compose_load(
+        &mut self,
+        path: &mut Path,
+        threads: &mut thread::Set,
+        covered: &[usize],
+        ordering: Ordering,
+        apply_floor: bool,
+    ) -> u128 {
+        let multi = covered.len() > 1;
+        let mut resolved: SmallVec<[(u64, bool); 8]> = SmallVec::new();
+        let mut result = 0u128;
+
+        for (k, &ri) in covered.iter().enumerate() {
+            // If necessary, generate the list of stores to permute through for
+            // this region.
+            //
+            // A `SeqCst` load participates in the SC total order S; a load past
+            // a `SeqCst` fence is bounded by the fence's position. The readable
+            // set is restricted inside `match_load_to_stores`.
+            if path.is_traversed() {
+                let mut seed = [0; MAX_ATOMIC_HISTORY];
+                let mut n =
+                    self.regions[ri].match_load_to_stores(threads, &mut seed[..], ordering);
+
+                // Whole-cell coherence for a typed lane load: drop candidates
+                // that would travel behind a wide op already observed through
+                // another region. `load_masked` skips this (per-lane coherent).
+                if apply_floor {
+                    n = self.filter_seen_op_floors(ri, threads, &mut seed[..], n);
+                }
+
+                if multi {
+                    // Keep only candidates consistent with the wide-op
+                    // visibility earlier regions committed to *and* completable
+                    // by the regions still to come. The forward half is what
+                    // makes the walk total: regions resolve in `covered` order,
+                    // but a later region's readable set can be pinned by plain
+                    // coherence to a store that sees wide op X, which forces
+                    // *every* region of this one single-copy-atomic load to see
+                    // X. Filtering on `resolved` alone lets an earlier region
+                    // commit to not-seeing-X, and the pinned region then has
+                    // nothing left — a dead end the walk cannot back out of,
+                    // reported as an internal bug. Offering only completable
+                    // prefixes prunes exactly those; every whole-cell snapshot
+                    // that some assignment realizes stays reachable.
+                    let rest = &covered[k + 1..];
+                    let mut w = 0;
+                    for r in 0..n {
+                        let ci = seed[r] as usize;
+                        if !self.regions[ri].is_consistent(ci, &resolved) {
+                            continue;
+                        }
+                        if !rest.is_empty() {
+                            let mut next: SmallVec<[(u64, bool); 8]> =
+                                SmallVec::from_slice(&resolved);
+                            self.regions[ri].record_resolutions(ci, &mut next);
+                            if !self.has_consistent_completion(
+                                rest,
+                                threads,
+                                ordering,
+                                apply_floor,
+                                &next,
+                            ) {
+                                continue;
+                            }
+                        }
+                        seed[w] = seed[r];
+                        w += 1;
+                    }
+                    // Now a genuine claim about the cell, not about walk order:
+                    // no assignment of stores to `covered` forms a consistent
+                    // whole-cell snapshot.
+                    assert!(
+                        w > 0,
+                        "[loom internal bug] no consistent store for a wide load"
+                    );
+                    n = w;
+                }
+
+                path.push_load(&seed[..n]);
+            }
+
+            let index = path.branch_load();
+            if multi {
+                self.regions[ri].record_resolutions(index, &mut resolved);
+            }
+            let mask_ri = self.regions[ri].mask;
+            let v = self.regions[ri].load(threads, index, ordering);
+            result |= v & mask_ri;
+        }
+
+        result
+    }
+
+    /// Can `rest` — the regions of a multi-region load not yet resolved — be
+    /// assigned stores consistent with `resolved`? Depth-first over the
+    /// regions in order, so a prefix is rejected only when *no* completion
+    /// exists. Exact rather than per-region approximate: a conflict can span
+    /// two later regions, and both sets are bounded (regions per cell, and
+    /// `MAX_ATOMIC_HISTORY` candidates each).
+    ///
+    /// Reads nothing the caller has not already fixed — `match_load_to_stores`
+    /// and `filter_seen_op_floors` both take `&self`/`&thread::Set` — so the
+    /// lookahead cannot perturb the execution it is predicting.
+    fn has_consistent_completion(
+        &self,
+        rest: &[usize],
+        threads: &thread::Set,
+        ordering: Ordering,
+        apply_floor: bool,
+        resolved: &[(u64, bool)],
+    ) -> bool {
+        let Some((&rj, tail)) = rest.split_first() else {
+            return true;
+        };
+
+        let mut seed = [0; MAX_ATOMIC_HISTORY];
+        let mut n = self.regions[rj].match_load_to_stores(threads, &mut seed[..], ordering);
+        if apply_floor {
+            n = self.filter_seen_op_floors(rj, threads, &mut seed[..], n);
+        }
+
+        for r in 0..n {
+            let ci = seed[r] as usize;
+            if !self.regions[rj].is_consistent(ci, resolved) {
+                continue;
+            }
+            if tail.is_empty() {
+                return true;
+            }
+            let mut next: SmallVec<[(u64, bool); 8]> = SmallVec::from_slice(resolved);
+            self.regions[rj].record_resolutions(ci, &mut next);
+            if self.has_consistent_completion(tail, threads, ordering, apply_floor, &next) {
+                return true;
+            }
+        }
+
+        false
+    }
+
+    /// Whole-cell coherence for a typed lane load (module docs, "Typed lane
+    /// loads"): drop every candidate in `seed[..n]` for region `ri` that is
+    /// modification-order-before a region-`ri` store whose whole-cell op the
+    /// active thread has already observed through *another* region of this
+    /// cell. Returns the retained count.
+    ///
+    /// A region-`ri` store `f` is a **floor** when its op `f.op_id` is observed
+    /// through some other region `rj` (`op_seen_through_other_region`) — the
+    /// thread has provably passed that one indivisible single-copy-atomic event
+    /// in `rj`, so reading this lane from before `f` would travel backwards
+    /// through it. Only genuine `mo_before` edges exclude: a racing store
+    /// mo-incomparable to `f` stays readable (per-byte coherence permits either
+    /// order until something orders them), and same-region observations need no
+    /// floor — the plain coherence rules in `match_load_to_stores` cover them.
+    ///
+    /// The result can never be empty: a floor `f` is never mo-before itself,
+    /// and any candidate dropped by the "saw a newer store" rule in
+    /// `match_load_to_stores` is superseded by a store mo-after it, which
+    /// clears every floor too. The RMW read path needs no such filter —
+    /// `match_rmw_to_stores` offers only mo-maximal stores, and a candidate
+    /// mo-before a floor has a known mo successor, so it was never offered.
+    fn filter_seen_op_floors(
+        &self,
+        ri: usize,
+        threads: &thread::Set,
+        seed: &mut [u8],
+        n: usize,
+    ) -> usize {
+        // A cell never touched by a masked op has one region — no siblings.
+        if self.regions.len() <= 1 {
+            return n;
+        }
+
+        let region = &self.regions[ri];
+        let mut w = 0;
+
+        'candidate: for k in 0..n {
+            let c = &region.stores[seed[k] as usize];
+
+            for f_idx in 0..region.live_stores() {
+                let f = &region.stores[f_idx];
+                if mo_before(c, f) && self.op_seen_through_other_region(ri, f.op_id, threads) {
+                    continue 'candidate;
+                }
+            }
+
+            seed[w] = seed[k];
+            w += 1;
+        }
+
+        assert!(
+            w > 0,
+            "[loom internal bug] cell-coherence floor filter emptied a readable set"
+        );
+        w
+    }
+
+    /// True when the active thread has observed whole-cell op `op_id` through
+    /// some region other than `ri` — i.e. that region holds a store `g` the
+    /// thread has *seen* (loaded or itself created; `first_seen`) which is
+    /// op `op_id`'s sibling there or modification-order-after it
+    /// (`Region::sees_op`).
+    ///
+    /// This is the union of both routes the single-copy-atomicity claim rests
+    /// on: the thread *read* the wide op through another lane (`g` is that op's
+    /// sibling, or a later store the thread read), or the thread *wrote* that
+    /// other lane past the wide op (`g` is the thread's own store, mo-after the
+    /// op's sibling — owning the line to write it carries the whole wide event
+    /// into this thread's view). A store the thread has neither seen nor passed
+    /// contributes nothing, so a genuinely-concurrent op never floors.
+    fn op_seen_through_other_region(&self, ri: usize, op_id: u64, threads: &thread::Set) -> bool {
+        for (rj, other) in self.regions.iter().enumerate() {
+            if rj == ri {
+                continue;
+            }
+            for g_idx in 0..other.live_stores() {
+                if other.stores[g_idx].first_seen.is_seen_by_current(threads)
+                    && other.sees_op(g_idx, op_id) == Some(true)
+                {
+                    return true;
+                }
+            }
+        }
+        false
     }
 
     /// Promote every live store this thread created into S at `pos`, across

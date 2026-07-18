@@ -39,6 +39,19 @@ where
         T::from_u128(self.state.load_masked(location!(), mask.into_u128(), order))
     }
 
+    /// Whole-cell-coherent lane load — the model of a typed lane view's
+    /// `load()` (see [`rt::Atomic::load_coherent_lane`]). Reads only `mask`'s
+    /// bits (others zero) as a projection coherent with the whole
+    /// single-copy-atomic cell, yet DPOR-scoped to `mask` so it commutes with
+    /// disjoint-lane traffic.
+    #[track_caller]
+    pub(crate) fn load_coherent_lane(&self, mask: T, order: Ordering) -> T {
+        T::from_u128(
+            self.state
+                .load_coherent_lane(location!(), mask.into_u128(), order),
+        )
+    }
+
     #[track_caller]
     pub(crate) fn store(&self, value: T, order: Ordering) {
         self.state.store(location!(), value, order)
