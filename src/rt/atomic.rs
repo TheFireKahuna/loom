@@ -323,6 +323,14 @@ impl Action {
     }
 }
 
+/// Whether two actions on the *same* cell commute. Reads never disturb each
+/// other, and accesses to disjoint bits are separate locations as far as the
+/// model is concerned — the same relation `for_each_dependent_access` walks,
+/// read as a predicate.
+pub(super) fn independent(a: Action, b: Action) -> bool {
+    (a.is_load() && b.is_load()) || (a.mask() & b.mask() == 0)
+}
+
 #[derive(Debug, Clone)]
 struct Store {
     /// The stored value. All atomic types can be converted to `u128`.

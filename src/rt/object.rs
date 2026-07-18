@@ -10,7 +10,7 @@ use tracing::trace;
 use serde::{Deserialize, Serialize};
 
 /// Stores objects
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 #[cfg_attr(feature = "checkpoint", derive(Serialize, Deserialize))]
 pub(super) struct Store<T = Entry> {
     /// Stored state for all objects.
@@ -302,6 +302,12 @@ impl<T> Ref<T> {
     pub(super) fn ref_eq(self, other: Ref<T>) -> bool {
         self.index == other.index
     }
+
+    /// Position in the store. For path branches this is the branch index,
+    /// which is what identifies a point in the execution path.
+    pub(super) fn index(self) -> usize {
+        self.index
+    }
 }
 
 impl<T: Object> Ref<T> {
@@ -424,6 +430,26 @@ impl<T: Object<Entry = Entry>> Ref<T> {
 }
 
 impl Operation {
+    /// Whether these two pending operations commute: running them in either
+    /// order reaches the same state, and neither changes whether the other can
+    /// run. Sleep sets carry a thread past exactly the transitions it is
+    /// independent of, so a wrong `true` here silently drops interleavings —
+    /// every case that is not *provably* commuting answers `false`.
+    ///
+    /// Distinct objects never interact. Within one object only atomics get a
+    /// finer answer, from the mask-scoped relation the DPOR dependence check
+    /// already uses: two reads commute, and so do accesses to disjoint bits.
+    pub(super) fn is_independent_of(&self, other: &Operation) -> bool {
+        if !self.obj.ref_eq(other.obj) {
+            return true;
+        }
+
+        match (self.action, other.action) {
+            (Action::Atomic(a), Action::Atomic(b)) => rt::atomic::independent(a, b),
+            _ => false,
+        }
+    }
+
     pub(super) fn object(&self) -> Ref {
         self.obj
     }

@@ -55,6 +55,7 @@ impl Execution {
         max_branches: usize,
         preemption_bound: Option<usize>,
         exploring: bool,
+        sleep_sets: bool,
     ) -> Execution {
         let id = Id::new();
         let threads = thread::Set::new(id, max_threads);
@@ -64,7 +65,7 @@ impl Execution {
 
         Execution {
             id,
-            path: Path::new(max_branches, preemption_bound, exploring),
+            path: Path::new(max_branches, preemption_bound, exploring, sleep_sets),
             threads,
             lazy_statics: lazy_static::Set::new(),
             objects: object::Store::with_capacity(max_branches),
@@ -274,6 +275,36 @@ impl Execution {
             );
 
             return true;
+        }
+
+        // Sleep-set propagation. A thread sleeping at this branch stays asleep
+        // in the next one only if its pending operation commutes with the
+        // transition just committed to: then the interleaving that runs it
+        // later is still a reordering of one already walked. Anything it could
+        // race with wakes it, because that reordering no longer holds.
+        if self.path.sleep_sets() {
+            let sleep = self.path.sleep_at(path_id);
+            let mut carried = 0;
+
+            if let (true, Some(op)) = (sleep != 0, self.threads.active().operation) {
+                let active = self.threads.active_id();
+
+                for (id, th) in self.threads.iter() {
+                    if id == active || sleep & (1 << id.as_usize()) == 0 {
+                        continue;
+                    }
+
+                    // A thread with no declared operation is between branch
+                    // points; nothing to prove independence against.
+                    if let Some(pending) = th.operation {
+                        if pending.is_independent_of(&op) {
+                            carried |= 1 << id.as_usize();
+                        }
+                    }
+                }
+            }
+
+            self.path.set_sleep_in(carried);
         }
 
         // TODO: refactor
