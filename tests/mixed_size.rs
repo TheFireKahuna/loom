@@ -22,7 +22,7 @@ use loom::thread;
 use std::collections::HashSet;
 use std::sync::atomic::{
     AtomicUsize,
-    Ordering::{Relaxed, SeqCst},
+    Ordering::{Acquire, Relaxed, Release, SeqCst},
 };
 use std::sync::{Arc, Mutex};
 
@@ -631,6 +631,69 @@ fn wide_load_completes_when_a_region_is_pinned_to_a_wide_op() {
             let v = x.load(Relaxed);
             assert_eq!(v & S_MASK, S_MASK, "wide op seen in one region only");
         }
+
+        w.join().unwrap();
+    });
+}
+
+/// A wide load's forward lookahead must account for the synchronization the
+/// load itself performs.
+///
+/// The walk picks a store per region in `covered` order and reads each pick
+/// immediately, and `Region::load` changes what the regions still to come may
+/// read: an `Acquire` read joins the storing thread's release view into the
+/// reader's causality, which retires stores the reader has now provably passed.
+/// That is real coherence - the writer's release orders its earlier lane write
+/// ahead of the released one, so a snapshot taking the released store must not
+/// take a stale value of the earlier lane. But the lookahead that certifies a
+/// prefix as completable evaluated the regions still to come against the state
+/// at *load entry*, before any of that had happened. The certified completion
+/// was then synchronized away, and the walk dead-ended on a prefix it had just
+/// proven completable - reported as
+/// `[loom internal bug] no consistent store for a wide load`.
+///
+/// The shape needs all three region kinds. The peer writes a **two-region**
+/// high-half op (owner+value) and then, with release, a disjoint low-qword op.
+/// The reader's own full-width store gives every region a store that does not
+/// see the high half. Resolving the value dword first may commit to *not*
+/// seeing the high-half op; the low qword may then read the peer's released
+/// store, whose acquire pulls the high-half op into causality and retires the
+/// owner dword's not-seeing candidate - leaving the owner dword only stores
+/// that do see it, contradicting what the value dword committed to.
+#[test]
+fn wide_load_lookahead_projects_its_own_synchronization() {
+    loom::model(|| {
+        // Split order fixes `covered` order: value dword, low qword, owner
+        // dword. The value dword must resolve before the qword whose acquire
+        // does the damage, and the owner dword after it.
+        let x = Arc::new(AtomicU128::new(0));
+        x.store_masked(VALUE, 0, Relaxed);
+        x.store_masked(S_MASK, 0, Relaxed);
+
+        // The reader's own full-width store lands first, so every region has a
+        // candidate that does not see the high half. Storing it before the
+        // spawn materializes the modification-order edges the peer's later
+        // stores need - without them the stores are mo-incomparable, both stay
+        // readable under per-region coherence, and nothing is ever retired.
+        x.store(0, Relaxed);
+
+        let w = {
+            let x = x.clone();
+            thread::spawn(move || {
+                x.store_masked(HIGH, (1u128 << 64) | (1u128 << 96), Relaxed);
+                x.store_masked(S_MASK, 1, Release);
+            })
+        };
+
+        let v = x.load(Acquire);
+
+        // Single-copy atomicity of the two-region op: owner and value agree.
+        assert_eq!(
+            (v >> 64) & 1,
+            (v >> 96) & 1,
+            "high-half op torn by a wide load: {:#034x}",
+            v
+        );
 
         w.join().unwrap();
     });

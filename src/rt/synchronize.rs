@@ -20,6 +20,14 @@ impl Synchronize {
         }
     }
 
+    /// The release view this synchronization point publishes — what an
+    /// acquiring load joins into the reader's causality (`sync_acq`). Exposed
+    /// so a multi-region load can *project* the causality its own earlier
+    /// regions will establish, without performing the reads.
+    pub fn released_view(&self) -> &VersionVec {
+        &self.happens_before
+    }
+
     pub fn sync_load(&mut self, threads: &mut thread::Set, order: Ordering) {
         match order {
             Relaxed | Release => {

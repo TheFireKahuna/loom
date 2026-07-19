@@ -268,6 +268,59 @@ pub(super) struct State {
     spares: Vec<Region>,
 }
 
+/// The reader-side state a multi-region load filters its candidates against.
+///
+/// A wide load resolves one region at a time, and `Region::load` *changes* what
+/// the regions still to come may read: `sync_load` joins the store's release
+/// view into the reader's causality (so a store the reader has now provably
+/// passed stops being readable), and `first_seen.touch` marks the store seen
+/// (so it can floor a sibling lane through `op_seen_through_other_region`).
+/// Both effects are real coherence - a writer's release orders its earlier lane
+/// write ahead of the released one, so a snapshot that takes the released store
+/// must not take a stale value of the earlier lane.
+///
+/// The walk therefore cannot filter a later region against the state at load
+/// entry; it must filter against the state the earlier regions will have
+/// established. `LoadView` is that projection: the causality and the extra
+/// seen-marks a prefix of choices implies. Carrying it makes the forward
+/// lookahead (`has_consistent_completion`) predict exactly the readable sets
+/// the walk will go on to compute, which is what makes the walk total.
+#[derive(Clone)]
+struct LoadView {
+    /// The reader's causality, projected forward over the prefix.
+    causality: VersionVec,
+
+    /// `(region, slot)` pairs the load has committed to reading. `Region::load`
+    /// touches `first_seen` for each, which no `causality` join reproduces.
+    touched: SmallVec<[(usize, usize); 4]>,
+}
+
+impl LoadView {
+    /// The state as of the load, before any region is resolved.
+    fn entry(threads: &thread::Set) -> LoadView {
+        LoadView {
+            causality: threads.active().causality,
+            touched: SmallVec::new(),
+        }
+    }
+
+    /// The state after this load additionally reads slot `ci` of region `ri`.
+    fn extend(&self, region: &Region, ri: usize, ci: usize, ordering: Ordering) -> LoadView {
+        let mut next = self.clone();
+        if acquires(ordering) {
+            next.causality.join(region.stores[ci].sync.released_view());
+        }
+        next.touched.push((ri, ci));
+        next
+    }
+
+    /// Has the reader seen slot `gi` of region `rj` - either through causality
+    /// or because this same load already committed to reading it?
+    fn is_seen(&self, store: &Store, rj: usize, gi: usize) -> bool {
+        store.first_seen.is_seen_in(&self.causality) || self.touched.contains(&(rj, gi))
+    }
+}
+
 /// One sub-word region of a cell: a bit-mask and the store history over just
 /// those bits. Every method here is the per-location coherence/SC machinery
 /// scoped to the region's ring.
@@ -1055,15 +1108,25 @@ impl State {
             // a `SeqCst` fence is bounded by the fence's position. The readable
             // set is restricted inside `match_load_to_stores`.
             if path.is_traversed() {
+                // The regions before this one have already been read, so the
+                // live state *is* the projection for this step: their causality
+                // joins and `first_seen` touches are already recorded, which is
+                // also why `touched` starts empty.
+                let view = LoadView::entry(threads);
+
                 let mut seed = [0; MAX_ATOMIC_HISTORY];
-                let mut n =
-                    self.regions[ri].match_load_to_stores(threads, &mut seed[..], ordering);
+                let mut n = self.regions[ri].match_load_to_stores(
+                    threads,
+                    &view.causality,
+                    &mut seed[..],
+                    ordering,
+                );
 
                 // Whole-cell coherence for a typed lane load: drop candidates
                 // that would travel behind a wide op already observed through
                 // another region. `load_masked` skips this (per-lane coherent).
                 if apply_floor {
-                    n = self.filter_seen_op_floors(ri, threads, &mut seed[..], n);
+                    n = self.filter_seen_op_floors(ri, &view, &mut seed[..], n);
                 }
 
                 if multi {
@@ -1091,12 +1154,14 @@ impl State {
                             let mut next: SmallVec<[(u64, bool); 8]> =
                                 SmallVec::from_slice(&resolved);
                             self.regions[ri].record_resolutions(ci, &mut next);
+                            let next_view = view.extend(&self.regions[ri], ri, ci, ordering);
                             if !self.has_consistent_completion(
                                 rest,
                                 threads,
                                 ordering,
                                 apply_floor,
                                 &next,
+                                &next_view,
                             ) {
                                 continue;
                             }
@@ -1146,15 +1211,21 @@ impl State {
         ordering: Ordering,
         apply_floor: bool,
         resolved: &[(u64, bool)],
+        view: &LoadView,
     ) -> bool {
         let Some((&rj, tail)) = rest.split_first() else {
             return true;
         };
 
         let mut seed = [0; MAX_ATOMIC_HISTORY];
-        let mut n = self.regions[rj].match_load_to_stores(threads, &mut seed[..], ordering);
+        let mut n = self.regions[rj].match_load_to_stores(
+            threads,
+            &view.causality,
+            &mut seed[..],
+            ordering,
+        );
         if apply_floor {
-            n = self.filter_seen_op_floors(rj, threads, &mut seed[..], n);
+            n = self.filter_seen_op_floors(rj, view, &mut seed[..], n);
         }
 
         for r in 0..n {
@@ -1167,7 +1238,15 @@ impl State {
             }
             let mut next: SmallVec<[(u64, bool); 8]> = SmallVec::from_slice(resolved);
             self.regions[rj].record_resolutions(ci, &mut next);
-            if self.has_consistent_completion(tail, threads, ordering, apply_floor, &next) {
+            let next_view = view.extend(&self.regions[rj], rj, ci, ordering);
+            if self.has_consistent_completion(
+                tail,
+                threads,
+                ordering,
+                apply_floor,
+                &next,
+                &next_view,
+            ) {
                 return true;
             }
         }
@@ -1199,7 +1278,7 @@ impl State {
     fn filter_seen_op_floors(
         &self,
         ri: usize,
-        threads: &thread::Set,
+        view: &LoadView,
         seed: &mut [u8],
         n: usize,
     ) -> usize {
@@ -1232,7 +1311,7 @@ impl State {
                 let seen = match seen_memo[f_idx] {
                     Some(seen) => seen,
                     None => {
-                        let seen = self.op_seen_through_other_region(ri, f.op_id, threads);
+                        let seen = self.op_seen_through_other_region(ri, f.op_id, view);
                         seen_memo[f_idx] = Some(seen);
                         seen
                     }
@@ -1267,13 +1346,13 @@ impl State {
     /// op's sibling — owning the line to write it carries the whole wide event
     /// into this thread's view). A store the thread has neither seen nor passed
     /// contributes nothing, so a genuinely-concurrent op never floors.
-    fn op_seen_through_other_region(&self, ri: usize, op_id: u64, threads: &thread::Set) -> bool {
+    fn op_seen_through_other_region(&self, ri: usize, op_id: u64, view: &LoadView) -> bool {
         for (rj, other) in self.regions.iter().enumerate() {
             if rj == ri {
                 continue;
             }
             for g_idx in 0..other.live_stores() {
-                if other.stores[g_idx].first_seen.is_seen_by_current(threads)
+                if view.is_seen(&other.stores[g_idx], rj, g_idx)
                     && other.sees_op(g_idx, op_id) == Some(true)
                 {
                     return true;
@@ -1881,6 +1960,7 @@ impl Region {
     fn match_load_to_stores(
         &self,
         threads: &thread::Set,
+        view: &VersionVec,
         dst: &mut [u8],
         ordering: Ordering,
     ) -> usize {
@@ -1921,7 +2001,7 @@ impl Region {
         // Add all stores **unless** a newer store has already been seen by the
         // current thread's causality.
         //
-        // `is_seen_by_current` is an all-lane compare that depends only on `j`,
+        // `is_seen_in` is an all-lane compare that depends only on `j`,
         // yet the pair loop can re-ask it for the same store once per `i`.
         // Resolve each store at most once, and only if some `mo_before` edge
         // actually reaches it — a lazy memo does no work the pair loop did not
@@ -1955,7 +2035,7 @@ impl Region {
                     let seen_j = match seen_memo[j] {
                         Some(seen) => seen,
                         None => {
-                            let seen = store_j.first_seen.is_seen_by_current(threads);
+                            let seen = store_j.first_seen.is_seen_in(view);
                             seen_memo[j] = Some(seen);
                             seen
                         }
@@ -2128,6 +2208,12 @@ impl FirstSeen {
 
 fn is_seq_cst(order: Ordering) -> bool {
     order == Ordering::SeqCst
+}
+
+/// True when a load of this ordering joins the store's release view into the
+/// reader's causality (`Synchronize::sync_load`).
+fn acquires(order: Ordering) -> bool {
+    matches!(order, Ordering::Acquire | Ordering::AcqRel | Ordering::SeqCst)
 }
 
 fn range(cnt: u16) -> (usize, usize) {
