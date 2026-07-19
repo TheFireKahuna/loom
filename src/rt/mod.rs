@@ -47,6 +47,8 @@ pub(crate) use self::rwlock::RwLock;
 mod scheduler;
 pub(crate) use self::scheduler::Scheduler;
 
+mod sleep;
+
 mod synchronize;
 pub(crate) use self::synchronize::Synchronize;
 

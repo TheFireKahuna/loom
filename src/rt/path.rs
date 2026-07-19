@@ -106,6 +106,13 @@ impl Frozen {
 
         self.word.0.fetch_or(bit, AcqRel) & bit == 0
     }
+
+    /// Alternatives proven necessary here so far. Monotone — a set bit is a
+    /// standing promise that some task fully explores that alternative, so a
+    /// reader may defer to any bit it observes (`rt::sleep`).
+    fn open_mask(&self) -> u16 {
+        self.word.0.load(Acquire) as u16
+    }
 }
 
 /// An execution path
@@ -298,6 +305,12 @@ impl Path {
         self.skipping = true;
     }
 
+    /// Whether the rest of this execution is a non-exploring scout — either
+    /// the user skipped it, or a sleep set proved it redundant.
+    pub(super) fn is_skipping(&self) -> bool {
+        self.skipping
+    }
+
     pub(crate) fn set_max_branches(&mut self, max_branches: usize) {
         self.branches
             .reserve_exact(max_branches - self.branches.len());
@@ -380,12 +393,17 @@ impl Path {
         spurious
     }
 
-    /// Returns the thread identifier to schedule
+    /// Returns the thread identifier to schedule, and the mask of sibling
+    /// alternatives this execution may defer to at the branch (`rt::sleep`):
+    /// the canonically-lower open alternatives, minus the bound's
+    /// conservative ones. One rule for owned and frozen branches alike — at a
+    /// frozen branch the private copy's thread states are degenerate, so the
+    /// open set comes from the claim record instead.
     pub(super) fn branch_thread(
         &mut self,
         execution_id: execution::Id,
         seed: impl ExactSizeIterator<Item = Thread>,
-    ) -> Option<thread::Id> {
+    ) -> (Option<thread::Id>, u16) {
         if self.is_traversed() {
             assert_path_len!(self.branches);
 
@@ -461,6 +479,8 @@ impl Path {
             schedule.preemptions = preemptions;
         }
 
+        let index = self.pos;
+
         let schedule_ref = object::Ref::from_usize(self.pos)
             .downcast::<Schedule>(&self.branches)
             .expect("Reached unexpected exploration state. Is the model fully deterministic?");
@@ -469,12 +489,37 @@ impl Path {
 
         self.pos += 1;
 
-        schedule
-            .threads
-            .iter()
-            .enumerate()
-            .find(|&(_, th)| th.is_active())
-            .map(|(i, _)| thread::Id::new(execution_id, i))
+        let active = schedule.threads.iter().position(|th| th.is_active());
+
+        // Zero under a preemption bound: a covering linearization can spend
+        // up to two more preemptions than the execution it covers (the
+        // commutation seam inserts a switch and a switch-back), so the
+        // deferred-to subtree may be bound-truncated exactly where the pruned
+        // class would have lived. Not a theoretical scruple — the fuzz corpus
+        // finds behavior loss for bounded deference within seconds.
+        let covered = match active {
+            Some(chosen) if self.preemption_bound.is_none() => {
+                let coverable = match self.frozen.get(index) {
+                    Some(frozen) => frozen.open_mask(),
+                    None => schedule
+                        .threads
+                        .iter()
+                        .enumerate()
+                        .filter(|&(_, th)| {
+                            matches!(th, Thread::Pending | Thread::Active | Thread::Visited)
+                        })
+                        .fold(0u16, |mask, (i, _)| mask | (1u16 << i)),
+                };
+
+                coverable & ((1u16 << chosen) - 1)
+            }
+            _ => 0,
+        };
+
+        (
+            active.map(|i| thread::Id::new(execution_id, i)),
+            covered,
+        )
     }
 
     pub(super) fn backtrack(&mut self, mut point: usize, thread_id: thread::Id) {

@@ -1,4 +1,5 @@
 use crate::rt::alloc::Allocation;
+use crate::rt::sleep::SleepSet;
 use crate::rt::{lazy_static, object, thread, Path};
 
 use rustc_hash::FxHashMap;
@@ -38,6 +39,24 @@ pub(crate) struct Execution {
 
     /// Reincarnate objects in place across iterations (`Builder::reuse_objects`).
     pub(crate) reuse_objects: bool,
+
+    /// Threads asleep at the current point of the execution (`rt::sleep`).
+    sleep: SleepSet,
+
+    /// Prune sleep-set-redundant executions (`Builder::sleep_sets`, gated off
+    /// under a preemption bound).
+    pub(crate) sleep_sets: bool,
+
+    /// Executions this instance cut short as sleep-set redundant. Cumulative
+    /// across iterations; never reset.
+    ///
+    /// A scout still runs its mark scan: its branches are non-exploring, so
+    /// its races land on exploring ancestors. That can open an alternative a
+    /// full walk would not have (a few extra executions on small trees), but
+    /// suppressing the marks loses behaviors outright under forward
+    /// deference — the deferred-to subtree is explored *later*, and scout
+    /// races are part of how its obligations get planted (fuzz seed 28).
+    pub(crate) pruned: usize,
 }
 
 #[derive(Debug, Eq, PartialEq, Hash, Clone, Copy)]
@@ -72,6 +91,9 @@ impl Execution {
             location: false,
             log: false,
             reuse_objects: true,
+            sleep: SleepSet::default(),
+            sleep_sets: true,
+            pruned: 0,
         }
     }
 
@@ -122,6 +144,7 @@ impl Execution {
         self.raw_allocations.clear();
         self.arc_objs.clear();
         self.threads.clear(id);
+        self.sleep.clear();
 
         // Object refs do not survive the iteration reset.
         self.dpor_update = None;
@@ -198,6 +221,10 @@ impl Execution {
                     th.set_runnable();
                 }
             }
+
+            // Time moved instead of an operation; the commutation argument
+            // sleep rests on says nothing about timeouts, so drop the set.
+            self.sleep.wake_all();
         }
 
         // It's important to avoid pre-emption as much as possible
@@ -223,9 +250,36 @@ impl Execution {
             }
         }
 
+        // A sleeping thread must not be *started* here: its next operation is
+        // covered by a sibling subtree (`rt::sleep`). Prefer any non-sleeping
+        // runnable thread; when none exists the node is sleep-set blocked —
+        // every continuation is redundant — so finish as a scout.
+        if self.sleep_sets && !self.sleep.is_empty() {
+            if let Some(id) = initial {
+                if self.sleep.contains(id) {
+                    let replacement = self
+                        .threads
+                        .iter()
+                        .filter(|&(i, th)| th.is_runnable() && !self.sleep.contains(i))
+                        .min_by_key(|&(_, th)| th.yield_count)
+                        .map(|(i, _)| i);
+
+                    match replacement {
+                        Some(other) => initial = Some(other),
+                        None => {
+                            if !self.path.is_skipping() {
+                                self.pruned += 1;
+                                self.path.skip_branch();
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         let path_id = self.path.pos();
 
-        let next = self.path.branch_thread(self.id, {
+        let (next, covered) = self.path.branch_thread(self.id, {
             self.threads.iter().map(|(i, th)| {
                 if initial.is_none() && th.is_runnable() {
                     initial = Some(i);
@@ -242,6 +296,19 @@ impl Execution {
                 }
             })
         });
+
+        if self.sleep_sets {
+            self.sleep.cover(covered);
+
+            // Replay scheduled a thread that is still asleep: everything from
+            // here is a reordering the deferred-to subtree already covers.
+            if let Some(id) = next {
+                if self.sleep.contains(id) && !self.path.is_skipping() {
+                    self.pruned += 1;
+                    self.path.skip_branch();
+                }
+            }
+        }
 
         let switched = Some(self.threads.active_id()) != next;
 
@@ -266,6 +333,25 @@ impl Execution {
 
         // TODO: refactor
         if let Some(operation) = self.threads.active().operation {
+            // The operation about to run wakes any sleeper it conflicts with:
+            // from here on, scheduling that sleeper is no longer a commutation
+            // of an explored subtree.
+            if self.sleep_sets && !self.sleep.is_empty() {
+                let mut woken = 0u16;
+
+                for (id, th) in self.threads.iter() {
+                    if self.sleep.contains(id) {
+                        if let Some(pending) = th.operation {
+                            if pending.conflicts_with(&operation) {
+                                woken |= 1u16 << id.as_usize();
+                            }
+                        }
+                    }
+                }
+
+                self.sleep.wake(woken);
+            }
+
             let threads = &mut self.threads;
             let th_id = threads.active_id();
 

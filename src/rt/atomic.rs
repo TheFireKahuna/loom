@@ -329,6 +329,13 @@ impl Action {
     fn is_load(self) -> bool {
         matches!(self, Action::Load(_))
     }
+
+    /// DPOR dependence between two operations on this cell — overlapping bits
+    /// and at least one writer, the same pairing `for_each_dependent_access`
+    /// reports — decided from the actions alone, without the access records.
+    pub(super) fn conflicts_with(self, other: Action) -> bool {
+        self.mask() & other.mask() != 0 && !(self.is_load() && other.is_load())
+    }
 }
 
 #[derive(Debug, Clone)]

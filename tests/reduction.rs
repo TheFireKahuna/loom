@@ -47,7 +47,7 @@ fn explore<M>(threads: usize, bound: Option<usize>, model: M) -> (BTreeSet<Strin
 where
     M: Fn(&Log) + Send + Sync + 'static,
 {
-    explore_with(threads, bound, model, true)
+    explore_with(threads, bound, model, true, true)
 }
 
 fn explore_with<M>(
@@ -55,6 +55,7 @@ fn explore_with<M>(
     bound: Option<usize>,
     model: M,
     reuse_objects: bool,
+    sleep_sets: bool,
 ) -> (BTreeSet<String>, usize)
 where
     M: Fn(&Log) + Send + Sync + 'static,
@@ -80,6 +81,7 @@ where
     builder.probe = std::time::Duration::ZERO;
     builder.budgeted = false;
     builder.reuse_objects = reuse_objects;
+    builder.sleep_sets = sleep_sets;
 
     let stats = builder.check(move || {
         let log = Log::default();
@@ -398,6 +400,12 @@ fn interleaved_cells(_: &Log) {
 /// Compared against **serial**, deliberately. Comparing worker counts only to
 /// each other passes just as happily when every one of them over-explores by
 /// the same factor, which is exactly how an earlier design hid a 5.3x tax.
+///
+/// Sleep sets are pinned off here: their pruning at a *shared* branch reads
+/// the claim record at passage time, which is deliberately time-sensitive
+/// (later marks only prune more), so exact counts are a property of the
+/// unpruned walk. Coverage under sleep sets is asserted separately by
+/// `sleep_sets_cover_every_behavior_of_the_full_walk`.
 #[test]
 fn sharding_walks_the_same_tree_as_a_serial_run() {
     let models: &[(&str, fn(&Log))] = &[
@@ -412,10 +420,10 @@ fn sharding_walks_the_same_tree_as_a_serial_run() {
 
     for &(name, model) in models {
         for &bound in BOUNDS {
-            let (_, serial) = explore(1, bound, model);
+            let (_, serial) = explore_with(1, bound, model, true, false);
 
             for workers in [2, 3, 4, 8] {
-                let (_, n) = explore(workers, bound, model);
+                let (_, n) = explore_with(workers, bound, model, true, false);
 
                 assert_eq!(
                     n, serial,
@@ -448,8 +456,8 @@ fn reincarnation_walks_the_same_tree_as_virgin_stores() {
 
     for &(name, model) in models {
         for &bound in BOUNDS {
-            let (virgin_seen, virgin_n) = explore_with(1, bound, model, false);
-            let (reused_seen, reused_n) = explore_with(1, bound, model, true);
+            let (virgin_seen, virgin_n) = explore_with(1, bound, model, false, true);
+            let (reused_seen, reused_n) = explore_with(1, bound, model, true, true);
 
             assert_eq!(
                 virgin_seen, reused_seen,
@@ -463,6 +471,392 @@ fn reincarnation_walks_the_same_tree_as_virgin_stores() {
                  object is not extensionally identical to a fresh one"
             );
         }
+    }
+}
+
+/// Sleep sets claim to walk a *subset* of the full tree that still reaches
+/// every behavior: an execution is only pruned when the interleavings it
+/// leads to reorder independent operations of a subtree some sibling
+/// alternative covers. Losing a behavior here means the independence relation
+/// or the deference order is wrong — the one failure mode that would make the
+/// checker silently unsound.
+///
+/// Counts are asserted as an upper bound only. Serially the pruned walk is
+/// deterministic, but at shared branches pruning grows with the marks that
+/// have landed by passage time, so a sharded count may fall anywhere at or
+/// below the full walk's.
+#[test]
+fn sleep_sets_cover_every_behavior_of_the_full_walk() {
+    let models: &[(&str, fn(&Log))] = &[
+        ("store_buffering", store_buffering),
+        ("message_passing", message_passing),
+        ("disjoint_objects", disjoint_objects),
+        ("disjoint_lanes", disjoint_lanes),
+        ("rmw_contention", rmw_contention),
+        ("mixed_independence", mixed_independence),
+        ("mutex_counter", mutex_counter),
+        ("interleaved_cells", interleaved_cells),
+    ];
+
+    for &(name, model) in models {
+        for &bound in BOUNDS {
+            let (full_seen, full_n) = explore_with(1, bound, model, true, false);
+            let (slept_seen, slept_n) = explore_with(1, bound, model, true, true);
+
+            let lost: Vec<_> = full_seen.difference(&slept_seen).collect();
+            assert!(
+                lost.is_empty(),
+                "{name}: bound={bound:?} sleep sets LOST {} of {} behaviors \
+                 ({slept_n} executions vs {full_n} full): {lost:?}",
+                lost.len(),
+                full_seen.len(),
+            );
+            assert_eq!(
+                slept_seen, full_seen,
+                "{name}: bound={bound:?} sleep sets INVENTED behaviors"
+            );
+            // Scout races can open an ancestor alternative the full walk
+            // would not have — tolerate a few extra executions, trip on
+            // runaway overshoot.
+            assert!(
+                slept_n <= full_n + full_n / 8 + 8,
+                "{name}: bound={bound:?} pruned walk took {slept_n} executions, \
+                 full walk {full_n} — a sleep set may never add exploration"
+            );
+
+            for workers in [2, 4, 8] {
+                let (sharded_seen, sharded_n) =
+                    explore_with(workers, bound, model, true, true);
+
+                assert_eq!(
+                    sharded_seen, full_seen,
+                    "{name}: bound={bound:?} workers={workers} sharded sleep-set \
+                     walk changed the observable behaviors"
+                );
+                assert!(
+                    sharded_n <= full_n + full_n / 8 + 8,
+                    "{name}: bound={bound:?} workers={workers} sharded pruned \
+                     walk took {sharded_n} executions, full walk {full_n}"
+                );
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Wake precision
+//
+// The one silently-unsound failure mode of a sleep set is an under-precise
+// wake: a sleeper not woken by a genuinely conflicting operation keeps its
+// covered-elsewhere justification past the point it expired, and the
+// interleavings pruned after that are not covered by anything. These models
+// pin the two subtle axes of the conflict relation: lane-mask overlap within
+// one cell, and load/store kind. (Over-waking is merely less pruning.)
+// ---------------------------------------------------------------------------
+
+/// Three threads on one 128-bit cell. The low-lane writers conflict with each
+/// other and with the low-lane readers but not with the high-lane writer; a
+/// wake keyed on object identity alone would be sound here, one keyed on a
+/// wrong mask would not.
+fn lane_wake_precision(log: &Log) {
+    const LOW: u128 = u64::MAX as u128;
+    const HIGH: u128 = (u64::MAX as u128) << 64;
+
+    let cell = Arc::new(AtomicU128::new(0));
+
+    let low_writer = {
+        let (cell, log) = (cell.clone(), log.clone());
+        thread::spawn(move || {
+            cell.store_masked(LOW, 1, Relaxed);
+            log.record(format_args!("t1:low={}", cell.load_masked(LOW, Relaxed)));
+        })
+    };
+
+    let high_writer = {
+        let cell = cell.clone();
+        thread::spawn(move || {
+            cell.store_masked(HIGH, 1u128 << 64, Relaxed);
+        })
+    };
+
+    cell.store_masked(LOW, 2, Relaxed);
+    log.record(format_args!("t0:low={}", cell.load_masked(LOW, Relaxed)));
+
+    low_writer.join().unwrap();
+    high_writer.join().unwrap();
+
+    log.record(format_args!("final:{:x}", cell.load(Relaxed)));
+}
+
+/// Loads must not wake sleepers on other loads, but a store must wake both.
+/// Two readers race one writer; the readers' mutual order is irrelevant, the
+/// writer's position relative to each read is everything.
+fn load_kind_precision(log: &Log) {
+    let x = Arc::new(AtomicUsize::new(0));
+
+    let reader = {
+        let (x, log) = (x.clone(), log.clone());
+        thread::spawn(move || {
+            log.record(format_args!("t1:x={}", x.load(Relaxed)));
+            log.record(format_args!("t1:x'={}", x.load(Relaxed)));
+        })
+    };
+
+    let writer = {
+        let x = x.clone();
+        thread::spawn(move || {
+            x.store(1, Relaxed);
+        })
+    };
+
+    log.record(format_args!("t0:x={}", x.load(Relaxed)));
+
+    reader.join().unwrap();
+    writer.join().unwrap();
+}
+
+#[test]
+fn coverage_lane_wake_precision() {
+    assert_reductions_preserve_coverage("lane_wake_precision", lane_wake_precision);
+}
+
+#[test]
+fn coverage_load_kind_precision() {
+    assert_reductions_preserve_coverage("load_kind_precision", load_kind_precision);
+}
+
+// ---------------------------------------------------------------------------
+// Randomized differential fuzzing
+//
+// The hand-written models above test the failure modes we thought of. The
+// fuzzer tests the ones we did not: random small programs — threads × ops ×
+// cells × orderings, including lane-masked ops on one wide cell and a
+// blocking mutex — each explored to exhaustion by the full walk and the
+// pruned walk, asserting the behavior sets are identical. Seeds are fixed,
+// so a failure names a reproducible program.
+// ---------------------------------------------------------------------------
+
+/// Deterministic xorshift; no dependency, stable across platforms.
+struct Rng(u64);
+
+impl Rng {
+    fn next(&mut self) -> u64 {
+        let mut x = self.0;
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        self.0 = x;
+        x
+    }
+
+    fn below(&mut self, n: u64) -> u64 {
+        self.next() % n
+    }
+}
+
+/// One randomly generated straight-line op.
+#[derive(Clone, Copy, Debug)]
+enum FuzzOp {
+    /// `cells[i].store(v)`
+    Store(usize, usize),
+    /// log `cells[i].load()`
+    Load(usize),
+    /// log `cells[i].fetch_add(v)`
+    Rmw(usize, usize),
+    /// `wide.store_masked(lane l)`
+    WideStore(u32, u64),
+    /// log `wide.load_masked(lane l)`
+    WideLoad(u32),
+    /// lock the mutex, add v, log the total
+    Mutex(usize),
+}
+
+const ORDERINGS: [loom::sync::atomic::Ordering; 5] = [Relaxed, Acquire, Release, AcqRel, SeqCst];
+
+impl FuzzOp {
+    fn generate(rng: &mut Rng) -> FuzzOp {
+        match rng.below(12) {
+            0..=2 => FuzzOp::Store(rng.below(2) as usize, 1 + rng.below(3) as usize),
+            3..=5 => FuzzOp::Load(rng.below(2) as usize),
+            6..=7 => FuzzOp::Rmw(rng.below(2) as usize, 1 + rng.below(3) as usize),
+            8 => FuzzOp::WideStore(rng.below(2) as u32, 1 + rng.below(3)),
+            9 => FuzzOp::WideLoad(rng.below(2) as u32),
+            _ => FuzzOp::Mutex(1 + rng.below(3) as usize),
+        }
+    }
+
+    /// A load-shaped ordering for reads, store-shaped for writes, either for
+    /// RMWs — mirroring what real code can legally write.
+    fn ordering(&self, rng: &mut Rng) -> loom::sync::atomic::Ordering {
+        match self {
+            FuzzOp::Load(_) | FuzzOp::WideLoad(_) => [Relaxed, Acquire, SeqCst][rng.below(3) as usize],
+            FuzzOp::Store(..) | FuzzOp::WideStore(..) => {
+                [Relaxed, Release, SeqCst][rng.below(3) as usize]
+            }
+            _ => ORDERINGS[rng.below(5) as usize],
+        }
+    }
+
+    fn run(
+        self,
+        ord: loom::sync::atomic::Ordering,
+        who: usize,
+        cells: &[Arc<AtomicUsize>],
+        wide: &Arc<AtomicU128>,
+        mutex: &Arc<loom::sync::Mutex<usize>>,
+        log: &Log,
+    ) {
+        match self {
+            FuzzOp::Store(c, v) => cells[c].store(v, ord),
+            FuzzOp::Load(c) => log.record(format_args!("t{who}:c{c}={}", cells[c].load(ord))),
+            FuzzOp::Rmw(c, v) => {
+                log.record(format_args!("t{who}:r{c}={}", cells[c].fetch_add(v, ord)))
+            }
+            FuzzOp::WideStore(lane, v) => {
+                let mask = (u64::MAX as u128) << (64 * lane);
+                wide.store_masked(mask, (v as u128) << (64 * lane), ord);
+            }
+            FuzzOp::WideLoad(lane) => {
+                let mask = (u64::MAX as u128) << (64 * lane);
+                log.record(format_args!(
+                    "t{who}:w{lane}={:x}",
+                    wide.load_masked(mask, ord) >> (64 * lane)
+                ));
+            }
+            FuzzOp::Mutex(v) => {
+                let mut g = mutex.lock().unwrap();
+                *g += v;
+                log.record(format_args!("t{who}:m={}", *g));
+            }
+        }
+    }
+}
+
+/// A generated program: per-thread straight-line op lists (thread 0 is the
+/// model's main thread).
+#[derive(Clone, Debug)]
+struct FuzzProgram {
+    threads: Vec<Vec<(FuzzOp, loom::sync::atomic::Ordering)>>,
+}
+
+impl FuzzProgram {
+    fn generate(seed: u64) -> FuzzProgram {
+        // Seed 0 is a xorshift fixed point; offset by a constant.
+        let mut rng = Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
+
+        let threads = (0..2 + rng.below(2) as usize)
+            .map(|_| {
+                (0..2 + rng.below(3) as usize)
+                    .map(|_| {
+                        let op = FuzzOp::generate(&mut rng);
+                        let ord = op.ordering(&mut rng);
+                        (op, ord)
+                    })
+                    .collect()
+            })
+            .collect();
+
+        FuzzProgram { threads }
+    }
+
+    fn run(&self, log: &Log) {
+        let cells: Vec<_> = (0..2).map(|_| Arc::new(AtomicUsize::new(0))).collect();
+        let wide = Arc::new(AtomicU128::new(0));
+        let mutex = Arc::new(loom::sync::Mutex::new(0usize));
+
+        let handles: Vec<_> = self
+            .threads
+            .iter()
+            .enumerate()
+            .skip(1)
+            .map(|(who, ops)| {
+                let ops = ops.clone();
+                let (cells, wide, mutex, log) =
+                    (cells.clone(), wide.clone(), mutex.clone(), log.clone());
+                thread::spawn(move || {
+                    for (op, ord) in ops {
+                        op.run(ord, who, &cells, &wide, &mutex, &log);
+                    }
+                })
+            })
+            .collect();
+
+        for &(op, ord) in &self.threads[0] {
+            op.run(ord, 0, &cells, &wide, &mutex, &log);
+        }
+
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        log.record(format_args!(
+            "final:{},{},{:x},{}",
+            cells[0].load(Relaxed),
+            cells[1].load(Relaxed),
+            wide.load(Relaxed),
+            *mutex.lock().unwrap(),
+        ));
+    }
+}
+
+/// The property, over programs nobody designed: the pruned walk reaches
+/// exactly the behaviors of the full walk. `LOOM_FUZZ_PROGRAMS` scales the
+/// corpus for soak runs.
+#[test]
+fn fuzz_pruned_walk_matches_full_walk() {
+    let programs: u64 = std::env::var("LOOM_FUZZ_PROGRAMS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(64);
+
+    // Localization overrides: pin one seed and/or one configuration.
+    let only_seed: Option<u64> = std::env::var("LOOM_FUZZ_SEED").ok().and_then(|v| v.parse().ok());
+    let force_workers: Option<usize> = std::env::var("LOOM_FUZZ_WORKERS")
+        .ok()
+        .and_then(|v| v.parse().ok());
+    let force_bound: Option<usize> = std::env::var("LOOM_FUZZ_BOUND")
+        .ok()
+        .and_then(|v| v.parse().ok());
+
+    for seed in only_seed.map(|s| s..s + 1).unwrap_or(0..programs) {
+        let program = Arc::new(FuzzProgram::generate(seed));
+
+        // Rotate through bound × workers configurations so the corpus covers
+        // the matrix without exploring every program four times.
+        let bound = force_bound
+            .map(|b| if b == 0 { None } else { Some(b) })
+            .unwrap_or([None, Some(2)][(seed % 2) as usize]);
+        let workers = force_workers.unwrap_or([1, 4][(seed / 2 % 2) as usize]);
+
+        let run = |sleep: bool| {
+            let program = program.clone();
+            explore_with(
+                workers,
+                bound,
+                move |log| program.run(log),
+                true,
+                sleep,
+            )
+        };
+
+        let (full_seen, full_n) = run(false);
+        let (slept_seen, slept_n) = run(true);
+
+        assert_eq!(
+            slept_seen, full_seen,
+            "seed={seed} bound={bound:?} workers={workers}: pruned walk changed \
+             the behavior set ({slept_n} vs {full_n} executions)\nprogram: {:#?}",
+            program,
+        );
+        // Tolerance: a scout's races mark exploring ancestors (its own
+        // branches are non-exploring), which can open an alternative the
+        // full walk would not have — a few extra executions on tiny trees,
+        // never a coverage change. The bound trips on runaway overshoot.
+        assert!(
+            slept_n <= full_n + full_n / 8 + 8,
+            "seed={seed} bound={bound:?} workers={workers}: pruned walk took \
+             {slept_n} executions, full walk {full_n}"
+        );
     }
 }
 

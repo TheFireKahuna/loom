@@ -51,6 +51,11 @@ pub struct Stats {
 
     /// Number of OS threads that explored the state space.
     pub threads: usize,
+
+    /// Executions cut short because a sleep set proved every continuation
+    /// redundant — their behaviors are covered by a sibling subtree. Counted
+    /// inside `executions`.
+    pub pruned: usize,
 }
 
 /// Configure a model
@@ -171,6 +176,25 @@ pub struct Builder {
     /// entirely. Off forces every execution to construct its objects from
     /// scratch — the reference behavior the reuse path is tested against.
     pub reuse_objects: bool,
+
+    /// Prune executions that only reorder independent operations of a
+    /// subtree already covered at some branch (canonical-order sleep sets,
+    /// see `rt::sleep`). Coverage is unchanged: every observable behavior of
+    /// the full walk is still reached.
+    ///
+    /// On by default; `LOOM_SLEEP_SETS=0` turns it off, restoring the exact
+    /// exploration the pruned walk is tested against — with it off, sharded
+    /// execution counts are again identical at every worker count.
+    ///
+    /// Inert when `preemption_bound` is set. Deference is only sound when
+    /// the covered-elsewhere subtree is fully explored, and a bound truncates
+    /// it: a covering linearization can cost up to two more preemptions than
+    /// the execution it covers (Coons, Musuvathi & McKinley, OOPSLA'13
+    /// study this interaction). Differential fuzzing confirms behavior loss
+    /// within seconds if deference is allowed under a bound, and measures the
+    /// sound residue (BPOR's classical rule) at a few percent — not worth an
+    /// unproven soundness posture.
+    pub sleep_sets: bool,
 }
 
 impl Builder {
@@ -243,6 +267,9 @@ impl Builder {
             reuse_objects: env::var("LOOM_REUSE_OBJECTS")
                 .map(|v| v != "0")
                 .unwrap_or(true),
+            sleep_sets: env::var("LOOM_SLEEP_SETS")
+                .map(|v| v != "0")
+                .unwrap_or(true),
         }
     }
 
@@ -302,11 +329,12 @@ impl Builder {
 
         let stats = match self.check_serial(&f, probe) {
             Ok(stats) => stats,
-            Err((probed, seed)) => {
+            Err((probed, probed_pruned, seed)) => {
                 let stats = self.check_parallel(&f, workers, seed);
 
                 Stats {
                     executions: stats.executions + probed,
+                    pruned: stats.pruned + probed_pruned,
                     ..stats
                 }
             }
@@ -319,8 +347,9 @@ impl Builder {
         // says whether a reduction is doing anything.
         if std::env::var_os("LOOM_STATS").is_some() {
             eprintln!(
-                "loom: {} executions, {} worker(s), bound={:?}, {:.2}s",
+                "loom: {} executions ({} pruned), {} worker(s), bound={:?}, {:.2}s",
                 stats.executions,
+                stats.pruned,
                 stats.threads,
                 self.preemption_bound,
                 start.elapsed().as_secs_f64(),
@@ -341,6 +370,7 @@ impl Builder {
         execution.log = self.log;
         execution.location = self.location;
         execution.reuse_objects = self.reuse_objects;
+        execution.sleep_sets = self.sleep_sets && self.preemption_bound.is_none();
         execution
     }
 
@@ -371,7 +401,7 @@ impl Builder {
         &self,
         f: &Arc<F>,
         deadline: Option<Instant>,
-    ) -> Result<Stats, (usize, rt::Path)>
+    ) -> Result<Stats, (usize, usize, rt::Path)>
     where
         F: Fn() + Sync + Send + 'static,
     {
@@ -404,13 +434,13 @@ impl Builder {
 
                 if let Some(max_permutations) = self.max_permutations {
                     if i >= max_permutations {
-                        return Ok(self.stats(i - 1, 1));
+                        return Ok(self.stats(i - 1, 1, execution.pruned));
                     }
                 }
 
                 if let Some(max_duration) = self.max_duration {
                     if start.elapsed() >= max_duration {
-                        return Ok(self.stats(i - 1, 1));
+                        return Ok(self.stats(i - 1, 1, execution.pruned));
                     }
                 }
             }
@@ -422,7 +452,7 @@ impl Builder {
             // executions are thrown away along with the tree they built.
             if let Some(deadline) = deadline {
                 if Instant::now() >= deadline {
-                    return Err((i - 1, execution.path));
+                    return Err((i - 1, execution.pruned, execution.path));
                 }
             }
 
@@ -438,7 +468,7 @@ impl Builder {
             _span = tracing::info_span!(parent: None, "iter", message = i).entered();
             if !execution.step() {
                 info!(parent: None, "Completed in {} iterations", i - 1);
-                return Ok(self.stats(i - 1, 1));
+                return Ok(self.stats(i - 1, 1, execution.pruned));
             }
         }
     }
@@ -489,13 +519,14 @@ impl Builder {
         });
 
         let executions = shared.executions.load(Relaxed);
+        let pruned = shared.pruned.load(Relaxed);
 
         if let Some(payload) = shared.into_failure() {
             panic::resume_unwind(payload);
         }
 
         info!(parent: None, "Completed in {} iterations", executions);
-        self.stats(executions, workers)
+        self.stats(executions, workers, pruned)
     }
 
     fn worker<F>(&self, shared: &Shared, f: &Arc<F>, workers: usize, start: Instant)
@@ -522,6 +553,7 @@ impl Builder {
 
                 if self.limit_reached(done, start) {
                     shared.stop();
+                    shared.pruned.fetch_add(execution.pruned, Relaxed);
                     return;
                 }
 
@@ -533,19 +565,23 @@ impl Builder {
                     shared.donate(&mut execution.path);
 
                     if shared.stopped() {
+                        shared.pruned.fetch_add(execution.pruned, Relaxed);
                         return;
                     }
                 }
             }
         }
+
+        shared.pruned.fetch_add(execution.pruned, Relaxed);
     }
 
-    fn stats(&self, executions: usize, threads: usize) -> Stats {
+    fn stats(&self, executions: usize, threads: usize, pruned: usize) -> Stats {
         let _ = self;
 
         Stats {
             executions,
             threads,
+            pruned,
         }
     }
 }
@@ -623,6 +659,9 @@ struct Shared {
     wake: Condvar,
     executions: AtomicUsize,
 
+    /// Sum of exited workers' sleep-set prunes.
+    pruned: AtomicUsize,
+
     /// Waiting workers, and subtrees already posted for them. Mirrors of the
     /// fields inside `state`, published so [`Shared::donate`] can answer "is
     /// anyone waiting" without taking the lock.
@@ -657,6 +696,7 @@ impl Shared {
             }),
             wake: Condvar::new(),
             executions: AtomicUsize::new(0),
+            pruned: AtomicUsize::new(0),
             idle: AtomicUsize::new(0),
             queued: AtomicUsize::new(1),
             stop: std::sync::atomic::AtomicBool::new(false),

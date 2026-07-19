@@ -510,6 +510,22 @@ impl Operation {
         self.action
     }
 
+    /// DPOR dependence with another operation, decided from the operations
+    /// alone. Same-object only; atomics refine by lane mask and access kind;
+    /// every other object type is conservatively dependent. For the sleep-set
+    /// wake rule an over-approximation only wakes threads earlier — pruning
+    /// less, never unsoundly more.
+    pub(super) fn conflicts_with(&self, other: &Operation) -> bool {
+        if self.obj != other.obj {
+            return false;
+        }
+
+        match (self.action, other.action) {
+            (Action::Atomic(a), Action::Atomic(b)) => a.conflicts_with(b),
+            _ => true,
+        }
+    }
+
     pub(super) fn location(&self) -> Location {
         self.location
     }
