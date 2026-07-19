@@ -607,6 +607,13 @@ struct Shared {
     state: Mutex<QueueState>,
     wake: Condvar,
     executions: AtomicUsize,
+
+    /// Waiting workers, and subtrees already posted for them. Mirrors of the
+    /// fields inside `state`, published so [`Shared::donate`] can answer "is
+    /// anyone waiting" without taking the lock.
+    idle: AtomicUsize,
+    queued: AtomicUsize,
+
     stop: std::sync::atomic::AtomicBool,
 }
 
@@ -635,6 +642,8 @@ impl Shared {
             }),
             wake: Condvar::new(),
             executions: AtomicUsize::new(0),
+            idle: AtomicUsize::new(0),
+            queued: AtomicUsize::new(1),
             stop: std::sync::atomic::AtomicBool::new(false),
         }
     }
@@ -652,10 +661,12 @@ impl Shared {
             }
 
             if let Some(task) = state.tasks.pop() {
+                self.queued.store(state.tasks.len(), Relaxed);
                 return Some(task);
             }
 
             state.idle += 1;
+            self.idle.store(state.idle, Relaxed);
 
             if state.idle == workers {
                 state.done = true;
@@ -665,22 +676,29 @@ impl Shared {
 
             state = self.wake.wait(state).unwrap();
             state.idle -= 1;
+            self.idle.store(state.idle, Relaxed);
         }
     }
 
     /// Offer idle peers part of this path's remaining subtree.
+    ///
+    /// The check is two relaxed loads rather than a lock acquire. Every worker
+    /// runs it every `DONATE_INTERVAL` executions and almost always finds
+    /// nobody waiting, so taking the pool mutex to ask would be paying for a
+    /// lock per sixteen executions to be told there is nothing to do.
+    ///
+    /// Both counters are hints, and neither can be wrong in a way that
+    /// matters: a peer missed because the load was stale waits one more
+    /// interval, and work carved for a peer that has since found some of its
+    /// own just goes to the pool, where the claim record settles who explores
+    /// it exactly as it would have anyway.
     fn donate(&self, path: &mut rt::Path) {
-        let wanted = {
-            let state = self.state.lock().unwrap();
+        let wanted = self
+            .idle
+            .load(Relaxed)
+            .saturating_sub(self.queued.load(Relaxed));
 
-            if state.done {
-                return;
-            }
-
-            state.idle.saturating_sub(state.tasks.len())
-        };
-
-        if wanted == 0 {
+        if wanted == 0 || self.stopped() {
             return;
         }
 
@@ -703,6 +721,8 @@ impl Shared {
             state.tasks.push(task);
             self.wake.notify_one();
         }
+
+        self.queued.store(state.tasks.len(), Relaxed);
     }
 
     fn stop(&self) {
