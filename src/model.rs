@@ -19,20 +19,21 @@ const DEFAULT_MAX_BRANCHES: usize = 1_000;
 /// enough that the initial fan-out is not the bottleneck.
 const DONATE_INTERVAL: usize = 16;
 
-/// How deep the exhaustively-expanded, shardable region of the tree goes.
+/// How deep into the tree a branch may be frozen, and so shared.
 ///
-/// Every branch above this depth is expanded without partial-order reduction
-/// so that subtrees can be handed between workers soundly (see
-/// `Path::split_depth`), which costs some redundant exploration near the root;
-/// every branch below it is reduced normally and belongs to one worker. Deeper
-/// means more independent subtrees to hand out and more redundancy, so this
-/// wants to be just deep enough to keep every worker fed.
+/// This costs no exploration at any setting — freezing changes who walks an
+/// alternative, never which alternatives exist. The execution count on
+/// `fused_same_word_claim_races_cancel` is 2,266,951 at every value from 4 to
+/// 10,000. All it decides is how far down a task can still be subdivided.
 ///
-/// 96 is the measured knee on a 16-thread host against the nt-sync futex
-/// rigs: shallower starves workers on an unbalanced tree (48 → 33s), deeper
-/// buys no more balance and pays for it in redundant exploration (192 → 28s,
-/// with executions up from 3.5M to 6.0M).
-const SPLIT_DEPTH: usize = 96;
+/// That makes the failure mode one-sided. Once a task's floor passes this
+/// depth it can never be split again, so a shallow setting strands whole
+/// subtrees on one worker: 58s at 4 and 8, 43s at 16, 33s at 32, against 12s
+/// from 96 up. Above 96 the curve is flat to 10,000, inside a run-to-run
+/// spread of about ±3s. 256 sits in that flat region an order of magnitude
+/// clear of the cliff, and stays bounded so a pathological model cannot grow
+/// an unbounded frozen prefix.
+const SPLIT_DEPTH: usize = 256;
 
 /// How long a model gets to finish as a plain reduced serial walk before the
 /// run restarts under a worker pool. Short enough that restarting is noise
@@ -127,13 +128,14 @@ pub struct Builder {
     /// configured per test for that to hold.
     pub threads: usize,
 
-    /// How long a model may run as a plain reduced serial walk before the run
-    /// restarts under a worker pool.
+    /// How long a model may run as a plain serial walk before it is handed to
+    /// a worker pool.
     ///
-    /// Sharding expands the shardable region of the tree without partial-order
-    /// reduction, which only pays off once there is enough tree to hand
-    /// around. Zero shards immediately — mainly useful for testing the sharded
-    /// path on a model too small to reach the probe on its own.
+    /// A pool is overhead a model that finishes in microseconds should not pay,
+    /// and that is most of them. Nothing is lost by waiting: the walk's path
+    /// crosses over with it, so the pool resumes where the probe stopped. Zero
+    /// shards immediately — mainly useful for testing the sharded path on a
+    /// model too small to reach the probe on its own.
     ///
     /// Defaults to the `LOOM_PROBE_MS` environment variable, else one second.
     pub probe: Duration,
@@ -149,13 +151,13 @@ pub struct Builder {
     /// [`threads`]: Self::threads
     pub budgeted: bool,
 
-    /// Branch depth above which scheduling is expanded exhaustively so that
-    /// subtrees can be handed between workers soundly.
+    /// How deep into the tree a branch may be frozen for sharing.
     ///
-    /// Deeper gives more independent subtrees to share out — better load
-    /// balance on an unbalanced tree — at the cost of exploring more of the
-    /// top of the tree than partial-order reduction would. Only consulted
-    /// when a run actually shards.
+    /// Deeper means a task can still be subdivided further down, which is what
+    /// keeps workers fed on an unbalanced tree. It buys that for free: what
+    /// gets explored is identical at every setting, so this trades only load
+    /// balance against how much of the tree carries shared bookkeeping. Only
+    /// consulted when a run actually shards.
     ///
     /// Defaults to the `LOOM_SPLIT_DEPTH` environment variable, else a value
     /// measured against the nt-sync futex models.
@@ -271,13 +273,15 @@ impl Builder {
 
         let start = Instant::now();
 
-        // Sharding is not free: the shardable region of the tree is expanded
-        // without partial-order reduction, which is a good trade only once
-        // there is enough tree to hand around. So every run starts as an
-        // ordinary reduced serial walk, and only a model still going after
-        // `PROBE` is big enough to be worth restarting under a worker pool.
-        // Models that finish inside the probe — the large majority — explore
-        // exactly what they always did.
+        // Spinning up a worker pool for a model that finishes in microseconds
+        // is all overhead, and that is the large majority of them. So every run
+        // starts as a plain serial walk and only hands over once it is still
+        // going after `PROBE`.
+        //
+        // The handover carries the walk's own path across, so the pool picks
+        // the tree up exactly where the probe left it. Nothing is explored
+        // twice and nothing is thrown away — which is why the probe can be
+        // generous without a large model paying for it.
         let probe = if workers == 1 {
             None
         } else {
@@ -286,13 +290,10 @@ impl Builder {
 
         let stats = match self.check_serial(&f, probe) {
             Ok(stats) => stats,
-            Err(probed) => {
-                let stats = self.check_parallel(&f, workers);
+            Err((probed, seed)) => {
+                let stats = self.check_parallel(&f, workers, seed);
 
                 Stats {
-                    // The probe's executions were real work, even though its
-                    // tree was thrown away; counting only the second phase
-                    // would understate what the run cost.
                     executions: stats.executions + probed,
                     ..stats
                 }
@@ -350,9 +351,14 @@ impl Builder {
     }
 
     /// Walk the whole tree on this thread. Returns `Err` with the executions
-    /// done so far if `deadline` passes first — the caller then knows the model
-    /// is large enough to be worth restarting under a worker pool.
-    fn check_serial<F>(&self, f: &Arc<F>, deadline: Option<Instant>) -> Result<Stats, usize>
+    /// done so far and the path to continue from if `deadline` passes first —
+    /// the caller then knows the model is large enough to be worth handing to a
+    /// worker pool.
+    fn check_serial<F>(
+        &self,
+        f: &Arc<F>,
+        deadline: Option<Instant>,
+    ) -> Result<Stats, (usize, rt::Path)>
     where
         F: Fn() + Sync + Send + 'static,
     {
@@ -403,7 +409,7 @@ impl Builder {
             // executions are thrown away along with the tree they built.
             if let Some(deadline) = deadline {
                 if Instant::now() >= deadline {
-                    return Err(i - 1);
+                    return Err((i - 1, execution.path));
                 }
             }
 
@@ -428,16 +434,16 @@ impl Builder {
 
     /// Explore the tree with `workers` threads over a shared pool of subtrees.
     ///
-    /// One worker seeds with the whole tree; whenever peers go idle, a worker
-    /// carves off its shallowest unexplored branches and posts them. Workers
-    /// never share an `Execution`, a `Scheduler`, or a coroutine — only the
-    /// task pool — so the model runs exactly as it does serially, one path at
-    /// a time per worker.
-    fn check_parallel<F>(&self, f: &Arc<F>, workers: usize) -> Stats
+    /// `seed` is the tree still to walk — whole, or whatever the probe left.
+    /// One worker takes it; whenever peers go idle, a worker freezes its
+    /// shallowest branches and posts what nobody has claimed. Workers never
+    /// share an `Execution`, a `Scheduler`, or a coroutine — only the task pool
+    /// and the frozen prefixes — so each explores exactly as a serial walk
+    /// does, one path at a time.
+    fn check_parallel<F>(&self, f: &Arc<F>, workers: usize, mut seed: rt::Path) -> Stats
     where
         F: Fn() + Sync + Send + 'static,
     {
-        let mut seed = self.new_execution().path;
         seed.set_split_depth(self.split_depth);
 
         let shared = Shared::new(seed);
