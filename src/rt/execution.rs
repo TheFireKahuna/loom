@@ -30,16 +30,14 @@ pub(crate) struct Execution {
     /// DPOR backtrack scan event-driven — see `schedule()`.
     dpor_update: Option<object::Ref>,
 
-    /// Maximum number of concurrent threads
-    pub(super) max_threads: usize,
-
-    pub(super) max_history: usize,
-
     /// Capture locations for significant events
     pub(crate) location: bool,
 
     /// Log execution output to STDOUT
     pub(crate) log: bool,
+
+    /// Reincarnate objects in place across iterations (`Builder::reuse_objects`).
+    pub(crate) reuse_objects: bool,
 }
 
 #[derive(Debug, Eq, PartialEq, Hash, Clone, Copy)]
@@ -71,10 +69,9 @@ impl Execution {
             raw_allocations: FxHashMap::default(),
             arc_objs: FxHashMap::default(),
             dpor_update: None,
-            max_threads,
-            max_history: 7,
             location: false,
             log: false,
+            reuse_objects: true,
         }
     }
 
@@ -96,47 +93,38 @@ impl Execution {
         thread_id
     }
 
-    /// Resets the execution state for the next execution run
-    pub(crate) fn step(self) -> Option<Self> {
-        let id = Id::new();
-        let max_threads = self.max_threads;
-        let max_history = self.max_history;
-        let location = self.location;
-        let log = self.log;
-        let mut path = self.path;
-        let mut objects = self.objects;
-        let mut lazy_statics = self.lazy_statics;
-        let mut raw_allocations = self.raw_allocations;
-        let mut arc_objs = self.arc_objs;
-
-        let mut threads = self.threads;
-
-        if !path.step() {
-            return None;
+    /// Resets the execution state for the next execution run. Returns `false`
+    /// when the path is fully explored.
+    pub(crate) fn step(&mut self) -> bool {
+        if !self.path.step() {
+            return false;
         }
 
-        objects.clear();
-        lazy_statics.reset();
-        raw_allocations.clear();
-        arc_objs.clear();
+        self.reset_iteration();
+        true
+    }
 
-        threads.clear(id);
+    /// Reset every per-iteration structure in place, keeping its allocations:
+    /// the object store keeps its entries as reincarnation carcasses
+    /// (`begin_epoch`), the maps keep their tables, the thread set its
+    /// backing storage. Also the seam a pooled `Execution` crosses when a
+    /// parallel worker reuses it for a fresh subtree.
+    pub(crate) fn reset_iteration(&mut self) {
+        let id = Id::new();
+        self.id = id;
 
-        Some(Execution {
-            id,
-            path,
-            threads,
-            objects,
-            lazy_statics,
-            raw_allocations,
-            arc_objs,
-            // Object refs do not survive the iteration reset.
-            dpor_update: None,
-            max_threads,
-            max_history,
-            location,
-            log,
-        })
+        if self.reuse_objects {
+            self.objects.begin_epoch();
+        } else {
+            self.objects.clear();
+        }
+        self.lazy_statics.reset();
+        self.raw_allocations.clear();
+        self.arc_objs.clear();
+        self.threads.clear(id);
+
+        // Object refs do not survive the iteration reset.
+        self.dpor_update = None;
     }
 
     /// Returns `true` if a switch is required

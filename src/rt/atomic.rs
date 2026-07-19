@@ -258,6 +258,14 @@ pub(super) struct State {
     /// skipped wholesale instead of scanning their stores. Maintained wherever
     /// `first_seen.touch` runs (see `track_load`/`track_store`).
     touched_by: u32,
+
+    /// Region carcasses from previous epochs of this cell. A reincarnated
+    /// cell collapses its partition back to one full-width region; the split
+    /// halves park here and `ensure_partition` reuses their allocations when
+    /// this epoch re-splits. A cell that re-splits identically every
+    /// execution — the common case — reaches steady state with zero region
+    /// allocation.
+    spares: Vec<Region>,
 }
 
 /// One sub-word region of a cell: a bit-mask and the store history over just
@@ -509,8 +517,12 @@ impl<T: Numeric> Atomic<T> {
     /// Create a new, atomic cell initialized with the provided value
     pub(crate) fn new(value: T, location: Location) -> Atomic<T> {
         rt::execution(|execution| {
-            let state = State::new(&mut execution.threads, value.into_u128(), location);
-            let state = execution.objects.insert(state);
+            let state = execution.objects.insert_with(State::shell, State::recycle);
+            state.get_mut(&mut execution.objects).init(
+                &mut execution.threads,
+                value.into_u128(),
+                location,
+            );
 
             trace!(?state, "Atomic::new");
 
@@ -868,9 +880,12 @@ impl<T: Numeric> Atomic<T> {
 // ===== impl State =====
 
 impl State {
-    fn new(threads: &mut thread::Set, value: u128, location: Location) -> State {
-        let mut state = State {
-            created_location: location,
+    /// An uninitialized cell shape: one full-width empty region. `init` must
+    /// run before any access. Split from `init` so a carcass can supply the
+    /// shape (`recycle`) with its allocations intact.
+    fn shell() -> State {
+        State {
+            created_location: Location::default(),
             loaded_at: VersionVec::new(),
             loaded_locations: LocationSet::new(),
             unsync_loaded_at: VersionVec::new(),
@@ -882,13 +897,43 @@ impl State {
             is_mutating: false,
             regions: vec![Region::new(FULL_MASK)],
             op_clock: 0,
-            // The genesis store's `first_seen` is touched by the creating
-            // thread, so seed its bit.
-            touched_by: 1 << threads.active_id().as_usize(),
-        };
+            touched_by: 0,
+            spares: Vec::new(),
+        }
+    }
+
+    /// Return a carcass to exactly the shape `shell` constructs, keeping its
+    /// allocations. Split regions park on `spares`; region 0 is reset to one
+    /// empty full-width region. Stale ring contents are never zeroed: every
+    /// ring read is bounded by `live_stores()` (`cnt`, reset here) and a push
+    /// overwrites its slot whole.
+    fn recycle(&mut self) {
+        let extra = self.regions.drain(1..);
+        self.spares.extend(extra);
+        self.regions[0].reset(FULL_MASK);
+    }
+
+    /// Initialize a shell (fresh or recycled) as `Atomic::new` requires.
+    /// Writes every non-storage field, so a recycled cell is extensionally
+    /// identical to a fresh one.
+    fn init(&mut self, threads: &mut thread::Set, value: u128, location: Location) {
+        self.created_location = location;
+        self.loaded_at = VersionVec::new();
+        self.loaded_locations = LocationSet::new();
+        self.unsync_loaded_at = VersionVec::new();
+        self.unsync_loaded_locations = LocationSet::new();
+        self.stored_at = VersionVec::new();
+        self.stored_locations = LocationSet::new();
+        self.unsync_mut_at = VersionVec::new();
+        self.unsync_mut_locations = LocationSet::new();
+        self.is_mutating = false;
+        self.op_clock = 0;
+        // The genesis store's `first_seen` is touched by the creating
+        // thread, so seed its bit.
+        self.touched_by = 1 << threads.active_id().as_usize();
 
         // All subsequent accesses must happen-after.
-        state.track_unsync_mut(threads);
+        self.track_unsync_mut(threads);
 
         // Store the initial thread
         //
@@ -897,9 +942,7 @@ impl State {
         // creation of this atomic cell.
         //
         // This is verified using `cell`.
-        state.regions[0].store(threads, Synchronize::new(), value, Ordering::Release, None, 0);
-
-        state
+        self.regions[0].store(threads, Synchronize::new(), value, Ordering::Release, None, 0);
     }
 
     /// Allocate the next store-op id for this cell. A wide op passes the same
@@ -931,7 +974,8 @@ impl State {
                 // The region straddles the mask boundary: keep the inside part
                 // in place and split off the outside part. Neither half
                 // straddles this mask afterwards, so advancing is correct.
-                let split = self.regions[i].split_off(inside);
+                let spare = self.spares.pop();
+                let split = self.regions[i].split_off(inside, spare);
                 self.regions.push(split);
             }
 
@@ -1461,6 +1505,16 @@ impl Region {
         }
     }
 
+    /// Reset to an empty region owning `mask`, keeping the allocations. The
+    /// ring is not zeroed: `cnt = 0` puts every slot outside `live_stores()`
+    /// and a push overwrites its slot whole, so stale bytes are unreachable.
+    fn reset(&mut self, mask: u128) {
+        self.mask = mask;
+        self.cnt = 0;
+        *self.last_access = Default::default();
+        *self.last_non_load_access = Default::default();
+    }
+
     /// Keep the `keep_mask` bits of this region in place; split the remaining
     /// bits into a new region that inherits a full copy of the history **and
     /// the DPOR access records**. Both halves start perfectly coherent
@@ -1468,16 +1522,31 @@ impl Region {
     /// conflicted with the pre-split region conflicts with whichever half it
     /// still overlaps — and diverge only as future masked ops touch one but
     /// not the other.
-    fn split_off(&mut self, keep_mask: u128) -> Region {
+    ///
+    /// `spare` recycles a previous epoch's region: its allocations receive
+    /// the copies (`clone_from` clones contents in place).
+    fn split_off(&mut self, keep_mask: u128, spare: Option<Region>) -> Region {
         let other_mask = self.mask & !keep_mask;
         self.mask &= keep_mask;
 
-        Region {
-            mask: other_mask,
-            stores: self.stores.clone(),
-            cnt: self.cnt,
-            last_access: self.last_access.clone(),
-            last_non_load_access: self.last_non_load_access.clone(),
+        match spare {
+            Some(mut region) => {
+                region.mask = other_mask;
+                region.cnt = self.cnt;
+                region.stores.clone_from(&self.stores);
+                region.last_access.clone_from(&self.last_access);
+                region
+                    .last_non_load_access
+                    .clone_from(&self.last_non_load_access);
+                region
+            }
+            None => Region {
+                mask: other_mask,
+                stores: self.stores.clone(),
+                cnt: self.cnt,
+                last_access: self.last_access.clone(),
+                last_non_load_access: self.last_non_load_access.clone(),
+            },
         }
     }
 
@@ -1511,6 +1580,7 @@ impl Region {
     }
 
     fn load(&mut self, threads: &mut thread::Set, index: usize, ordering: Ordering) -> u128 {
+        debug_assert!(index < self.live_stores(), "load of dead slot");
         // Apply coherence rules
         self.apply_load_coherence(threads, index);
 
@@ -1582,9 +1652,6 @@ impl Region {
         let id = self.cnt;
         let creator = threads.active_id().as_usize();
 
-        // Increment the count
-        self.cnt += 1;
-
         // The modification order is initialized to the thread's current
         // causality. All reads / writes that happen before this store are
         // ordered before the store.
@@ -1630,7 +1697,12 @@ impl Region {
         }
 
         // RMW Atomicity: everything mo-after an RMW's read store is mo-after
-        // the RMW's write.
+        // the RMW's write. Runs against the pre-push ring: `cnt` is not yet
+        // incremented, so the slot this store will occupy is outside
+        // `live_stores()` and its previous contents — dead sentinel or a
+        // reincarnated cell's stale carcass — are structurally unreadable.
+        // (`cnt` incremented early here once relied on the sentinel's
+        // `rmw_read: None` to keep this scan benign.)
         self.close_rmw_atomicity(&mut modification_order, id);
 
         sync.sync_store(threads, ordering);
@@ -1638,7 +1710,7 @@ impl Region {
         let mut first_seen = FirstSeen::new();
         first_seen.touch(threads);
 
-        // Track the store
+        // Track the store: write the slot whole, then publish it by count.
         self.stores[index] = Store {
             value,
             happens_before,
@@ -1651,12 +1723,14 @@ impl Region {
             first_seen,
             sc_rank,
         };
+        self.cnt += 1;
     }
 
     /// The read half of an RMW: apply load coherence and return the read
     /// value. The caller composes it across regions; `rmw_commit` or
     /// `rmw_fail` follows.
     fn rmw_read(&mut self, threads: &mut thread::Set, index: usize) -> u128 {
+        debug_assert!(index < self.live_stores(), "rmw_read of dead slot");
         // Apply coherence rules.
         self.apply_load_coherence(threads, index);
 
@@ -1677,6 +1751,7 @@ impl Region {
         sc_rank: Option<u32>,
         op_id: u64,
     ) {
+        debug_assert!(index < self.live_stores(), "rmw_commit of dead slot");
         // Perform load synchronization using the `success` ordering.
         self.stores[index].sync.sync_load(threads, success);
 
@@ -1702,6 +1777,7 @@ impl Region {
 
     /// The failed-compare-exchange path: a load synchronizing with `failure`.
     fn rmw_fail(&mut self, threads: &mut thread::Set, index: usize, failure: Ordering) {
+        debug_assert!(index < self.live_stores(), "rmw_fail of dead slot");
         self.stores[index].sync.sync_load(threads, failure);
     }
 

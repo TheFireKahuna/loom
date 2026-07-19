@@ -162,6 +162,15 @@ pub struct Builder {
     /// Defaults to the `LOOM_SPLIT_DEPTH` environment variable, else a value
     /// measured against the nt-sync futex models.
     pub split_depth: usize,
+
+    /// Reincarnate model objects in place across executions instead of
+    /// freeing and reallocating them (see `rt::object::Store::begin_epoch`).
+    ///
+    /// On by default; consecutive executions rebuild an almost-identical
+    /// object graph, and reuse removes that rebuild from the allocator
+    /// entirely. Off forces every execution to construct its objects from
+    /// scratch — the reference behavior the reuse path is tested against.
+    pub reuse_objects: bool,
 }
 
 impl Builder {
@@ -231,6 +240,9 @@ impl Builder {
                     Duration::from_millis(v.parse().expect("invalid value for `LOOM_PROBE_MS`"))
                 })
                 .unwrap_or(PROBE),
+            reuse_objects: env::var("LOOM_REUSE_OBJECTS")
+                .map(|v| v != "0")
+                .unwrap_or(true),
         }
     }
 
@@ -328,6 +340,7 @@ impl Builder {
 
         execution.log = self.log;
         execution.location = self.location;
+        execution.reuse_objects = self.reuse_objects;
         execution
     }
 
@@ -423,9 +436,7 @@ impl Builder {
             // execution, as the `Execution` will capture the current span when
             // it's reset.
             _span = tracing::info_span!(parent: None, "iter", message = i).entered();
-            if let Some(next) = execution.step() {
-                execution = next;
-            } else {
+            if !execution.step() {
                 info!(parent: None, "Completed in {} iterations", i - 1);
                 return Ok(self.stats(i - 1, 1));
             }
@@ -493,9 +504,14 @@ impl Builder {
     {
         let mut scheduler = Scheduler::new(self.max_threads);
 
+        // One `Execution` for the worker's whole life: taking a new subtree
+        // swaps the path in and epoch-resets the rest, so the object store's
+        // reincarnation carcasses carry across tasks, not just iterations.
+        let mut execution = self.new_execution();
+
         while let Some(path) = shared.take(workers) {
-            let mut execution = self.new_execution();
             execution.path = path;
+            execution.reset_iteration();
 
             loop {
                 run_once(&mut scheduler, &mut execution, f);
@@ -509,9 +525,8 @@ impl Builder {
                     return;
                 }
 
-                match execution.step() {
-                    Some(next) => execution = next,
-                    None => break,
+                if !execution.step() {
+                    break;
                 }
 
                 if done % DONATE_INTERVAL == 0 {

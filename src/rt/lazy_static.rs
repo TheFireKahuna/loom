@@ -30,7 +30,13 @@ impl Set {
     }
 
     pub(crate) fn reset(&mut self) {
-        assert!(!self.live, "lazy_static was not dropped during execution");
+        // A live set is only tolerable when it is empty (a never-run
+        // execution being re-armed at a worker task boundary): live and
+        // non-empty means an execution ended without dropping its statics.
+        assert!(
+            !self.live || self.statics.is_empty(),
+            "lazy_static was not dropped during execution"
+        );
         debug_assert!(self.statics.is_empty(), "`drop` left statics behind");
         self.live = true;
     }

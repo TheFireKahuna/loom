@@ -47,6 +47,18 @@ fn explore<M>(threads: usize, bound: Option<usize>, model: M) -> (BTreeSet<Strin
 where
     M: Fn(&Log) + Send + Sync + 'static,
 {
+    explore_with(threads, bound, model, true)
+}
+
+fn explore_with<M>(
+    threads: usize,
+    bound: Option<usize>,
+    model: M,
+    reuse_objects: bool,
+) -> (BTreeSet<String>, usize)
+where
+    M: Fn(&Log) + Send + Sync + 'static,
+{
     let seen: Arc<Mutex<BTreeSet<String>>> = Arc::new(Mutex::new(BTreeSet::new()));
     let out = seen.clone();
 
@@ -67,6 +79,7 @@ where
     // back one worker and the comparison would be against itself.
     builder.probe = std::time::Duration::ZERO;
     builder.budgeted = false;
+    builder.reuse_objects = reuse_objects;
 
     let stats = builder.check(move || {
         let log = Log::default();
@@ -411,6 +424,44 @@ fn sharding_walks_the_same_tree_as_a_serial_run() {
                      the tree, which means lost or duplicated subtrees"
                 );
             }
+        }
+    }
+}
+
+/// Object reincarnation (`Builder::reuse_objects`) claims a recycled object
+/// is extensionally identical to a freshly constructed one. If any reused
+/// state leaked across executions — a stale store in a ring, a surviving
+/// access record, a partition that failed to collapse — the checker would
+/// walk a different tree, so behaviors *and* execution counts must match a
+/// virgin-store run exactly.
+#[test]
+fn reincarnation_walks_the_same_tree_as_virgin_stores() {
+    let models: &[(&str, fn(&Log))] = &[
+        ("store_buffering", store_buffering),
+        ("message_passing", message_passing),
+        ("disjoint_lanes", disjoint_lanes),
+        ("rmw_contention", rmw_contention),
+        ("mixed_independence", mixed_independence),
+        ("mutex_counter", mutex_counter),
+        ("interleaved_cells", interleaved_cells),
+    ];
+
+    for &(name, model) in models {
+        for &bound in BOUNDS {
+            let (virgin_seen, virgin_n) = explore_with(1, bound, model, false);
+            let (reused_seen, reused_n) = explore_with(1, bound, model, true);
+
+            assert_eq!(
+                virgin_seen, reused_seen,
+                "{name}: bound={bound:?} reincarnated objects changed the \
+                 observable behaviors — reused state leaked across executions"
+            );
+            assert_eq!(
+                reused_n, virgin_n,
+                "{name}: bound={bound:?} explored {reused_n} executions with \
+                 reincarnation but {virgin_n} with virgin stores — a recycled \
+                 object is not extensionally identical to a fresh one"
+            );
         }
     }
 }

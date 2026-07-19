@@ -10,11 +10,28 @@ use tracing::trace;
 use serde::{Deserialize, Serialize};
 
 /// Stores objects
+///
+/// Executions are epochs over an almost-identical object graph: iteration
+/// i+1 re-creates the objects iteration i dropped, in the same order, because
+/// creation order is deterministic given the schedule prefix and consecutive
+/// executions share most of it. So the store never frees at an epoch
+/// boundary — `begin_epoch` resets a cursor and the old entries become
+/// carcasses, reincarnated in place slot-by-slot as the next execution
+/// re-creates the same objects. Steady state allocates nothing.
+///
+/// `entries[..live]` are the current epoch's objects; `entries[live..]` are
+/// carcasses awaiting reuse. Every read path is bounded by `live` — a carcass
+/// must be invisible (a fence scanning a stale atomic's stores would absorb
+/// synchronization from a previous execution).
 #[derive(Debug, Clone)]
 #[cfg_attr(feature = "checkpoint", derive(Serialize, Deserialize))]
 pub(super) struct Store<T = Entry> {
-    /// Stored state for all objects.
+    /// Stored state for all objects, current epoch then carcasses.
     entries: Vec<T>,
+
+    /// Number of live (current-epoch) entries. Stores that never call
+    /// `begin_epoch` (the path's branch store) keep `live == entries.len()`.
+    live: usize,
 }
 
 pub(super) trait Object: Sized {
@@ -147,11 +164,12 @@ impl<T> Store<T> {
     pub(super) fn with_capacity(capacity: usize) -> Store<T> {
         Store {
             entries: Vec::with_capacity(capacity),
+            live: 0,
         }
     }
 
     pub(super) fn len(&self) -> usize {
-        self.entries.len()
+        self.live
     }
 
     pub(super) fn capacity(&self) -> usize {
@@ -162,13 +180,55 @@ impl<T> Store<T> {
         self.entries.reserve_exact(additional);
     }
 
-    /// Insert an object into the store
+    /// Insert an object into the store, overwriting a carcass in place when
+    /// one is available (any variant — assignment drops the old entry without
+    /// touching the `Vec`).
     pub(super) fn insert<O>(&mut self, item: O) -> Ref<O>
     where
         O: Object<Entry = T>,
     {
-        let index = self.entries.len();
-        self.entries.push(item.into_entry());
+        let index = self.live;
+        if index < self.entries.len() {
+            self.entries[index] = item.into_entry();
+        } else {
+            self.entries.push(item.into_entry());
+        }
+        self.live += 1;
+
+        Ref {
+            index,
+            _p: PhantomData,
+        }
+    }
+
+    /// Insert an object, reincarnating a same-variant carcass in place.
+    ///
+    /// `reuse` must leave the carcass in exactly the state `make` constructs —
+    /// same fields, same reachable history — reusing its allocations. A
+    /// carcass of a different variant means the schedule diverged into code
+    /// creating a different object graph; the rest of the tail is stale for
+    /// this path and is dropped.
+    pub(super) fn insert_with<O>(
+        &mut self,
+        make: impl FnOnce() -> O,
+        reuse: impl FnOnce(&mut O),
+    ) -> Ref<O>
+    where
+        O: Object<Entry = T>,
+    {
+        let index = self.live;
+        if index < self.entries.len() {
+            match O::get_mut(&mut self.entries[index]) {
+                Some(obj) => reuse(obj),
+                None => {
+                    self.entries.truncate(index);
+                    self.entries.push(make().into_entry());
+                }
+            }
+        } else {
+            self.entries.push(make().into_entry());
+        }
+        self.live += 1;
 
         Ref {
             index,
@@ -179,17 +239,26 @@ impl<T> Store<T> {
     pub(crate) fn truncate<O>(&mut self, obj: Ref<O>) {
         let target = obj.index + 1;
         self.entries.truncate(target);
+        self.live = self.live.min(target);
     }
 
     pub(crate) fn clear(&mut self) {
         self.entries.clear();
+        self.live = 0;
+    }
+
+    /// Start a new epoch: every entry becomes a carcass available for
+    /// in-place reincarnation by this epoch's `insert`/`insert_with` calls.
+    /// Nothing is dropped here.
+    pub(crate) fn begin_epoch(&mut self) {
+        self.live = 0;
     }
 
     pub(super) fn iter_ref<O>(&self) -> impl DoubleEndedIterator<Item = Ref<O>> + '_
     where
         O: Object<Entry = T>,
     {
-        self.entries
+        self.entries[..self.live]
             .iter()
             .enumerate()
             .filter(|(_, e)| O::get_ref(e).is_some())
@@ -203,7 +272,8 @@ impl<T> Store<T> {
     where
         O: Object<Entry = T> + 'a,
     {
-        self.entries.iter_mut().filter_map(O::get_mut)
+        let live = self.live;
+        self.entries[..live].iter_mut().filter_map(O::get_mut)
     }
 }
 
@@ -279,7 +349,7 @@ impl Store {
 
     /// Panics if any leaks were detected
     pub(crate) fn check_for_leaks(&self) {
-        for (index, entry) in self.entries.iter().enumerate() {
+        for (index, entry) in self.entries[..self.live].iter().enumerate() {
             match entry {
                 Entry::Alloc(entry) => entry.check_for_leaks(index),
                 Entry::Arc(entry) => entry.check_for_leaks(index),
@@ -313,6 +383,7 @@ impl<T> Ref<T> {
 impl<T: Object> Ref<T> {
     /// Get a reference to the object associated with this reference from the store
     pub(super) fn get(self, store: &Store<T::Entry>) -> &T {
+        debug_assert!(self.index < store.live, "[loom internal bug] ref to carcass");
         T::get_ref(&store.entries[self.index])
             .expect("[loom internal bug] unexpected object stored at reference")
     }
@@ -320,6 +391,7 @@ impl<T: Object> Ref<T> {
     /// Get a mutable reference to the object associated with this reference
     /// from the store
     pub(super) fn get_mut(self, store: &mut Store<T::Entry>) -> &mut T {
+        debug_assert!(self.index < store.live, "[loom internal bug] ref to carcass");
         T::get_mut(&mut store.entries[self.index])
             .expect("[loom internal bug] unexpected object stored at reference")
     }

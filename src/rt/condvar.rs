@@ -29,11 +29,18 @@ impl Condvar {
     /// Create a new condition variable object
     pub(crate) fn new() -> Condvar {
         super::execution(|execution| {
-            let state = execution.objects.insert(State {
-                last_access: None,
-                did_spur: false,
-                waiters: VecDeque::new(),
-            });
+            let state = execution.objects.insert_with(
+                || State {
+                    last_access: None,
+                    did_spur: false,
+                    waiters: VecDeque::new(),
+                },
+                |state| {
+                    state.last_access = None;
+                    state.did_spur = false;
+                    state.waiters.clear();
+                },
+            );
 
             trace!(?state, "Condvar::new");
 

@@ -52,14 +52,24 @@ pub(super) enum Action {
 impl Channel {
     pub(crate) fn new(location: Location) -> Self {
         super::execution(|execution| {
-            let state = execution.objects.insert(State {
-                msg_cnt: 0,
-                last_send_access: None,
-                last_recv_access: None,
-                sender_synchronize: Synchronize::new(),
-                receiver_synchronize: VecDeque::new(),
-                created: location,
-            });
+            let state = execution.objects.insert_with(
+                || State {
+                    msg_cnt: 0,
+                    last_send_access: None,
+                    last_recv_access: None,
+                    sender_synchronize: Synchronize::new(),
+                    receiver_synchronize: VecDeque::new(),
+                    created: location,
+                },
+                |state| {
+                    state.msg_cnt = 0;
+                    state.last_send_access = None;
+                    state.last_recv_access = None;
+                    state.sender_synchronize = Synchronize::new();
+                    state.receiver_synchronize.clear();
+                    state.created = location;
+                },
+            );
 
             tracing::trace!(?state, %location, "mpsc::channel");
             Self { state }
