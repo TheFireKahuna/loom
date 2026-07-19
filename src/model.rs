@@ -127,18 +127,6 @@ pub struct Builder {
     /// configured per test for that to hold.
     pub threads: usize,
 
-    /// Apply sleep-set reduction.
-    ///
-    /// DPOR alone still walks a given interleaving once per order in which
-    /// its independent operations can be reached. A sleep set records, at
-    /// each branch, the threads whose subtree is already accounted for and
-    /// carries that forward across every transition they commute with, which
-    /// cuts those repeats. It never changes which behaviors are reachable,
-    /// only how many times each is visited.
-    ///
-    /// Defaults to the `LOOM_SLEEP_SETS` environment variable, else enabled.
-    pub sleep_sets: bool,
-
     /// How long a model may run as a plain reduced serial walk before the run
     /// restarts under a worker pool.
     ///
@@ -220,14 +208,6 @@ impl Builder {
             .map(|v| v.parse().expect("invalid value for `LOOM_THREADS`"))
             .unwrap_or_else(|_| cpus());
 
-        let sleep_sets = env::var("LOOM_SLEEP_SETS")
-            .map(|v| match &*v.to_ascii_lowercase() {
-                "0" | "false" | "no" | "off" => false,
-                "1" | "true" | "yes" | "on" => true,
-                _ => panic!("invalid value for `LOOM_SLEEP_SETS`"),
-            })
-            .unwrap_or(true);
-
         Builder {
             max_threads: DEFAULT_MAX_THREADS,
             max_branches,
@@ -240,7 +220,6 @@ impl Builder {
             location,
             log,
             threads,
-            sleep_sets,
             budgeted: true,
             split_depth: env::var("LOOM_SPLIT_DEPTH")
                 .map(|v| v.parse().expect("invalid value for `LOOM_SPLIT_DEPTH`"))
@@ -327,10 +306,9 @@ impl Builder {
         // says whether a reduction is doing anything.
         if std::env::var_os("LOOM_STATS").is_some() {
             eprintln!(
-                "loom: {} executions, {} worker(s), sleep_sets={}, bound={:?}, {:.2}s",
+                "loom: {} executions, {} worker(s), bound={:?}, {:.2}s",
                 stats.executions,
                 stats.threads,
-                self.sleep_sets,
                 self.preemption_bound,
                 start.elapsed().as_secs_f64(),
             );
@@ -345,7 +323,6 @@ impl Builder {
             self.max_branches,
             self.preemption_bound,
             !self.expect_explicit_explore,
-            self.sleep_sets,
         );
 
         execution.log = self.log;

@@ -33,15 +33,6 @@ pub(crate) struct Path {
     /// How to reset the `exploring` state
     exploring_on_start: bool,
 
-    /// Whether sleep-set reduction is applied (see [`Schedule::sleep_done`]).
-    sleep_sets: bool,
-
-    /// Sleep set to install at the *next* schedule branch this traversal
-    /// reaches, computed by `Execution::schedule` from the transition it
-    /// just committed to. Staged here because the branch it belongs to has
-    /// not been visited yet.
-    sleep_in: u16,
-
     /// Lowest branch index this path owns. `step()` never advances or
     /// truncates below it, which is what makes a path clone a self-contained
     /// unit of work: the subtree rooted here and nothing else (see
@@ -93,18 +84,6 @@ pub(crate) struct Schedule {
     prev: Option<object::Ref<Schedule>>,
 
     exploring: bool,
-
-    /// Threads whose subtree *from this branch* the DFS has already finished
-    /// (or handed to another worker). Grown by `step()` as it retires each
-    /// alternative; persists across iterations because this branch's prefix
-    /// does not change while it is being explored.
-    sleep_done: u16,
-
-    /// Threads carried into this branch from its predecessor: put to sleep
-    /// higher up, and independent of every transition taken since. Recomputed
-    /// each traversal, since it is a function of the prefix rather than of
-    /// the exploration so far.
-    sleep_in: u16,
 }
 
 #[derive(Debug, Clone)]
@@ -179,15 +158,10 @@ macro_rules! assert_path_len {
 impl Path {
     /// Create a new, blank, configured to branch at most `max_branches` times
     /// and at most `preemption_bound` thread preemptions.
-    pub(crate) fn new(
-        max_branches: usize,
-        preemption_bound: Option<u8>,
-        exploring: bool,
-        sleep_sets: bool,
-    ) -> Path {
+    pub(crate) fn new(max_branches: usize, preemption_bound: Option<u8>, exploring: bool) -> Path {
         assert!(
             MAX_THREADS <= 16,
-            "[loom internal bug] sleep sets are a u16 mask over threads"
+            "[loom internal bug] thread sets are a u16 mask over threads"
         );
 
         Path {
@@ -197,8 +171,6 @@ impl Path {
             exploring,
             skipping: false,
             exploring_on_start: exploring,
-            sleep_sets,
-            sleep_in: 0,
             floor: 0,
             split_depth: 0,
             escapes: Vec::new(),
@@ -243,40 +215,6 @@ impl Path {
         self.pos
     }
 
-    /// The effective sleep set at the schedule branch stored at `point` —
-    /// what the DFS has retired here, plus what was carried in. A branch that
-    /// is not a `Schedule` (or a path with sleep sets off) sleeps nothing.
-    pub(super) fn sleep_at(&self, point: usize) -> u16 {
-        if !self.sleep_sets || point >= self.branches.len() {
-            return 0;
-        }
-
-        object::Ref::from_usize(point)
-            .downcast::<Schedule>(&self.branches)
-            .map(|s| self.sleep_of(s))
-            .unwrap_or(0)
-    }
-
-    fn sleep_of(&self, schedule: object::Ref<Schedule>) -> u16 {
-        if !self.sleep_sets {
-            return 0;
-        }
-
-        let schedule = schedule.get(&self.branches);
-        schedule.sleep_done | schedule.sleep_in
-    }
-
-    /// Stage the sleep set for the next schedule branch this traversal
-    /// reaches. Called once per `Execution::schedule`, after it has committed
-    /// to the transition that filtered the set.
-    pub(super) fn set_sleep_in(&mut self, sleep: u16) {
-        self.sleep_in = if self.sleep_sets { sleep } else { 0 };
-    }
-
-    pub(super) fn sleep_sets(&self) -> bool {
-        self.sleep_sets
-    }
-
     /// Note backtrack points that landed below this path's floor. Deduplicated
     /// because the prefix below the floor is frozen for this path's whole
     /// lifetime, so `(branch, thread)` names the same subtree every time.
@@ -318,7 +256,6 @@ impl Path {
                 let mut task = self.clone();
                 task.floor = point as usize;
                 task.pos = 0;
-                task.sleep_in = 0;
                 task.escapes = Vec::new();
                 task.branches.truncate(entry);
 
@@ -434,8 +371,6 @@ impl Path {
                 threads: [Thread::Disabled; MAX_THREADS],
                 prev,
                 exploring: self.exploring,
-                sleep_done: 0,
-                sleep_in: 0,
             });
 
             // Get a reference to the branch in the object store.
@@ -516,11 +451,6 @@ impl Path {
             .downcast::<Schedule>(&self.branches)
             .expect("Reached unexpected exploration state. Is the model fully deterministic?");
 
-        // Refresh the carried-in sleep set: `sleep_done` is a property of how
-        // far the DFS has gotten here and persists, but `sleep_in` is a
-        // function of the prefix and is recomputed every traversal.
-        schedule_ref.get_mut(&mut self.branches).sleep_in = self.sleep_in;
-
         let schedule = schedule_ref.get(&self.branches);
 
         self.pos += 1;
@@ -538,13 +468,11 @@ impl Path {
             if let Some(schedule_ref) =
                 object::Ref::from_usize(point).downcast::<Schedule>(&self.branches)
             {
-                let sleep = self.sleep_of(schedule_ref);
                 let owned = point >= self.floor;
                 let schedule = schedule_ref.get_mut(&mut self.branches);
 
                 if schedule.exploring {
-                    let marked =
-                        schedule.backtrack(thread_id, self.preemption_bound, sleep, owned);
+                    let marked = schedule.backtrack(thread_id, self.preemption_bound, owned);
                     let prev = schedule.prev;
 
                     self.record_escapes(point, owned, marked);
@@ -574,12 +502,10 @@ impl Path {
                     let active_b = prev.get(&self.branches).active_thread_index();
 
                     if active_a != active_b && curr.get(&self.branches).exploring {
-                        let sleep = self.sleep_of(curr);
                         let owned = curr.index() >= self.floor;
                         let marked = curr.get_mut(&mut self.branches).backtrack(
                             thread_id,
                             self.preemption_bound,
-                            sleep,
                             owned,
                         );
 
@@ -591,12 +517,10 @@ impl Path {
                 } else {
                     if curr.get(&self.branches).exploring {
                         // This is the very first schedule
-                        let sleep = self.sleep_of(curr);
                         let owned = curr.index() >= self.floor;
                         let marked = curr.get_mut(&mut self.branches).backtrack(
                             thread_id,
                             self.preemption_bound,
-                            sleep,
                             owned,
                         );
 
@@ -621,10 +545,6 @@ impl Path {
         self.exploring = self.exploring_on_start;
         self.skipping = false;
 
-        // The first schedule branch carries nothing in; every later one has
-        // its `sleep_in` recomputed as the traversal reaches it.
-        self.sleep_in = 0;
-
         // Set the final branch to try the next option. If all options have been
         // traversed, pop the final branch and try again w/ the one under it.
         //
@@ -640,45 +560,23 @@ impl Path {
             self.branches.truncate(last);
 
             if let Some(schedule_ref) = last.downcast::<Schedule>(&self.branches) {
-                let sleep = self.sleep_of(schedule_ref);
-                let sleep_sets = self.sleep_sets;
                 let schedule = schedule_ref.get_mut(&mut self.branches);
 
                 if !schedule.exploring {
                     continue;
                 }
 
-                // Transition the active thread to visited. Its subtree from
-                // this branch is now fully explored, which is exactly the
-                // condition for putting it to sleep for the alternatives that
-                // follow: any interleaving they could reach by running it
-                // later is a reordering of one just covered.
-                if let Some((i, thread)) = schedule
-                    .threads
-                    .iter_mut()
-                    .enumerate()
-                    .find(|(_, th)| th.is_active())
-                {
+                // The alternative just explored is finished; its subtree from
+                // this branch is fully walked.
+                if let Some(thread) = schedule.threads.iter_mut().find(|th| th.is_active()) {
                     *thread = Thread::Visited;
-
-                    if sleep_sets {
-                        schedule.sleep_done |= 1 << i;
-                    }
                 }
 
-                let sleep = sleep | schedule.sleep_done;
-
-                // Find a pending thread and transition it to active, retiring
-                // any that have since gone to sleep.
+                // Find a pending thread and transition it to active.
                 let mut rem = false;
 
-                for (i, th) in schedule.threads.iter_mut().enumerate() {
+                for th in schedule.threads.iter_mut() {
                     if !th.is_pending() {
-                        continue;
-                    }
-
-                    if sleep_sets && sleep & (1 << i) != 0 {
-                        *th = Thread::Visited;
                         continue;
                     }
 
@@ -734,11 +632,8 @@ impl Path {
     /// leaf. Both sides come out with a strictly smaller share, so repeated
     /// donation terminates.
     ///
-    /// Each side records the other's share as slept-through: the two subtrees
-    /// are disjoint and both are explored before the model run completes, so
-    /// an interleaving one side prunes as a reordering is one the other side
-    /// actually walks. `Spurious` branches are not split — they are two-way,
-    /// and the scan simply moves past them to the next schedule or load.
+    /// `Spurious` branches are not split — they are two-way, and the scan
+    /// simply moves past them to the next schedule or load.
     pub(crate) fn split_off(&mut self) -> Option<Path> {
         let capacity = self.branches.capacity();
         let limit = self.branches.len().min(self.split_depth);
@@ -788,7 +683,6 @@ impl Path {
             let mut thief = self.clone();
             thief.floor = index;
             thief.pos = 0;
-            thief.sleep_in = 0;
             thief.branches.truncate(entry);
 
             // `Vec::clone` allocates to fit, which would make the
@@ -806,7 +700,6 @@ impl Path {
                     let mine = mine.get_mut(&mut self.branches);
                     for &i in &taken {
                         mine.threads[i] = Thread::Visited;
-                        mine.sleep_done |= 1 << i;
                     }
 
                     let theirs = theirs.get_mut(&mut thief.branches);
@@ -829,7 +722,6 @@ impl Path {
                         // Leaving them skippable would let both sides open the
                         // same one.
                         *th = Thread::Visited;
-                        theirs.sleep_done |= 1 << i;
                     }
 
                     debug_assert!(active, "[loom internal bug] donated no thread");
@@ -886,20 +778,10 @@ impl Schedule {
     /// Mark `thread_id` for exploration from this branch, returning the mask
     /// of threads that changed to pending.
     ///
-    /// `sleep` names the threads whose subtree here is already accounted for;
-    /// marking one would re-derive interleavings equivalent to ones already
-    /// walked, so it is skipped — this is where sleep sets do their pruning.
-    ///
     /// When `owned` is false this branch belongs to another worker: the mask
     /// is computed but not applied, and the caller routes it to a task of its
     /// own instead.
-    fn backtrack(
-        &mut self,
-        thread_id: thread::Id,
-        preemption_bound: Option<u8>,
-        sleep: u16,
-        owned: bool,
-    ) -> u16 {
+    fn backtrack(&mut self, thread_id: thread::Id, preemption_bound: Option<u8>, owned: bool) -> u16 {
         assert!(self.exploring);
 
         if let Some(bound) = preemption_bound {
@@ -934,7 +816,7 @@ impl Schedule {
         let mut marked = 0;
 
         for &i in candidates {
-            if i >= self.threads.len() || sleep & (1 << i) != 0 {
+            if i >= self.threads.len() {
                 continue;
             }
 

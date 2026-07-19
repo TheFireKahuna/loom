@@ -1,19 +1,15 @@
 #![deny(warnings)]
 
-//! Differential coverage tests for the two exploration reductions:
-//! sleep sets (`Builder::sleep_sets`) and parallel sharding
-//! (`Builder::threads`).
+//! Differential coverage tests for parallel sharding (`Builder::threads`).
 //!
-//! Both claim to change only *how many times* the search visits a behavior,
-//! never *which* behaviors it reaches. That claim is what these tests check,
-//! and it is not a claim to take on argument alone: sleep sets are proved
-//! sound for unbounded DPOR, but combining a partial-order reduction with a
-//! preemption bound is a known source of silently lost coverage (Coons,
-//! Musuvathi & Emmi, *Bounded Partial-Order Reduction*, OOPSLA'13 — a bound
-//! can cut the sibling subtree that a sleep set is pruning against). So every
-//! model here is explored under each bound the reductions might interact
-//! with, and the set of observed behaviors is compared against an
-//! unreduced serial run at that same bound.
+//! Sharding claims to change only *which worker* visits a subtree, never
+//! which behaviors the search reaches nor how many executions it takes to
+//! reach them. That claim is not one to take on argument alone: combining a
+//! partial-order reduction with a preemption bound is a known source of
+//! silently lost coverage (Coons, Musuvathi & Emmi, *Bounded Partial-Order
+//! Reduction*, OOPSLA'13 — a bound can cut the sibling subtree the reduction
+//! is pruning against). So every model here is explored under each bound, and
+//! the observed behaviors are compared against a serial run at that bound.
 //!
 //! A behavior is a per-execution fingerprint: every value each thread read,
 //! tagged by reader, plus whatever final state the model records. Losing an
@@ -47,7 +43,7 @@ impl Log {
 
 /// Run `model` to exhaustion and return every behavior it exhibited, with the
 /// number of executions it took to get there.
-fn explore<M>(threads: usize, sleep_sets: bool, bound: Option<usize>, model: M) -> (BTreeSet<String>, usize)
+fn explore<M>(threads: usize, bound: Option<usize>, model: M) -> (BTreeSet<String>, usize)
 where
     M: Fn(&Log) + Send + Sync + 'static,
 {
@@ -60,7 +56,6 @@ where
     // tests compare runs against each other, so a stray `LOOM_*` variable
     // would compare two different questions.
     builder.threads = threads;
-    builder.sleep_sets = sleep_sets;
     builder.preemption_bound = bound;
     builder.max_permutations = None;
     builder.max_duration = None;
@@ -87,36 +82,35 @@ where
 /// search they are proved against.
 const BOUNDS: &[Option<usize>] = &[None, Some(1), Some(2), Some(3)];
 
-/// The core assertion: at each bound, neither reduction may lose a behavior
-/// that an unreduced serial search finds, nor invent one it does not.
+/// The core assertion: at each bound, sharding may not lose a behavior a
+/// serial search finds, nor invent one it does not.
 fn assert_reductions_preserve_coverage<M>(name: &str, model: M)
 where
     M: Fn(&Log) + Send + Sync + Clone + 'static,
 {
     for &bound in BOUNDS {
-        let (baseline, plain) = explore(1, false, bound, model.clone());
+        let (baseline, plain) = explore(1, bound, model.clone());
 
-        for &(threads, sleep_sets) in &[(1, true), (4, false), (4, true)] {
-            let (reduced, count) = explore(threads, sleep_sets, bound, model.clone());
+        for &threads in &[2, 4, 8] {
+            let (reduced, count) = explore(threads, bound, model.clone());
 
             let lost: Vec<_> = baseline.difference(&reduced).collect();
             let gained: Vec<_> = reduced.difference(&baseline).collect();
 
             assert!(
                 lost.is_empty(),
-                "{name}: bound={bound:?} threads={threads} sleep_sets={sleep_sets} \
-                 LOST {} of {} behaviors ({} executions vs {plain} unreduced): {lost:?}",
+                "{name}: bound={bound:?} threads={threads} \
+                 LOST {} of {} behaviors ({count} executions vs {plain} serial): {lost:?}",
                 lost.len(),
                 baseline.len(),
-                count,
             );
 
-            // A behavior the unreduced search cannot reach means the
-            // reduction changed the model's semantics, not just its
-            // scheduling — at least as serious as losing one.
+            // A behavior the serial search cannot reach means sharding changed
+            // the model's semantics, not just who explored it — at least as
+            // serious as losing one.
             assert!(
                 gained.is_empty(),
-                "{name}: bound={bound:?} threads={threads} sleep_sets={sleep_sets} \
+                "{name}: bound={bound:?} threads={threads} \
                  INVENTED {} behaviors: {gained:?}",
                 gained.len(),
             );
@@ -355,16 +349,9 @@ fn coverage_mixed_independence() {
     assert_reductions_preserve_coverage("mixed_independence", mixed_independence);
 }
 
-// ---------------------------------------------------------------------------
-// The reductions have to actually reduce
-//
-// Coverage equivalence is satisfied trivially by a reduction that does
-// nothing, so pin the other side down too.
-// ---------------------------------------------------------------------------
-
-/// Threads that both touch two cells: partially independent, and big enough
-/// at a loose bound to contain redundancy worth cutting.
-fn interleaved_cells() {
+/// Threads that both touch two cells: partially independent, and the largest
+/// tree here at a loose bound.
+fn interleaved_cells(_: &Log) {
     let x = Arc::new(AtomicUsize::new(0));
     let y = Arc::new(AtomicUsize::new(0));
 
@@ -385,49 +372,6 @@ fn interleaved_cells() {
     }
 }
 
-#[test]
-fn sleep_sets_cut_redundant_executions() {
-    // Only asserted at a bound loose enough for redundancy to exist. A tight
-    // preemption bound is itself a strong reduction — it cuts the repeated
-    // interleavings before a sleep set gets to see them — so at bounds 1 and 2
-    // these models leave the reduction with nothing to do. That is a property
-    // of the bound, not a defect here, and `..._leave_fully_dependent_models_alone`
-    // pins down that being inert is what "nothing to do" looks like.
-    let mut builder = loom::model::Builder::new();
-    builder.threads = 1;
-    builder.preemption_bound = Some(3);
-    builder.max_branches = 10_000;
-
-    let without = {
-        builder.sleep_sets = false;
-        builder.check(interleaved_cells).executions
-    };
-
-    let with = {
-        builder.sleep_sets = true;
-        builder.check(interleaved_cells).executions
-    };
-
-    assert!(
-        with < without,
-        "sleep sets explored {with} executions, no better than {without} without them"
-    );
-}
-
-#[test]
-fn sleep_sets_leave_fully_dependent_models_alone() {
-    // Nothing commutes, so there is nothing to sleep through: the reduction
-    // should be inert rather than "helpful".
-    let (_, without) = explore(1, false, Some(2), rmw_contention);
-    let (_, with) = explore(1, true, Some(2), rmw_contention);
-
-    assert_eq!(
-        with, without,
-        "sleep sets changed the execution count of a model with no \
-         independent operations"
-    );
-}
-
 /// The tree a sharded run walks must not depend on how many workers walk it.
 ///
 /// This is the invariant that catches the two ways sharding goes wrong, both
@@ -445,18 +389,15 @@ fn sharding_walks_the_same_tree_at_every_worker_count() {
         ("rmw_contention", rmw_contention),
         ("mixed_independence", mixed_independence),
         ("mutex_counter", mutex_counter),
+        ("interleaved_cells", interleaved_cells),
     ];
 
-    // Checked with sleep sets off, where the invariant is exact. Splitting a
-    // subtree also seeds each side's sleep set with what the other took, so
-    // with them on the amount of reduction legitimately depends on where the
-    // splits landed — sound, but not a fixed number to compare against.
     for &(name, model) in models {
         for &bound in BOUNDS {
-            let (_, two) = explore(2, false, bound, model);
+            let (_, two) = explore(2, bound, model);
 
             for workers in [3, 4, 8] {
-                let (_, n) = explore(workers, false, bound, model);
+                let (_, n) = explore(workers, bound, model);
 
                 assert_eq!(
                     n, two,
@@ -477,10 +418,9 @@ fn sharding_walks_the_same_tree_at_every_worker_count() {
 // executions that complete.
 // ---------------------------------------------------------------------------
 
-fn racy_model_panics(threads: usize, sleep_sets: bool) -> bool {
+fn racy_model_panics(threads: usize) -> bool {
     let mut builder = loom::model::Builder::new();
     builder.threads = threads;
-    builder.sleep_sets = sleep_sets;
     builder.preemption_bound = Some(2);
     builder.probe = std::time::Duration::ZERO;
     builder.budgeted = false;
@@ -505,11 +445,11 @@ fn racy_model_panics(threads: usize, sleep_sets: bool) -> bool {
 
 #[test]
 fn reductions_still_find_a_real_bug() {
-    for &(threads, sleep_sets) in &[(1, false), (1, true), (4, false), (4, true)] {
+    for &threads in &[1, 2, 4, 8] {
         assert!(
-            racy_model_panics(threads, sleep_sets),
-            "threads={threads} sleep_sets={sleep_sets}: a model that fails on \
-             some interleaving was reported clean"
+            racy_model_panics(threads),
+            "threads={threads}: a model that fails on some interleaving was \
+             reported clean"
         );
     }
 }
