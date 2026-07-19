@@ -1,7 +1,112 @@
 use crate::rt::{execution, object, thread, MAX_ATOMIC_HISTORY, MAX_THREADS};
 
+use std::sync::atomic::{AtomicU32, Ordering::AcqRel, Ordering::Acquire};
+use std::sync::Arc;
+
 #[cfg(feature = "checkpoint")]
 use serde::{Deserialize, Serialize};
+
+/// Every thread slot a branch can hold.
+const ALL_THREADS: u16 = ((1u32 << MAX_THREADS) - 1) as u16;
+
+/// Ownership of the alternatives at one frozen branch, shared by every task
+/// descended from the split that froze it.
+///
+/// A branch that has been frozen has a fixed choice, so its index stops being
+/// recycled into some other part of the tree and `(prefix, branch)` becomes a
+/// stable name. That is what makes a backtrack mark landing here *deliverable*
+/// rather than lost: DPOR marks propagate upward, and a worker deep in a
+/// donated subtree routinely proves that some thread had to run at an ancestor
+/// it no longer owns. Writing that into its private copy would tell nobody.
+/// Writing it here tells everyone.
+///
+/// Both halves of `word` only ever gain bits, so `fetch_or` is the whole
+/// protocol: it is the join of a lattice, the previous value says who won, and
+/// no two callers need to agree on an order.
+#[derive(Debug)]
+pub(crate) struct Frozen {
+    /// Threads a mark may still open here — exactly those that were `Skip`
+    /// when the branch froze. Nothing else is an alternative DPOR can create:
+    /// `Disabled` and `Yield` are never marked, and the rest are already open.
+    markable: u16,
+
+    /// Threads that were not `Disabled` here. `Schedule::backtrack` falls back
+    /// to opening every candidate when its target cannot itself be scheduled,
+    /// and a task's private copy of this branch has been overwritten, so the
+    /// test has to read the state the branch actually had.
+    enabled: u16,
+
+    /// `open` in the low half, `claimed` in the high half.
+    ///
+    /// Open means DPOR has proven this alternative must be explored; claimed
+    /// means somebody has taken responsibility for exploring it. One word so a
+    /// single load sees both.
+    word: ClaimWord,
+}
+
+/// The claim word on a line of its own, away from the immutable fields beside
+/// it and the `Arc` refcount behind it. Those are read on every replay through
+/// the frozen prefix; this is written whenever a mark lands. Sharing a line
+/// would let the rare write invalidate the frequent read.
+#[derive(Debug)]
+#[repr(align(64))]
+struct ClaimWord(AtomicU32);
+
+impl Frozen {
+    fn new(markable: u16, enabled: u16, open: u16, claimed: u16) -> Frozen {
+        Frozen {
+            markable,
+            enabled,
+            word: ClaimWord(AtomicU32::new((open as u32) | ((claimed as u32) << 16))),
+        }
+    }
+
+    /// A branch nothing can be claimed at or marked on: not being explored, or
+    /// not a schedule. `step()` moves past it exactly as a serial walk does.
+    fn sealed() -> Frozen {
+        Frozen::new(0, 0, 0, 0)
+    }
+
+    /// Prove these threads must be explored here. Idempotent, and safe to race
+    /// with any other caller.
+    fn open(&self, mask: u16) {
+        if mask != 0 {
+            self.word.0.fetch_or(mask as u32, AcqRel);
+        }
+    }
+
+    /// Take responsibility for the next alternative nobody holds, or `None`
+    /// when this branch is entirely spoken for.
+    ///
+    /// The retry is not a wait: every pass either wins a bit or observes one
+    /// permanently claimed by somebody else, so it runs at most once per
+    /// thread slot and always makes progress.
+    fn claim_next(&self) -> Option<usize> {
+        loop {
+            let word = self.word.0.load(Acquire);
+            let free = (word as u16) & !((word >> 16) as u16);
+
+            if free == 0 {
+                return None;
+            }
+
+            let thread = free.trailing_zeros() as usize;
+            let bit = 1u32 << (16 + thread);
+
+            if self.word.0.fetch_or(bit, AcqRel) & bit == 0 {
+                return Some(thread);
+            }
+        }
+    }
+
+    /// Take responsibility for one specific alternative, reporting whether
+    /// this caller is the one that got it.
+    fn claim(&self, thread: usize) -> bool {
+        let bit = 1u32 << (16 + thread);
+
+        self.word.0.fetch_or(bit, AcqRel) & bit == 0
+    }
+}
 
 /// An execution path
 #[derive(Debug, Clone)]
@@ -33,38 +138,25 @@ pub(crate) struct Path {
     /// How to reset the `exploring` state
     exploring_on_start: bool,
 
-    /// Lowest branch index this path owns. `step()` never advances or
-    /// truncates below it, which is what makes a path clone a self-contained
-    /// unit of work: the subtree rooted here and nothing else (see
-    /// [`Path::split_off`]).
-    floor: usize,
+    /// Shared claim state for this path's frozen prefix, one entry per branch.
+    ///
+    /// `frozen.len()` is the floor: branches below it have a fixed choice here
+    /// and are shared with every task descended from the same split, so their
+    /// alternatives come from [`Frozen`] rather than from this path's private
+    /// copy. Branches at or above it are this path's alone and take ordinary
+    /// DPOR with no atomics involved at all.
+    ///
+    /// Empty for a serial run — nothing is ever frozen, so nothing is shared.
+    #[cfg_attr(feature = "checkpoint", serde(skip))]
+    frozen: Vec<Arc<Frozen>>,
 
-    /// Branch depth above which scheduling is expanded exhaustively rather
-    /// than by DPOR, and the only region [`split_off`] may hand out.
+    /// Deepest branch [`Path::split_off`] may freeze.
     ///
-    /// This is what makes sharding sound. DPOR marks propagate upward, so a
-    /// worker exploring a donated subtree can prove that some thread had to run
-    /// at an ancestor — a branch frozen in its private copy, whose owner will
-    /// never see the mark. Expanding those branches exhaustively (subject to
-    /// the preemption bound, which still applies) means every such thread is
-    /// already open, so there is no mark left to lose. Below this depth,
-    /// branches belong to exactly one task and ordinary DPOR applies.
-    ///
-    /// Zero for a serial run: with one worker nothing is ever frozen, so the
-    /// full reduction applies at every depth.
+    /// This bounds how much of the tree carries shared bookkeeping, and
+    /// nothing else — freezing a branch changes who explores its alternatives,
+    /// never which alternatives exist. So it only has to be deep enough to
+    /// expose more independent subtrees than there are workers.
     split_depth: usize,
-
-    /// Backtrack points this path discovered below its floor, as
-    /// `(branch, thread)`.
-    ///
-    /// DPOR marks propagate *upward*: exploring a subtree can prove that some
-    /// thread had to be scheduled at an ancestor branch. A path that does not
-    /// own that ancestor cannot mark it — the owner is off exploring its own
-    /// alternatives and will never see the mark — so the point is recorded
-    /// here and turned into a task of its own (see [`Path::escape`]). Losing
-    /// one silently drops every interleaving behind it, which is exactly the
-    /// coverage a sharded run would otherwise miss.
-    escapes: Vec<(u32, u8)>,
 }
 
 #[derive(Debug, Clone)]
@@ -171,10 +263,16 @@ impl Path {
             exploring,
             skipping: false,
             exploring_on_start: exploring,
-            floor: 0,
+            frozen: Vec::new(),
             split_depth: 0,
-            escapes: Vec::new(),
         }
+    }
+
+    /// Branches below this are frozen: their choice here is fixed, and their
+    /// alternatives are claimed through [`Frozen`] rather than explored
+    /// directly.
+    fn floor(&self) -> usize {
+        self.frozen.len()
     }
 
     pub(crate) fn set_split_depth(&mut self, depth: usize) {
@@ -213,73 +311,6 @@ impl Path {
 
     pub(super) fn pos(&self) -> usize {
         self.pos
-    }
-
-    /// Note backtrack points that landed below this path's floor. Deduplicated
-    /// because the prefix below the floor is frozen for this path's whole
-    /// lifetime, so `(branch, thread)` names the same subtree every time.
-    fn record_escapes(&mut self, point: usize, owned: bool, marked: u16) {
-        if owned || marked == 0 {
-            return;
-        }
-
-        for i in 0..MAX_THREADS {
-            if marked & (1 << i) == 0 {
-                continue;
-            }
-
-            let escape = (point as u32, i as u8);
-
-            if !self.escapes.contains(&escape) {
-                self.escapes.push(escape);
-            }
-        }
-    }
-
-    pub(crate) fn has_escapes(&self) -> bool {
-        !self.escapes.is_empty()
-    }
-
-    /// Turn each escaped backtrack point into a path that explores exactly the
-    /// subtree behind it: the frozen prefix, that one thread scheduled, and
-    /// nothing else at that branch — every sibling is closed, because the
-    /// branch's owner is still responsible for those.
-    pub(crate) fn drain_escapes(&mut self) -> Vec<Path> {
-        let escapes = std::mem::take(&mut self.escapes);
-        let capacity = self.branches.capacity();
-
-        escapes
-            .into_iter()
-            .map(|(point, thread)| {
-                let entry = object::Ref::from_usize(point as usize);
-
-                let mut task = self.clone();
-                task.floor = point as usize;
-                task.pos = 0;
-                task.escapes = Vec::new();
-                task.branches.truncate(entry);
-
-                if task.branches.capacity() < capacity {
-                    let additional = capacity - task.branches.len();
-                    task.branches.reserve_exact(additional);
-                }
-
-                let schedule = entry
-                    .downcast::<Schedule>(&task.branches)
-                    .expect("[loom internal bug] escape does not name a schedule")
-                    .get_mut(&mut task.branches);
-
-                for (i, th) in schedule.threads.iter_mut().enumerate() {
-                    *th = if i == thread as usize {
-                        Thread::Active
-                    } else {
-                        Thread::Visited
-                    };
-                }
-
-                task
-            })
-            .collect()
     }
 
     /// Push a new atomic-load branch
@@ -425,26 +456,9 @@ impl Path {
                 preemptions,
             );
 
-            // Shallow branches may be handed to another worker, whose subtree
-            // can no longer mark them; open every candidate now so there is
-            // nothing left for a later mark to add. The preemption bound still
-            // gates this — it bounds the search itself, not the reduction.
-            let exhaustive = self.pos < self.split_depth
-                && self
-                    .preemption_bound
-                    .is_none_or(|bound| preemptions < bound);
-
             let schedule = schedule_ref.get_mut(&mut self.branches);
             schedule.initial_active = initial_active;
             schedule.preemptions = preemptions;
-
-            if exhaustive {
-                for th in &mut schedule.threads {
-                    if *th == Thread::Skip {
-                        *th = Thread::Pending;
-                    }
-                }
-            }
         }
 
         let schedule_ref = object::Ref::from_usize(self.pos)
@@ -468,14 +482,10 @@ impl Path {
             if let Some(schedule_ref) =
                 object::Ref::from_usize(point).downcast::<Schedule>(&self.branches)
             {
-                let owned = point >= self.floor;
-                let schedule = schedule_ref.get_mut(&mut self.branches);
+                if schedule_ref.get(&self.branches).exploring {
+                    let prev = schedule_ref.get(&self.branches).prev;
 
-                if schedule.exploring {
-                    let marked = schedule.backtrack(thread_id, self.preemption_bound, owned);
-                    let prev = schedule.prev;
-
-                    self.record_escapes(point, owned, marked);
+                    self.mark(schedule_ref, thread_id);
                     break prev;
                 }
             }
@@ -502,14 +512,7 @@ impl Path {
                     let active_b = prev.get(&self.branches).active_thread_index();
 
                     if active_a != active_b && curr.get(&self.branches).exploring {
-                        let owned = curr.index() >= self.floor;
-                        let marked = curr.get_mut(&mut self.branches).backtrack(
-                            thread_id,
-                            self.preemption_bound,
-                            owned,
-                        );
-
-                        self.record_escapes(curr.index(), owned, marked);
+                        self.mark(curr, thread_id);
                         return;
                     }
 
@@ -517,17 +520,67 @@ impl Path {
                 } else {
                     if curr.get(&self.branches).exploring {
                         // This is the very first schedule
-                        let owned = curr.index() >= self.floor;
-                        let marked = curr.get_mut(&mut self.branches).backtrack(
-                            thread_id,
-                            self.preemption_bound,
-                            owned,
-                        );
-
-                        self.record_escapes(curr.index(), owned, marked);
+                        self.mark(curr, thread_id);
                     }
                     return;
                 }
+            }
+        }
+    }
+
+    /// Open the alternatives DPOR proved necessary at `schedule`, given that
+    /// `thread_id` raced with an access recorded there.
+    ///
+    /// Above the floor this branch is the path's own and the mark is a plain
+    /// state change. At or below it the branch is shared, so the mark goes to
+    /// the claim record instead — where it stays visible to whichever task
+    /// reaches the branch next, instead of being written into a private copy
+    /// that every other holder of this branch has already overwritten.
+    fn mark(&mut self, schedule: object::Ref<Schedule>, thread_id: thread::Id) {
+        let thread_id = thread_id.as_usize();
+
+        if thread_id >= MAX_THREADS {
+            return;
+        }
+
+        // The bound is a property of the prefix, so a frozen branch's private
+        // copy still carries the right value for it.
+        if let Some(bound) = self.preemption_bound {
+            let preemptions = schedule.get(&self.branches).preemptions;
+
+            assert!(
+                preemptions <= bound,
+                "[loom internal bug] actual = {}, bound = {}",
+                preemptions,
+                bound
+            );
+
+            if preemptions == bound {
+                return;
+            }
+        }
+
+        let bit = 1u16 << thread_id;
+
+        if let Some(frozen) = self.frozen.get(schedule.index()) {
+            // A disabled target cannot itself be scheduled here, so DPOR falls
+            // back to opening every candidate at this branch.
+            let candidates = if frozen.enabled & bit != 0 { bit } else { ALL_THREADS };
+
+            frozen.open(candidates & frozen.markable);
+            return;
+        }
+
+        let schedule = schedule.get_mut(&mut self.branches);
+        let candidates = if schedule.threads[thread_id].is_enabled() {
+            bit
+        } else {
+            ALL_THREADS
+        };
+
+        for (i, th) in schedule.threads.iter_mut().enumerate() {
+            if candidates & (1 << i) != 0 && *th == Thread::Skip {
+                *th = Thread::Pending;
             }
         }
     }
@@ -549,15 +602,45 @@ impl Path {
         // traversed, pop the final branch and try again w/ the one under it.
         //
         // This is depth-first tree traversal.
-        //
-        // `floor` bounds it from below: a path handed over by `split_off` owns
-        // only the subtree rooted at its floor, and retiring that root ends the
-        // path rather than escaping into a sibling another worker holds.
-        for last in (self.floor..self.branches.len()).rev() {
+        for last in (0..self.branches.len()).rev() {
             let last = object::Ref::from_usize(last);
 
             // Remove all objects that were created **after** this branch
             self.branches.truncate(last);
+
+            // A frozen branch's alternatives are shared, so the next one comes
+            // from the claim record rather than from this path's copy. Winning
+            // one here is the same act as picking up a posted task — the
+            // difference is only that this worker was already standing on the
+            // branch, so it costs one atomic instead of a trip through the
+            // pool.
+            if last.index() < self.frozen.len() {
+                let Some(thread) = self.frozen[last.index()].claim_next() else {
+                    // Nothing left here for anybody. Dropping the record is
+                    // safe precisely because of that: this path can no longer
+                    // be the one that owes work at this branch.
+                    continue;
+                };
+
+                // Deeper frozen branches described alternatives under the
+                // choice being left behind, and were just observed empty.
+                self.frozen.truncate(last.index() + 1);
+
+                let schedule = last
+                    .downcast::<Schedule>(&self.branches)
+                    .expect("[loom internal bug] claimed a branch that is not a schedule")
+                    .get_mut(&mut self.branches);
+
+                for (i, th) in schedule.threads.iter_mut().enumerate() {
+                    *th = if i == thread {
+                        Thread::Active
+                    } else {
+                        Thread::Visited
+                    };
+                }
+
+                return true;
+            }
 
             if let Some(schedule_ref) = last.downcast::<Schedule>(&self.branches) {
                 let schedule = schedule_ref.get_mut(&mut self.branches);
@@ -623,137 +706,217 @@ impl Path {
         self.branches.iter_ref::<Schedule>().rev().next()
     }
 
-    /// Hand half of the shallowest branch that still has unexplored
-    /// alternatives to a second path, so another worker can explore it
-    /// concurrently. `None` when nothing is left to share.
+    /// Carve up to `wanted` subtrees off this path for idle peers.
     ///
-    /// The shallowest branch is picked deliberately: its alternatives root the
-    /// largest subtrees, so a single donation carries real work rather than a
-    /// leaf. Both sides come out with a strictly smaller share, so repeated
-    /// donation terminates.
+    /// Nothing is *given away* here in the sense the name suggests. Every
+    /// alternative a task explores — donated or not, this path's own or a
+    /// peer's — is acquired by one `fetch_or` on the branch that owns it, and
+    /// this only reaches for the ones nobody holds yet. That is the whole
+    /// reason a sharded search now walks the same tree a serial one does:
+    /// there is no second mechanism that has to agree with the first about
+    /// which alternatives exist.
     ///
-    /// `Spurious` branches are not split — they are two-way, and the scan
-    /// simply moves past them to the next schedule or load.
-    pub(crate) fn split_off(&mut self) -> Option<Path> {
-        let capacity = self.branches.capacity();
-        let limit = self.branches.len().min(self.split_depth);
+    /// Two sources, shallowest first, because shallow alternatives root the
+    /// largest subtrees and a donation should carry real work rather than a
+    /// leaf:
+    ///
+    /// 1. Branches already frozen, where a mark has since opened an
+    ///    alternative. This path would have picked those up on its way back
+    ///    up; an idle peer can have them now instead.
+    /// 2. Fresh branches, frozen on the spot. Freezing fixes the choice here,
+    ///    which is what lets the branch be named by more than one task at once.
+    pub(crate) fn split_off(&mut self, wanted: usize) -> Vec<Path> {
+        let mut tasks = Vec::new();
 
-        for index in self.floor..limit {
+        for point in 0..self.floor() {
+            while tasks.len() < wanted {
+                let Some(thread) = self.frozen[point].claim_next() else {
+                    break;
+                };
+
+                tasks.push(self.task_at(point, Fixed::Thread(thread)));
+            }
+        }
+
+        while tasks.len() < wanted {
+            let Some(index) = self.pick_split() else { break };
+
+            for point in self.floor()..=index {
+                let entry = object::Ref::from_usize(point);
+                let mut handing_out = Vec::new();
+
+                let frozen = if let Some(sched) = entry.downcast::<Schedule>(&self.branches) {
+                    let sched = sched.get(&self.branches);
+
+                    // A branch that is not being explored is one a serial walk
+                    // steps straight past, so nothing here is work for anyone.
+                    if !sched.exploring {
+                        Frozen::sealed()
+                    } else {
+                        let (mut markable, mut enabled, mut open, mut claimed) = (0, 0, 0, 0);
+
+                        for (i, th) in sched.threads.iter().enumerate() {
+                            let bit = 1u16 << i;
+
+                            if th.is_enabled() {
+                                enabled |= bit;
+                            }
+
+                            match th {
+                                // Still an alternative a mark can create.
+                                Thread::Skip => markable |= bit,
+                                // Open, and about to be claimed by its task.
+                                Thread::Pending => {
+                                    open |= bit;
+                                    handing_out.push(Fixed::Thread(i));
+                                }
+                                // Open, and this path is already on it or done
+                                // with it.
+                                Thread::Active | Thread::Visited => {
+                                    open |= bit;
+                                    claimed |= bit;
+                                }
+                                Thread::Yield | Thread::Disabled => {}
+                            }
+                        }
+
+                        Frozen::new(markable, enabled, open, claimed)
+                    }
+                } else if let Some(load) = entry.downcast::<Load>(&self.branches) {
+                    let load = load.get(&self.branches);
+
+                    // A load's value list is fixed when the branch is created,
+                    // so unlike a schedule it can never gain an alternative
+                    // later. Handing out the remainder here is exhaustive, and
+                    // the record stays sealed.
+                    if load.exploring {
+                        handing_out.extend((load.pos + 1..load.len).map(Fixed::Value));
+                    }
+
+                    Frozen::sealed()
+                } else if let Some(spurious) = entry.downcast::<Spurious>(&self.branches) {
+                    let spurious = spurious.get(&self.branches);
+
+                    if spurious.exploring && !spurious.spur {
+                        handing_out.push(Fixed::Spurious);
+                    }
+
+                    Frozen::sealed()
+                } else {
+                    unreachable!()
+                };
+
+                // Freeze before spawning: a task's frozen prefix has to cover
+                // the branch it fixes, and it takes that from this path's.
+                self.frozen.push(Arc::new(frozen));
+                debug_assert_eq!(self.floor(), point + 1, "[loom internal bug]");
+
+                for fixed in handing_out {
+                    if let Fixed::Thread(i) = fixed {
+                        let won = self.frozen[point].claim(i);
+
+                        debug_assert!(won, "[loom internal bug] fresh branch already claimed");
+                    }
+
+                    tasks.push(self.task_at(point, fixed));
+                }
+            }
+        }
+
+        tasks
+    }
+
+    /// A task that replays this path as far as `point`, takes `fixed` there,
+    /// and explores everything below.
+    fn task_at(&self, point: usize, fixed: Fixed) -> Path {
+        let capacity = self.branches.capacity();
+        let entry = object::Ref::from_usize(point);
+
+        let mut task = self.clone();
+        task.pos = 0;
+        task.branches.truncate(entry);
+
+        // `point` is frozen for the new task too — its choice there is
+        // `fixed`. It keeps the *same* record, so a mark arriving there from
+        // either side is settled once, between all of them.
+        task.frozen.truncate(point + 1);
+
+        debug_assert_eq!(task.frozen.len(), task.branches.len(), "[loom internal bug]");
+
+        // `Vec::clone` allocates to fit, which would make the
+        // `assert_path_len!` guard fire early on the new task.
+        if task.branches.capacity() < capacity {
+            let additional = capacity - task.branches.len();
+            task.branches.reserve_exact(additional);
+        }
+
+        match fixed {
+            Fixed::Thread(thread) => {
+                let schedule = entry
+                    .downcast::<Schedule>(&task.branches)
+                    .expect("[loom internal bug] not a schedule branch")
+                    .get_mut(&mut task.branches);
+
+                // Closing the siblings costs nothing now: at a frozen branch
+                // it is the record, not this array, that says what is still an
+                // alternative here.
+                for (i, th) in schedule.threads.iter_mut().enumerate() {
+                    *th = if i == thread {
+                        Thread::Active
+                    } else {
+                        Thread::Visited
+                    };
+                }
+            }
+            Fixed::Value(value) => {
+                entry
+                    .downcast::<Load>(&task.branches)
+                    .expect("[loom internal bug] not a load branch")
+                    .get_mut(&mut task.branches)
+                    .pos = value;
+            }
+            Fixed::Spurious => {
+                entry
+                    .downcast::<Spurious>(&task.branches)
+                    .expect("[loom internal bug] not a spurious branch")
+                    .get_mut(&mut task.branches)
+                    .spur = true;
+            }
+        }
+
+        task
+    }
+
+    /// The shallowest owned branch with an alternative to hand out, within the
+    /// shardable region.
+    fn pick_split(&self) -> Option<usize> {
+        (self.floor()..self.branches.len().min(self.split_depth)).find(|&index| {
             let entry = object::Ref::from_usize(index);
 
-            let taken = if let Some(sched) = entry.downcast::<Schedule>(&self.branches) {
-                if !sched.get(&self.branches).exploring {
-                    continue;
-                }
+            if let Some(schedule) = entry.downcast::<Schedule>(&self.branches) {
+                let schedule = schedule.get(&self.branches);
 
-                let pending: Vec<usize> = sched
-                    .get(&self.branches)
-                    .threads
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, th)| th.is_pending())
-                    .map(|(i, _)| i)
-                    .collect();
-
-                if pending.is_empty() {
-                    continue;
-                }
-
-                Taken::Threads(pending[pending.len() - pending.len().div_ceil(2)..].to_vec())
+                schedule.exploring && schedule.threads.iter().any(Thread::is_pending)
             } else if let Some(load) = entry.downcast::<Load>(&self.branches) {
                 let load = load.get(&self.branches);
 
-                if !load.exploring {
-                    continue;
-                }
+                load.exploring && load.len > load.pos + 1
+            } else if let Some(spurious) = entry.downcast::<Spurious>(&self.branches) {
+                let spurious = spurious.get(&self.branches);
 
-                // Values still to try, beyond the one being explored now.
-                let rem = (load.len - load.pos - 1) as usize;
-
-                if rem == 0 {
-                    continue;
-                }
-
-                let split = load.len as usize - rem.div_ceil(2);
-                Taken::Values(split)
+                spurious.exploring && !spurious.spur
             } else {
-                continue;
-            };
-
-            let mut thief = self.clone();
-            thief.floor = index;
-            thief.pos = 0;
-            thief.branches.truncate(entry);
-
-            // `Vec::clone` allocates to fit, which would make the
-            // `assert_path_len!` guard fire early on the thief.
-            if thief.branches.capacity() < capacity {
-                let additional = capacity - thief.branches.len();
-                thief.branches.reserve_exact(additional);
+                false
             }
-
-            match taken {
-                Taken::Threads(taken) => {
-                    let mine = entry.downcast::<Schedule>(&self.branches).unwrap();
-                    let theirs = entry.downcast::<Schedule>(&thief.branches).unwrap();
-
-                    let mine = mine.get_mut(&mut self.branches);
-                    for &i in &taken {
-                        mine.threads[i] = Thread::Visited;
-                    }
-
-                    let theirs = theirs.get_mut(&mut thief.branches);
-                    let mut active = false;
-
-                    for (i, th) in theirs.threads.iter_mut().enumerate() {
-                        if taken.contains(&i) {
-                            *th = if active {
-                                Thread::Pending
-                            } else {
-                                active = true;
-                                Thread::Active
-                            };
-                            continue;
-                        }
-
-                        // Close every sibling, `Skip` ones included: this
-                        // branch stays the donor's, so a mark that lands here
-                        // later must open a subtree there and only there.
-                        // Leaving them skippable would let both sides open the
-                        // same one.
-                        *th = Thread::Visited;
-                    }
-
-                    debug_assert!(active, "[loom internal bug] donated no thread");
-                }
-                Taken::Values(split) => {
-                    let mine = entry.downcast::<Load>(&self.branches).unwrap();
-                    let theirs = entry.downcast::<Load>(&thief.branches).unwrap();
-
-                    let mine = mine.get_mut(&mut self.branches);
-                    let end = mine.len;
-                    mine.len = split as u8;
-
-                    let theirs = theirs.get_mut(&mut thief.branches);
-                    theirs.values.copy_within(split..end as usize, 0);
-                    theirs.pos = 0;
-                    theirs.len = end - split as u8;
-                }
-            }
-
-            return Some(thief);
-        }
-
-        None
+        })
     }
 }
 
-/// The share `split_off` carves out of one branch.
-enum Taken {
-    /// Schedule branch: these thread indices become the thief's to explore.
-    Threads(Vec<usize>),
-    /// Load branch: values from this index on become the thief's.
-    Values(usize),
+/// The one choice a spawned task takes at the branch it was created for.
+enum Fixed {
+    Thread(usize),
+    Value(u8),
+    Spurious,
 }
 
 impl Schedule {
@@ -775,64 +938,6 @@ impl Schedule {
         self.preemptions
     }
 
-    /// Mark `thread_id` for exploration from this branch, returning the mask
-    /// of threads that changed to pending.
-    ///
-    /// When `owned` is false this branch belongs to another worker: the mask
-    /// is computed but not applied, and the caller routes it to a task of its
-    /// own instead.
-    fn backtrack(&mut self, thread_id: thread::Id, preemption_bound: Option<u8>, owned: bool) -> u16 {
-        assert!(self.exploring);
-
-        if let Some(bound) = preemption_bound {
-            assert!(
-                self.preemptions <= bound,
-                "[loom internal bug] actual = {}, bound = {}",
-                self.preemptions,
-                bound
-            );
-
-            if self.preemptions == bound {
-                return 0;
-            }
-        }
-
-        let thread_id = thread_id.as_usize();
-
-        if thread_id >= self.threads.len() {
-            return 0;
-        }
-
-        // A disabled target cannot itself be scheduled here, so DPOR falls
-        // back to opening every candidate at this branch.
-        let candidates: &[usize] = if self.threads[thread_id].is_enabled() {
-            &[thread_id]
-        } else {
-            &[0, 1, 2, 3, 4]
-        };
-
-        debug_assert!(MAX_THREADS <= 5, "[loom internal bug] widen `candidates`");
-
-        let mut marked = 0;
-
-        for &i in candidates {
-            if i >= self.threads.len() {
-                continue;
-            }
-
-            if self.threads[i] != Thread::Skip {
-                continue;
-            }
-
-            marked |= 1 << i;
-
-            if owned {
-                self.threads[i] = Thread::Pending;
-            }
-        }
-
-        marked
-    }
 }
 
 impl Thread {

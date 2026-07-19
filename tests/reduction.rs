@@ -372,16 +372,21 @@ fn interleaved_cells(_: &Log) {
     }
 }
 
-/// The tree a sharded run walks must not depend on how many workers walk it.
+/// A sharded run must walk exactly the tree a serial run walks — not a
+/// superset, not a subset, and not something that depends on how many workers
+/// happened to be running.
 ///
 /// This is the invariant that catches the two ways sharding goes wrong, both
 /// of which are otherwise silent. If a donated subtree cannot record a
-/// backtrack point in the prefix it no longer owns, the count *falls* as
-/// workers are added and interleavings are lost; if a branch stays markable in
-/// two copies at once, the count *rises* and subtrees are walked twice. Only
-/// an exactly worker-count-independent total says neither is happening.
+/// backtrack point in the prefix it no longer owns, the count *falls* and
+/// interleavings are lost; if a branch stays markable in two copies at once,
+/// the count *rises* and subtrees are walked twice.
+///
+/// Compared against **serial**, deliberately. Comparing worker counts only to
+/// each other passes just as happily when every one of them over-explores by
+/// the same factor, which is exactly how an earlier design hid a 5.3x tax.
 #[test]
-fn sharding_walks_the_same_tree_at_every_worker_count() {
+fn sharding_walks_the_same_tree_as_a_serial_run() {
     let models: &[(&str, fn(&Log))] = &[
         ("store_buffering", store_buffering),
         ("message_passing", message_passing),
@@ -394,16 +399,16 @@ fn sharding_walks_the_same_tree_at_every_worker_count() {
 
     for &(name, model) in models {
         for &bound in BOUNDS {
-            let (_, two) = explore(2, bound, model);
+            let (_, serial) = explore(1, bound, model);
 
-            for workers in [3, 4, 8] {
+            for workers in [2, 3, 4, 8] {
                 let (_, n) = explore(workers, bound, model);
 
                 assert_eq!(
-                    n, two,
+                    n, serial,
                     "{name}: bound={bound:?} explored {n} executions on \
-                     {workers} workers but {two} on 2 — sharding changed the \
-                     tree, which means lost or duplicated subtrees"
+                     {workers} workers but {serial} serially — sharding changed \
+                     the tree, which means lost or duplicated subtrees"
                 );
             }
         }

@@ -396,13 +396,14 @@ impl Builder {
                 }
             }
 
-            // Checked on the same cadence as work donation, so a model that
-            // does finish quickly never pays for the clock read.
-            if i % DONATE_INTERVAL == 0 {
-                if let Some(deadline) = deadline {
-                    if Instant::now() >= deadline {
-                        return Err(i - 1);
-                    }
+            // Only a run that is deciding whether to shard reads the clock
+            // here, and for it one read per execution is noise against the
+            // execution itself. Checking on the donation cadence instead would
+            // overshoot the probe by up to a full interval, and those
+            // executions are thrown away along with the tree they built.
+            if let Some(deadline) = deadline {
+                if Instant::now() >= deadline {
+                    return Err(i - 1);
                 }
             }
 
@@ -500,14 +501,6 @@ impl Builder {
                 if self.limit_reached(done, start) {
                     shared.stop();
                     return;
-                }
-
-                // Backtrack points this execution proved necessary at branches
-                // owned by another task. They cannot be marked here, so each
-                // becomes a task in its own right — without this, sharding
-                // silently drops the interleavings behind them.
-                if execution.path.has_escapes() {
-                    shared.post(execution.path.drain_escapes());
                 }
 
                 match execution.step() {
@@ -681,25 +674,11 @@ impl Shared {
             state.idle.saturating_sub(state.tasks.len())
         };
 
-        let mut carved = Vec::new();
-
-        for _ in 0..wanted {
-            match path.split_off() {
-                Some(task) => carved.push(task),
-                None => break,
-            }
-        }
-
-        if carved.is_empty() {
+        if wanted == 0 {
             return;
         }
 
-        let mut state = self.state.lock().unwrap();
-
-        for task in carved {
-            state.tasks.push(task);
-            self.wake.notify_one();
-        }
+        self.post(path.split_off(wanted));
     }
 
     /// Add tasks to the pool, waking a waiter for each.
