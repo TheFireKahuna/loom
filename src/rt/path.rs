@@ -1,6 +1,8 @@
 use crate::rt::{execution, object, thread, MAX_ATOMIC_HISTORY, MAX_THREADS};
 
-use std::sync::atomic::{AtomicU32, Ordering::AcqRel, Ordering::Acquire};
+use std::sync::atomic::{
+    AtomicU16, AtomicU32, Ordering::AcqRel, Ordering::Acquire, Ordering::Relaxed,
+};
 use std::sync::Arc;
 
 #[cfg(feature = "checkpoint")]
@@ -42,6 +44,13 @@ pub(crate) struct Frozen {
     /// means somebody has taken responsibility for exploring it. One word so a
     /// single load sees both.
     word: ClaimWord,
+
+    /// Threads whose open bit was set only by the preemption bound's
+    /// conservative backtrack points (BPOR Algorithm 3, Line 9), never by a
+    /// standard DPOR mark. Measurement only (`Builder::stats`); a standard
+    /// mark clears the bit, and the clear/set race with a concurrent peer is
+    /// tolerated — attribution is an upper bound, not part of exploration.
+    conservative: AtomicU16,
 }
 
 /// The claim word on a line of its own, away from the immutable fields beside
@@ -53,26 +62,38 @@ pub(crate) struct Frozen {
 struct ClaimWord(AtomicU32);
 
 impl Frozen {
-    fn new(markable: u16, enabled: u16, open: u16, claimed: u16) -> Frozen {
+    fn new(markable: u16, enabled: u16, open: u16, claimed: u16, conservative: u16) -> Frozen {
         Frozen {
             markable,
             enabled,
             word: ClaimWord(AtomicU32::new((open as u32) | ((claimed as u32) << 16))),
+            conservative: AtomicU16::new(conservative),
         }
     }
 
     /// A branch nothing can be claimed at or marked on: not being explored, or
     /// not a schedule. `step()` moves past it exactly as a serial walk does.
     fn sealed() -> Frozen {
-        Frozen::new(0, 0, 0, 0)
+        Frozen::new(0, 0, 0, 0, 0)
     }
 
     /// Prove these threads must be explored here. Idempotent, and safe to race
     /// with any other caller.
-    fn open(&self, mask: u16) {
+    fn open(&self, mask: u16, conservative: bool) {
         if mask != 0 {
+            if conservative {
+                self.conservative.fetch_or(mask, Relaxed);
+            } else {
+                self.conservative.fetch_and(!mask, Relaxed);
+            }
+
             self.word.0.fetch_or(mask as u32, AcqRel);
         }
+    }
+
+    /// Whether this alternative is (still) only conservatively justified.
+    fn is_conservative(&self, thread: usize) -> bool {
+        self.conservative.load(Relaxed) & (1u16 << thread) != 0
     }
 
     /// Take responsibility for the next alternative nobody holds, or `None`
@@ -183,6 +204,16 @@ pub(crate) struct Schedule {
     prev: Option<object::Ref<Schedule>>,
 
     exploring: bool,
+
+    /// Threads whose `Pending` here was opened only by the preemption bound's
+    /// conservative backtrack points (BPOR Algorithm 3, Line 9). A standard
+    /// DPOR mark clears the bit: the alternative is then required regardless
+    /// of the bound. Measurement only (`Builder::stats`).
+    conservative: u16,
+
+    /// The branch's current choice was conservative-only (see above) at the
+    /// moment it was activated. What execution attribution reads.
+    entered_conservative: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -420,6 +451,8 @@ impl Path {
                 threads: [Thread::Disabled; MAX_THREADS],
                 prev,
                 exploring: self.exploring,
+                conservative: 0,
+                entered_conservative: false,
             });
 
             // Get a reference to the branch in the object store.
@@ -530,7 +563,7 @@ impl Path {
                 if schedule_ref.get(&self.branches).exploring {
                     let prev = schedule_ref.get(&self.branches).prev;
 
-                    self.mark(schedule_ref, thread_id);
+                    self.mark(schedule_ref, thread_id, false);
                     break prev;
                 }
             }
@@ -557,7 +590,7 @@ impl Path {
                     let active_b = prev.get(&self.branches).active_thread_index();
 
                     if active_a != active_b && curr.get(&self.branches).exploring {
-                        self.mark(curr, thread_id);
+                        self.mark(curr, thread_id, true);
                         return;
                     }
 
@@ -565,7 +598,7 @@ impl Path {
                 } else {
                     if curr.get(&self.branches).exploring {
                         // This is the very first schedule
-                        self.mark(curr, thread_id);
+                        self.mark(curr, thread_id, true);
                     }
                     return;
                 }
@@ -581,7 +614,7 @@ impl Path {
     /// the claim record instead — where it stays visible to whichever task
     /// reaches the branch next, instead of being written into a private copy
     /// that every other holder of this branch has already overwritten.
-    fn mark(&mut self, schedule: object::Ref<Schedule>, thread_id: thread::Id) {
+    fn mark(&mut self, schedule: object::Ref<Schedule>, thread_id: thread::Id, conservative: bool) {
         let thread_id = thread_id.as_usize();
 
         if thread_id >= MAX_THREADS {
@@ -612,7 +645,7 @@ impl Path {
             // back to opening every candidate at this branch.
             let candidates = if frozen.enabled & bit != 0 { bit } else { ALL_THREADS };
 
-            frozen.open(candidates & frozen.markable);
+            frozen.open(candidates & frozen.markable, conservative);
             return;
         }
 
@@ -624,8 +657,27 @@ impl Path {
         };
 
         for (i, th) in schedule.threads.iter_mut().enumerate() {
-            if candidates & (1 << i) != 0 && *th == Thread::Skip {
+            if candidates & (1 << i) == 0 {
+                continue;
+            }
+
+            if *th == Thread::Skip {
                 *th = Thread::Pending;
+
+                if conservative {
+                    schedule.conservative |= 1 << i;
+                } else {
+                    schedule.conservative &= !(1 << i);
+                }
+            } else if !conservative {
+                // A standard mark reaching an alternative that was opened (or
+                // even taken) conservatively upgrades it: ordinary DPOR now
+                // requires it, so nothing under it is bound-attributable.
+                schedule.conservative &= !(1 << i);
+
+                if *th == Thread::Active {
+                    schedule.entered_conservative = false;
+                }
             }
         }
     }
@@ -671,6 +723,8 @@ impl Path {
                 // choice being left behind, and were just observed empty.
                 self.frozen.truncate(last.index() + 1);
 
+                let entered_conservative = self.frozen[last.index()].is_conservative(thread);
+
                 let schedule = last
                     .downcast::<Schedule>(&self.branches)
                     .expect("[loom internal bug] claimed a branch that is not a schedule")
@@ -683,6 +737,8 @@ impl Path {
                         Thread::Visited
                     };
                 }
+
+                schedule.entered_conservative = entered_conservative;
 
                 return true;
             }
@@ -701,19 +757,20 @@ impl Path {
                 }
 
                 // Find a pending thread and transition it to active.
-                let mut rem = false;
+                let mut rem = None;
 
-                for th in schedule.threads.iter_mut() {
+                for (i, th) in schedule.threads.iter_mut().enumerate() {
                     if !th.is_pending() {
                         continue;
                     }
 
                     *th = Thread::Active;
-                    rem = true;
+                    rem = Some(i);
                     break;
                 }
 
-                if rem {
+                if let Some(i) = rem {
+                    schedule.entered_conservative = schedule.conservative & (1 << i) != 0;
                     return true;
                 }
             } else if let Some(load_ref) = last.downcast::<Load>(&self.branches) {
@@ -749,6 +806,17 @@ impl Path {
 
     fn last_schedule(&self) -> Option<object::Ref<Schedule>> {
         self.branches.iter_ref::<Schedule>().rev().next()
+    }
+
+    /// Whether the execution just traversed sits under at least one schedule
+    /// choice that only the preemption bound's conservative backtrack points
+    /// opened (`Builder::stats`). An upper bound on what a bound-aware
+    /// optimal DPOR could avoid exploring: everything counted here exists
+    /// only because of BPOR Algorithm 3's Line 9.
+    pub(crate) fn conservative_attributed(&self) -> bool {
+        self.branches
+            .iter_ref::<Schedule>()
+            .any(|r| r.get(&self.branches).entered_conservative)
     }
 
     /// Carve up to `wanted` subtrees off this path for idle peers.
@@ -825,7 +893,7 @@ impl Path {
                             }
                         }
 
-                        Frozen::new(markable, enabled, open, claimed)
+                        Frozen::new(markable, enabled, open, claimed, sched.conservative)
                     }
                 } else if let Some(load) = entry.downcast::<Load>(&self.branches) {
                     let load = load.get(&self.branches);
@@ -897,6 +965,8 @@ impl Path {
 
         match fixed {
             Fixed::Thread(thread) => {
+                let entered_conservative = task.frozen[point].is_conservative(thread);
+
                 let schedule = entry
                     .downcast::<Schedule>(&task.branches)
                     .expect("[loom internal bug] not a schedule branch")
@@ -912,6 +982,8 @@ impl Path {
                         Thread::Visited
                     };
                 }
+
+                schedule.entered_conservative = entered_conservative;
             }
             Fixed::Value(value) => {
                 entry

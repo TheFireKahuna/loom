@@ -56,6 +56,17 @@ pub struct Stats {
     /// redundant — their behaviors are covered by a sibling subtree. Counted
     /// inside `executions`.
     pub pruned: usize,
+
+    /// Executions that sit under at least one schedule alternative opened
+    /// only by the preemption bound's conservative backtrack points (Coons,
+    /// Musuvathi & McKinley, OOPSLA'13, Algorithm 3 Line 9). Counted inside
+    /// `executions`; only collected when [`Builder::stats`] is set, else 0.
+    ///
+    /// This is the measured ceiling on what a bound-aware optimal DPOR
+    /// (e.g. TACAS'23 slack bounding) could remove: these executions exist
+    /// only to compensate for the bound, though some re-derive behaviors an
+    /// optimal search would still have to reach another way.
+    pub conservative: usize,
 }
 
 /// Configure a model
@@ -195,6 +206,15 @@ pub struct Builder {
     /// sound residue (BPOR's classical rule) at a few percent — not worth an
     /// unproven soundness posture.
     pub sleep_sets: bool,
+
+    /// Collect per-execution attribution into [`Stats`] (currently: how many
+    /// executions exist only because of the preemption bound's conservative
+    /// backtrack points, see [`Stats::conservative`]). Off by default — it
+    /// walks the path's schedule branches once per execution.
+    ///
+    /// Defaults to the presence of the `LOOM_STATS` environment variable,
+    /// which also prints the stats line at the end of the run.
+    pub stats: bool,
 }
 
 impl Builder {
@@ -270,6 +290,7 @@ impl Builder {
             sleep_sets: env::var("LOOM_SLEEP_SETS")
                 .map(|v| v != "0")
                 .unwrap_or(true),
+            stats: env::var_os("LOOM_STATS").is_some(),
         }
     }
 
@@ -329,12 +350,13 @@ impl Builder {
 
         let stats = match self.check_serial(&f, probe) {
             Ok(stats) => stats,
-            Err((probed, probed_pruned, seed)) => {
+            Err((probed, probed_pruned, probed_conservative, seed)) => {
                 let stats = self.check_parallel(&f, workers, seed);
 
                 Stats {
                     executions: stats.executions + probed,
                     pruned: stats.pruned + probed_pruned,
+                    conservative: stats.conservative + probed_conservative,
                     ..stats
                 }
             }
@@ -347,9 +369,10 @@ impl Builder {
         // says whether a reduction is doing anything.
         if std::env::var_os("LOOM_STATS").is_some() {
             eprintln!(
-                "loom: {} executions ({} pruned), {} worker(s), bound={:?}, {:.2}s",
+                "loom: {} executions ({} pruned, {} bound-conservative), {} worker(s), bound={:?}, {:.2}s",
                 stats.executions,
                 stats.pruned,
+                stats.conservative,
                 stats.threads,
                 self.preemption_bound,
                 start.elapsed().as_secs_f64(),
@@ -401,11 +424,12 @@ impl Builder {
         &self,
         f: &Arc<F>,
         deadline: Option<Instant>,
-    ) -> Result<Stats, (usize, usize, rt::Path)>
+    ) -> Result<Stats, (usize, usize, usize, rt::Path)>
     where
         F: Fn() + Sync + Send + 'static,
     {
         let mut i = 1;
+        let mut conservative = 0;
         let mut _span = tracing::info_span!("iter", message = i).entered();
 
         let mut execution = self.new_execution();
@@ -434,13 +458,13 @@ impl Builder {
 
                 if let Some(max_permutations) = self.max_permutations {
                     if i >= max_permutations {
-                        return Ok(self.stats(i - 1, 1, execution.pruned));
+                        return Ok(self.stats(i - 1, 1, execution.pruned, conservative));
                     }
                 }
 
                 if let Some(max_duration) = self.max_duration {
                     if start.elapsed() >= max_duration {
-                        return Ok(self.stats(i - 1, 1, execution.pruned));
+                        return Ok(self.stats(i - 1, 1, execution.pruned, conservative));
                     }
                 }
             }
@@ -452,13 +476,17 @@ impl Builder {
             // executions are thrown away along with the tree they built.
             if let Some(deadline) = deadline {
                 if Instant::now() >= deadline {
-                    return Err((i - 1, execution.pruned, execution.path));
+                    return Err((i - 1, execution.pruned, conservative, execution.path));
                 }
             }
 
             run_once(&mut scheduler, &mut execution, f);
 
             execution.check_for_leaks();
+
+            if self.stats && execution.path.conservative_attributed() {
+                conservative += 1;
+            }
 
             i += 1;
 
@@ -468,7 +496,7 @@ impl Builder {
             _span = tracing::info_span!(parent: None, "iter", message = i).entered();
             if !execution.step() {
                 info!(parent: None, "Completed in {} iterations", i - 1);
-                return Ok(self.stats(i - 1, 1, execution.pruned));
+                return Ok(self.stats(i - 1, 1, execution.pruned, conservative));
             }
         }
     }
@@ -520,13 +548,14 @@ impl Builder {
 
         let executions = shared.executions.load(Relaxed);
         let pruned = shared.pruned.load(Relaxed);
+        let conservative = shared.conservative.load(Relaxed);
 
         if let Some(payload) = shared.into_failure() {
             panic::resume_unwind(payload);
         }
 
         info!(parent: None, "Completed in {} iterations", executions);
-        self.stats(executions, workers, pruned)
+        self.stats(executions, workers, pruned, conservative)
     }
 
     fn worker<F>(&self, shared: &Shared, f: &Arc<F>, workers: usize, start: Instant)
@@ -540,6 +569,8 @@ impl Builder {
         // reincarnation carcasses carry across tasks, not just iterations.
         let mut execution = self.new_execution();
 
+        let mut conservative = 0;
+
         while let Some(path) = shared.take(workers) {
             execution.path = path;
             execution.reset_iteration();
@@ -549,11 +580,16 @@ impl Builder {
 
                 execution.check_for_leaks();
 
+                if self.stats && execution.path.conservative_attributed() {
+                    conservative += 1;
+                }
+
                 let done = shared.executions.fetch_add(1, Relaxed) + 1;
 
                 if self.limit_reached(done, start) {
                     shared.stop();
                     shared.pruned.fetch_add(execution.pruned, Relaxed);
+                    shared.conservative.fetch_add(conservative, Relaxed);
                     return;
                 }
 
@@ -566,6 +602,7 @@ impl Builder {
 
                     if shared.stopped() {
                         shared.pruned.fetch_add(execution.pruned, Relaxed);
+                        shared.conservative.fetch_add(conservative, Relaxed);
                         return;
                     }
                 }
@@ -573,15 +610,17 @@ impl Builder {
         }
 
         shared.pruned.fetch_add(execution.pruned, Relaxed);
+        shared.conservative.fetch_add(conservative, Relaxed);
     }
 
-    fn stats(&self, executions: usize, threads: usize, pruned: usize) -> Stats {
+    fn stats(&self, executions: usize, threads: usize, pruned: usize, conservative: usize) -> Stats {
         let _ = self;
 
         Stats {
             executions,
             threads,
             pruned,
+            conservative,
         }
     }
 }
@@ -662,6 +701,9 @@ struct Shared {
     /// Sum of exited workers' sleep-set prunes.
     pruned: AtomicUsize,
 
+    /// Sum of exited workers' bound-conservative-attributed executions.
+    conservative: AtomicUsize,
+
     /// Waiting workers, and subtrees already posted for them. Mirrors of the
     /// fields inside `state`, published so [`Shared::donate`] can answer "is
     /// anyone waiting" without taking the lock.
@@ -697,6 +739,7 @@ impl Shared {
             wake: Condvar::new(),
             executions: AtomicUsize::new(0),
             pruned: AtomicUsize::new(0),
+            conservative: AtomicUsize::new(0),
             idle: AtomicUsize::new(0),
             queued: AtomicUsize::new(1),
             stop: std::sync::atomic::AtomicBool::new(false),
