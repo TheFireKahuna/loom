@@ -214,6 +214,15 @@ pub(crate) struct Schedule {
     /// The branch's current choice was conservative-only (see above) at the
     /// moment it was activated. What execution attribution reads.
     entered_conservative: bool,
+
+    /// The seed switched here because the previous thread *yielded*, not
+    /// because it blocked or finished. Alternatives still cost no preemption
+    /// (loom's yield stance: a voluntary switch is free), but a spent bound
+    /// must keep refusing marks here — yield seams recur every spin
+    /// iteration, so ungated they make cyclic state spaces inexhaustible.
+    /// This is the fairness-bound seam of Coons et al., carried as a flag
+    /// rather than a second bound.
+    yield_seam: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -453,6 +462,7 @@ impl Path {
                 exploring: self.exploring,
                 conservative: 0,
                 entered_conservative: false,
+                yield_seam: false,
             });
 
             // Get a reference to the branch in the object store.
@@ -490,10 +500,28 @@ impl Path {
 
             let mut initial_active = active;
 
-            if let Some(prev) = prev {
-                if initial_active != prev.get(&self.branches).active_thread_index() {
-                    initial_active = None;
-                }
+            // The thread whose transition ran into this branch: the previous
+            // branch's choice, or at the root the main thread, whose
+            // un-branched prefix is what executed before any branch existed.
+            let displaced = match prev {
+                Some(prev) => prev.get(&self.branches).active_thread_index(),
+                None => Some(0),
+            };
+
+            let mut yield_seam = false;
+
+            if initial_active != displaced {
+                // The seed switched threads, so the displaced thread stopped
+                // being runnable — every alternative here is free
+                // (Definition 2.5: no enabled thread is being preempted; at
+                // the root the seed's pick has yet to run a transition).
+                // Unless it *yielded*: that switch is still free by loom's
+                // yield stance, but the seam is flagged so a spent bound
+                // keeps refusing marks here (see `Schedule::yield_seam`).
+                yield_seam = displaced
+                    .map(|d| schedule_ref.get(&self.branches).threads[d as usize] == Thread::Yield)
+                    .unwrap_or(false);
+                initial_active = None;
             }
 
             let preemptions = prev
@@ -510,6 +538,7 @@ impl Path {
             let schedule = schedule_ref.get_mut(&mut self.branches);
             schedule.initial_active = initial_active;
             schedule.preemptions = preemptions;
+            schedule.yield_seam = yield_seam;
         }
 
         let index = self.pos;
@@ -624,16 +653,27 @@ impl Path {
         // The bound is a property of the prefix, so a frozen branch's private
         // copy still carries the right value for it.
         if let Some(bound) = self.preemption_bound {
-            let preemptions = schedule.get(&self.branches).preemptions;
+            let branch = schedule.get(&self.branches);
 
             assert!(
-                preemptions <= bound,
+                branch.preemptions <= bound,
                 "[loom internal bug] actual = {}, bound = {}",
-                preemptions,
+                branch.preemptions,
                 bound
             );
 
-            if preemptions == bound {
+            // BPOR's gate is on an exploration's own cost (Algorithm 2,
+            // Line 12), not on point creation. At a branch whose seed
+            // switched threads (`initial_active == None`) the previous
+            // thread stopped being runnable, so scheduling any alternative
+            // is free (Definition 2.5) and stays within a spent bound. A
+            // saturated prefix rules out only alternatives that would
+            // preempt the naturally-continuing thread — plus yield seams,
+            // whose free switches recur every spin iteration and must stay
+            // budget-cut for cyclic state spaces to exhaust.
+            if branch.preemptions == bound
+                && (branch.initial_active.is_some() || branch.yield_seam)
+            {
                 return;
             }
         }

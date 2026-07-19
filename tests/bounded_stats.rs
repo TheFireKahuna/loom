@@ -100,18 +100,13 @@ fn attribution_is_behavior_preserving() {
     assert_eq!(baseline.conservative, 0, "off means not collected");
 }
 
-/// Documents the divergence from BPOR's exploration gate (Algorithm 2,
-/// Line 12): BPOR creates backtrack points unconditionally and refuses only
-/// explorations whose *own* cost exceeds the bound — and scheduling a thread
-/// where the previous thread just blocked or exited is free (Definition 2.5).
-/// Loom instead refuses to create any point once the prefix has spent the
-/// bound, so at `k = 0` it explores exactly one order of two free-running
-/// writers even though both orders contain zero preemptions.
-///
-/// Un-ignore when the mark gate distinguishes free switches
-/// (`initial_active == None`) from preemptive ones.
+/// BPOR's exploration gate (Algorithm 2, Line 12) refuses only explorations
+/// whose *own* cost exceeds the bound — and scheduling a thread where the
+/// previous thread just blocked or exited is free (Definition 2.5). The mark
+/// gate honors that: a saturated prefix only rules out alternatives that
+/// would preempt the naturally-continuing thread, so at `k = 0` both orders
+/// of two free-running writers are reached (each contains zero preemptions).
 #[test]
-#[ignore = "bound-gate coverage hole: free alternatives at saturated branches are refused"]
 fn bound_zero_reaches_all_zero_preemption_orders() {
     let log: Arc<Mutex<BTreeSet<usize>>> = Arc::new(Mutex::new(BTreeSet::new()));
     let out = log.clone();
