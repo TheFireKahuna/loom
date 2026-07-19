@@ -66,11 +66,11 @@ pub const MAX_THREADS: usize = 5;
 /// Maximum number of atomic store history to track per-cell.
 pub(crate) const MAX_ATOMIC_HISTORY: usize = 7;
 
-pub(crate) fn spawn<F>(stack_size: Option<usize>, f: F) -> crate::rt::thread::Id
+pub(crate) fn spawn<F>(stack_size: Option<usize>, symmetric: bool, f: F) -> crate::rt::thread::Id
 where
     F: FnOnce() + 'static,
 {
-    let id = execution(|execution| execution.new_thread());
+    let id = execution(|execution| execution.new_thread(symmetric));
 
     trace!(thread = ?id, "spawn");
 

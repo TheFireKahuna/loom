@@ -129,7 +129,37 @@ where
     F: 'static,
     T: 'static,
 {
-    spawn_internal(f, None, None, location!())
+    spawn_internal(f, None, None, false, location!())
+}
+
+/// Spawn `n` interchangeable threads of one closure. The scheduler pins the
+/// group's *first* transitions to spawn order, so the search walks one
+/// representative per relabeling of the group instead of all `n!`
+/// permutations of identical futures.
+///
+/// Taking a single `Fn` closure is what makes the thread side of the
+/// symmetry sound by construction: every member runs the same code over the
+/// same captures, so any execution maps onto an explored one by relabeling.
+/// What loom cannot check — the caller's remaining contract — is that the
+/// model treats the group uniformly afterward: assertions must be invariant
+/// under permuting the group (asserting each handle's result identically
+/// qualifies; asserting *which* member got an outcome does not). Divergence
+/// the members earn at runtime from shared state is fine — the relabeling
+/// carries it.
+#[track_caller]
+pub fn symmetric<F, T>(n: usize, f: F) -> Vec<JoinHandle<T>>
+where
+    F: Fn() -> T + Send + Sync + 'static,
+    T: 'static,
+{
+    let f = Arc::new(f);
+
+    (0..n)
+        .map(|_| {
+            let f = f.clone();
+            spawn_internal(move || f(), None, None, true, location!())
+        })
+        .collect()
 }
 
 /// Mock implementation of `std::thread::park`.
@@ -147,6 +177,7 @@ fn spawn_internal<F, T>(
     f: F,
     name: Option<String>,
     stack_size: Option<usize>,
+    symmetric: bool,
     location: Location,
 ) -> JoinHandle<T>
 where
@@ -160,7 +191,7 @@ where
     let id = {
         let name = name.clone();
         let result = result.clone();
-        rt::spawn(stack_size, move || {
+        rt::spawn(stack_size, symmetric, move || {
             rt::execution(|execution| {
                 init_current(execution, name);
             });
@@ -224,7 +255,7 @@ impl Builder {
         F: Send + 'static,
         T: Send + 'static,
     {
-        Ok(spawn_internal(f, self.name, self.stack_size, location!()))
+        Ok(spawn_internal(f, self.name, self.stack_size, false, location!()))
     }
 }
 

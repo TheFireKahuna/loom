@@ -98,8 +98,8 @@ impl Execution {
     }
 
     /// Create state to track a new thread
-    pub(crate) fn new_thread(&mut self) -> thread::Id {
-        let thread_id = self.threads.new_thread();
+    pub(crate) fn new_thread(&mut self, symmetric: bool) -> thread::Id {
+        let thread_id = self.threads.new_thread(symmetric);
         let active_id = self.threads.active_id();
 
         let (active, new) = self.threads.active2_mut(thread_id);
@@ -227,6 +227,11 @@ impl Execution {
             self.sleep.wake_all();
         }
 
+        // Threads whose first transition symmetry holds back for now
+        // (`thread::spawn_symmetric`). Shown as disabled below: unschedulable
+        // and never a DPOR alternative, which is the entire reduction.
+        let pinned = self.threads.symmetry_pinned_mask();
+
         // It's important to avoid pre-emption as much as possible
         let mut initial = Some(self.threads.active_id());
 
@@ -236,7 +241,7 @@ impl Execution {
             initial = None;
 
             for (i, th) in self.threads.iter() {
-                if !th.is_runnable() {
+                if !th.is_runnable() || pinned & (1 << i.as_usize()) != 0 {
                     continue;
                 }
 
@@ -260,7 +265,11 @@ impl Execution {
                     let replacement = self
                         .threads
                         .iter()
-                        .filter(|&(i, th)| th.is_runnable() && !self.sleep.contains(i))
+                        .filter(|&(i, th)| {
+                            th.is_runnable()
+                                && pinned & (1 << i.as_usize()) == 0
+                                && !self.sleep.contains(i)
+                        })
                         .min_by_key(|&(_, th)| th.yield_count)
                         .map(|(i, _)| i);
 
@@ -281,7 +290,9 @@ impl Execution {
 
         let (next, covered) = self.path.branch_thread(self.id, {
             self.threads.iter().map(|(i, th)| {
-                if initial.is_none() && th.is_runnable() {
+                let is_pinned = pinned & (1 << i.as_usize()) != 0;
+
+                if initial.is_none() && th.is_runnable() && !is_pinned {
                     initial = Some(i);
                 }
 
@@ -289,7 +300,7 @@ impl Execution {
                     Thread::Active
                 } else if th.is_yield() {
                     Thread::Yield
-                } else if !th.is_runnable() {
+                } else if !th.is_runnable() || is_pinned {
                     Thread::Disabled
                 } else {
                     Thread::Skip
@@ -330,6 +341,10 @@ impl Execution {
 
             return true;
         }
+
+        // The chosen thread takes a transition now: any symmetry pin waiting
+        // on it releases from the next branch on.
+        self.threads.active_mut().started = true;
 
         // TODO: refactor
         if let Some(operation) = self.threads.active().operation {
