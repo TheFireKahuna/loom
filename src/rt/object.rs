@@ -204,10 +204,23 @@ impl<T> Store<T> {
     /// Insert an object, reincarnating a same-variant carcass in place.
     ///
     /// `reuse` must leave the carcass in exactly the state `make` constructs —
-    /// same fields, same reachable history — reusing its allocations. A
-    /// carcass of a different variant means the schedule diverged into code
-    /// creating a different object graph; the rest of the tail is stale for
-    /// this path and is dropped.
+    /// same fields, same reachable history — reusing its allocations.
+    ///
+    /// A carcass of a different variant is overwritten where it lies, and the
+    /// tail behind it is left alone. Truncating there instead would be a
+    /// memory heuristic paid for at exactly the wrong time: object creation
+    /// order is only deterministic for eagerly constructed cells, and a
+    /// deferred one is numbered by *first access*, so a mismatch is an
+    /// ordinary consequence of exploring a different schedule rather than
+    /// evidence the object graph changed shape. Dropping the tail on each such
+    /// mismatch would discard every surviving carcass — and with them
+    /// `atomic::State::spares` and every inner allocation — turning
+    /// `reuse_objects` into a per-iteration rebuild. Keeping them costs only
+    /// the memory of a wrong-variant entry until `live` reaches it again, and
+    /// they stay invisible meanwhile: every read path is bounded by `live`
+    /// (`iter_ref`, `iter_mut`, `check_for_leaks`), and `insert`/`insert_with`
+    /// each reset whatever entry they land on. Plain `insert` has always
+    /// overwritten any variant in place for the same reason.
     pub(super) fn insert_with<O>(
         &mut self,
         make: impl FnOnce() -> O,
@@ -220,10 +233,7 @@ impl<T> Store<T> {
         if index < self.entries.len() {
             match O::get_mut(&mut self.entries[index]) {
                 Some(obj) => reuse(obj),
-                None => {
-                    self.entries.truncate(index);
-                    self.entries.push(make().into_entry());
-                }
+                None => self.entries[index] = make().into_entry(),
             }
         } else {
             self.entries.push(make().into_entry());
