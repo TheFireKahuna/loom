@@ -301,6 +301,10 @@ macro_rules! materialized_cell {
     ($name:ident, $align:literal, $bytes:literal) => {
         #[doc = concat!("A materialized cell ", stringify!($bytes), " bytes wide.")]
         #[derive(Debug)]
+        // All-zeroes is the unregistered cell, which is the whole premise of
+        // the type — so the proof is mechanized rather than asserted, and
+        // travels to any record a consumer builds out of these.
+        #[cfg_attr(feature = "zerocopy", derive(zerocopy::FromZeros))]
         #[repr(C, align($align))]
         pub(crate) struct $name {
             // Never read and never written *by the model* — the value lives in

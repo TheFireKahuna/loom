@@ -22,6 +22,12 @@ rust-version = "1.73"
 default = []
 checkpoint = ["serde", "serde_json"]
 futures = []
+# Zero-validity proofs for `sync::atomic::materialized`. A consumer that
+# reinterprets zeroed memory as records proves it with `zerocopy::FromZeros`,
+# and the derive on such a record requires every field to carry the impl. The
+# orphan rule puts that out of the consumer's reach for a loom type, so it is
+# supplied here.
+zerocopy = ["dep:zerocopy"]
 
 [dependencies]
 cfg-if = "1.0.0"
@@ -44,10 +50,19 @@ generator = "0.8.1"
 serde = { version = "1.0.113", features = ["derive"], optional = true }
 serde_json = { version = "1.0.33", optional = true }
 
+# Requires for "zerocopy" feature
+zerocopy = { version = "0.8", default-features = false, features = [
+    "derive",
+], optional = true }
+
 tracing = { version = "0.1.27", default-features = false, features = ["std"] }
 tracing-subscriber = { version = "0.3.8", features = ["env-filter"] }
 
 [dev-dependencies]
+# Exercises the `zerocopy` feature: a record built from materialized cells must
+# be able to derive `FromZeros`, which is how a consumer proves reinterpreting
+# zeroed memory as that record is sound.
+zerocopy = { version = "0.8", features = ["derive"] }
 futures-util = "0.3.0"
 
 [package.metadata.docs.rs]

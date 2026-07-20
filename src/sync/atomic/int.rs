@@ -8,7 +8,7 @@ macro_rules! atomic_int {
     // Constructed cells: the default backing caches its registration inline,
     // so it is wider than `$int_type` and must be built by a constructor.
     ($name: ident, $int_type: ty) => {
-        atomic_int!(@ops $name, $int_type, Atomic<$int_type>);
+        atomic_int!(@ops [] $name, $int_type, Atomic<$int_type>);
 
         impl $name {
             #[doc = concat!(" Creates a new instance of `", stringify!($name), "`.")]
@@ -54,7 +54,15 @@ macro_rules! atomic_int {
     // memory. No constructor — `ZEROED` is the only way to name one, and it is
     // the all-zeroes bit pattern.
     (@materialized $name: ident, $int_type: ty, $backing: ty) => {
-        atomic_int!(@ops $name, $int_type, $backing);
+        // All-zeroes is a valid unregistered cell — the premise of the whole
+        // module — so the proof is mechanized and travels into any record a
+        // consumer builds from these. Only the materialized arm carries it: a
+        // constructed cell's backing caches a registration and is emphatically
+        // not valid when zeroed.
+        atomic_int!(
+            @ops [#[cfg_attr(feature = "zerocopy", derive(zerocopy::FromZeros))]]
+            $name, $int_type, $backing
+        );
 
         impl $name {
             #[doc = concat!(
@@ -72,11 +80,12 @@ macro_rules! atomic_int {
         }
     };
 
-    (@ops $name: ident, $int_type: ty, $backing: ty) => {
+    (@ops [$(#[$extra:meta])*] $name: ident, $int_type: ty, $backing: ty) => {
         #[doc = concat!(
             " Mock implementation of `std::sync::atomic::", stringify!($name), "`.",
         )]
         #[derive(Debug)]
+        $(#[$extra])*
         #[repr(transparent)]
         pub struct $name($backing);
 

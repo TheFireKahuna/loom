@@ -17,6 +17,7 @@ use std::sync::atomic::Ordering;
 ///
 /// Everything below is numeric conversion, written once and shared by both.
 #[derive(Debug)]
+#[cfg_attr(feature = "zerocopy", derive(zerocopy::FromZeros))]
 #[repr(transparent)]
 pub(crate) struct Atomic<T, B = rt::Atomic<T>> {
     /// Atomic object

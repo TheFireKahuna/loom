@@ -299,6 +299,63 @@ fn undeclared_memory_is_rejected() {
     });
 }
 
+/// The shape a consumer actually builds: a record laid out over raw memory,
+/// whose zero-validity is *proved* by the derive rather than asserted in a
+/// comment. The `zerocopy` feature exists so this derive can see through to the
+/// cells — the orphan rule puts the impl out of the consumer's reach.
+#[cfg(feature = "zerocopy")]
+#[derive(zerocopy::FromZeros)]
+#[repr(C, align(64))]
+struct Record {
+    head: AtomicU64,
+    generation: AtomicU32,
+    flags: AtomicU16,
+    tag: AtomicU8,
+    _pad: [u8; 49],
+}
+
+#[cfg(feature = "zerocopy")]
+#[test]
+fn a_record_of_materialized_cells_composes_and_is_zero_valid() {
+    // The record is the production shape, not a checker-only stand-in — which
+    // is the entire point of the module.
+    assert_eq!(std::mem::size_of::<Record>(), 64);
+    assert_eq!(std::mem::align_of::<Record>(), 64);
+    assert_eq!(std::mem::offset_of!(Record, head), 0);
+    assert_eq!(std::mem::offset_of!(Record, generation), 8);
+    assert_eq!(std::mem::offset_of!(Record, flags), 12);
+    assert_eq!(std::mem::offset_of!(Record, tag), 14);
+
+    loom::model(|| {
+        // Two records carved out of one zeroed, declared region.
+        let backing = vec![0u64; 16];
+        let base = backing.as_ptr() as *const u8;
+        publish(base, std::mem::size_of_val(&backing[..]));
+
+        // SAFETY: `Record: FromZeros` (derived above) says the all-zero pattern
+        // is a valid `Record`; the buffer is zeroed and 64-aligned by the
+        // `u64` backing plus the record's own alignment being satisfied at
+        // offset 0 and 64. This is the reinterpretation the module licenses.
+        let records = unsafe { std::slice::from_raw_parts(base as *const Record, 2) };
+
+        for r in records {
+            assert_eq!(r.head.load(Relaxed), 0);
+            assert_eq!(r.generation.load(Relaxed), 0);
+            assert_eq!(r.flags.load(Relaxed), 0);
+            assert_eq!(r.tag.load(Relaxed), 0);
+        }
+
+        records[0].head.store(0xdead_beef, Relaxed);
+        records[1].generation.store(7, Relaxed);
+
+        // Fields of distinct records are distinct cells.
+        assert_eq!(records[0].head.load(Relaxed), 0xdead_beef);
+        assert_eq!(records[1].head.load(Relaxed), 0);
+        assert_eq!(records[0].generation.load(Relaxed), 0);
+        assert_eq!(records[1].generation.load(Relaxed), 7);
+    });
+}
+
 #[test]
 fn wide_cells_materialize_and_partition_by_lane() {
     loom::model(|| {
