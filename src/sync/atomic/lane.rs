@@ -38,18 +38,26 @@ macro_rules! lane_type {
     ) => {
         $(#[$m])*
         #[derive(Debug)]
-        pub struct $name<'a> {
-            cell: &'a Atomic<$parent>,
+        // Generic over the cell's backing so a materialized cell has lane views
+        // too. Every operation below is `ModelOps`, which is written once
+        // against a resolved registration and does not care how the cell named
+        // it — so the views need no per-flavor implementation, only the
+        // parameter. The default keeps every existing use spelled as it was.
+        pub struct $name<'a, B = crate::rt::Atomic<$parent>> {
+            cell: &'a Atomic<$parent, B>,
             shift: u32,
         }
 
-        impl<'a> $name<'a> {
+        // The bound is a sealing one: `ModelOps` is private and stays that way,
+        // so no downstream backing can exist.
+        #[allow(private_bounds)]
+        impl<'a, B: crate::rt::ModelOps> $name<'a, B> {
             /// One lane's bytes.
             const LANE_BYTES: usize = std::mem::size_of::<$lane>();
             /// The whole cell's bytes.
             const CELL_BYTES: usize = std::mem::size_of::<$parent>();
 
-            pub(crate) fn new(cell: &'a Atomic<$parent>, byte_offset: usize) -> Self {
+            pub(crate) fn new(cell: &'a Atomic<$parent, B>, byte_offset: usize) -> Self {
                 assert!(
                     byte_offset % Self::LANE_BYTES == 0
                         && byte_offset + Self::LANE_BYTES <= Self::CELL_BYTES,

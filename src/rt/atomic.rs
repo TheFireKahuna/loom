@@ -197,8 +197,13 @@ pub(crate) const FULL_MASK: u128 = u128::MAX;
 /// reserved for "not yet minted", so the counter starts at one.
 static NEXT_CELL_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
+/// A constructed cell's backing: a registration cached inline.
+///
+/// `pub` for the same reason the materialized cells are — it is the *default*
+/// backing of the public lane views, so it appears in their signature. Opaque
+/// outside the crate: no public constructor, no public field.
 #[derive(Debug)]
-pub(crate) struct Atomic<T> {
+pub struct Atomic<T> {
     /// This cell's registration in the execution's object store.
     ///
     /// `Some` — registered eagerly by [`Atomic::new`], which is what every
@@ -306,7 +311,10 @@ macro_rules! materialized_cell {
         // travels to any record a consumer builds out of these.
         #[cfg_attr(feature = "zerocopy", derive(zerocopy::FromZeros))]
         #[repr(C, align($align))]
-        pub(crate) struct $name {
+        // `pub` only so a materialized cell's lane views can name their
+        // backing in a public signature. Opaque: no public constructor, no
+        // public field, nothing to do with one but pass it along.
+        pub struct $name {
             // Never read and never written *by the model* — the value lives in
             // the execution's object store. The cell exists to occupy `T`'s
             // layout and to have an address. `UnsafeCell` because the bytes do
@@ -371,16 +379,71 @@ pub(crate) fn publish(base: usize, len: usize) {
     let location = location!();
 
     rt::execution(|execution| {
-        let causality = execution.threads.active().causality;
+
 
         trace!(base, len, "atomic::publish");
 
-        execution.published_regions.push(PublishedRegion {
-            base,
-            len,
-            causality,
-            location,
-        });
+        // Only the parts of the range that are not published already. A second
+        // publication of live memory is what an *idempotent* commit looks like
+        // — a pool re-commits the fringe pages a chunk shares with its
+        // neighbours as a matter of course — and the underlying map does
+        // nothing on such a call: it neither re-zeroes the bytes nor
+        // re-initializes them. Recording it anyway would move those cells'
+        // genesis onto a thread that initialized nothing, and every peer
+        // holding the memory from the first publication would be reported
+        // against it.
+        //
+        // Clipping rather than skipping, because the common case is a range
+        // that is partly live and partly new: the new part must still take this
+        // thread's causality.
+        //
+        // Overlapping an existing publication also *orders* this thread after
+        // the thread that made it. Mapping a range is serialized by the
+        // platform (NT takes the VM lock; `mmap` the mmap lock), so every
+        // caller returns having synchronized-with whoever actually mapped it —
+        // not only the winner. Without this edge a second, idempotent commit
+        // hands its caller memory it has no happens-before with, and the first
+        // access is reported.
+
+        let mut acquired = VersionVec::new();
+        for r in &execution.published_regions {
+            if r.base < base + len && base < r.base + r.len {
+                acquired.join(&r.causality);
+            }
+        }
+        execution.threads.active_mut().causality.join(&acquired);
+
+        let mut gaps = vec![(base, base + len)];
+        for r in &execution.published_regions {
+            let (lo, hi) = (r.base, r.base + r.len);
+            let mut next = Vec::with_capacity(gaps.len() + 1);
+            for (a, b) in gaps {
+                if hi <= a || lo >= b {
+                    next.push((a, b));
+                    continue;
+                }
+                if a < lo {
+                    next.push((a, lo));
+                }
+                if hi < b {
+                    next.push((hi, b));
+                }
+            }
+            gaps = next;
+            if gaps.is_empty() {
+                break;
+            }
+        }
+
+        let causality = execution.threads.active().causality;
+        for (a, b) in gaps {
+            execution.published_regions.push(PublishedRegion {
+                base: a,
+                len: b - a,
+                causality,
+                location,
+            });
+        }
     })
 }
 
@@ -998,6 +1061,9 @@ fn fence_seqcst(execution: &mut Execution) {
     }
 }
 
+// `Numeric` is private and stays that way: the bound seals this impl even
+// though `Atomic` is nameable (as `ConstructedCell`) for signatures.
+#[allow(private_bounds)]
 impl<T: Numeric> Atomic<T> {
     /// Create a new, atomic cell initialized with the provided value
     pub(crate) fn new(value: T, location: Location) -> Atomic<T> {

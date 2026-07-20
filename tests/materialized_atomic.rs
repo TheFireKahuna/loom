@@ -207,17 +207,19 @@ fn region_bytes(region: &[AtomicU64]) -> (*const u8, usize) {
 #[should_panic(expected = "Concurrent load and mut accesses")]
 fn access_unsynchronized_with_the_publisher_is_reported() {
     loom::model(|| {
-        // Declared up front so no schedule can reach a cell before *some*
-        // declaration exists — otherwise the reader races the "not in any
-        // published region" panic and this test would not be measuring what it
-        // claims to. Every thread below inherits this declaration's causality.
+        // Declare only the *tail* up front, so no schedule can reach a cell
+        // before some declaration exists — otherwise the reader races the "not
+        // in any published region" panic and this test would not be measuring
+        // what it claims to. Cell 0 is deliberately left undeclared here: it is
+        // the one the publisher below brings into existence.
         let (ptr, len) = region_bytes(&PUBLISHED_RACY);
-        publish(ptr, len);
+        let cell = std::mem::size_of_val(&PUBLISHED_RACY[0]);
+        publish(unsafe { ptr.add(cell) }, len - cell);
 
-        // Re-declaring supersedes: cells registering from here on take *this*
-        // thread's causality, and this thread is a sibling of the reader.
+        // Publishing genuinely new memory, so cell 0's genesis is *this*
+        // thread's causality — and this thread is only a sibling of the reader.
         let publisher = thread::spawn(move || {
-            publish(ptr, len);
+            publish(ptr, cell);
             PUBLISHED_RACY[0].store(1, Relaxed);
         });
 
@@ -326,16 +328,21 @@ fn a_record_of_materialized_cells_composes_and_is_zero_valid() {
     assert_eq!(std::mem::offset_of!(Record, flags), 12);
     assert_eq!(std::mem::offset_of!(Record, tag), 14);
 
+    // A `Vec` would only be element-aligned; the records need 64, so the
+    // backing carries the alignment in its own type.
+    #[repr(C, align(64))]
+    struct Backing([u8; 128]);
+
     loom::model(|| {
         // Two records carved out of one zeroed, declared region.
-        let backing = vec![0u64; 16];
-        let base = backing.as_ptr() as *const u8;
-        publish(base, std::mem::size_of_val(&backing[..]));
+        let backing = Backing([0; 128]);
+        let base = &backing as *const Backing as *const u8;
+        publish(base, std::mem::size_of::<Backing>());
 
         // SAFETY: `Record: FromZeros` (derived above) says the all-zero pattern
-        // is a valid `Record`; the buffer is zeroed and 64-aligned by the
-        // `u64` backing plus the record's own alignment being satisfied at
-        // offset 0 and 64. This is the reinterpretation the module licenses.
+        // is a valid `Record`; the backing is zeroed and its type carries
+        // 64-byte alignment, so both records are aligned. This is the
+        // reinterpretation the module licenses.
         let records = unsafe { std::slice::from_raw_parts(base as *const Record, 2) };
 
         for r in records {
@@ -461,6 +468,28 @@ fn reset_discards_only_its_own_range() {
     });
 }
 
+/// A pointer cell materializes too — the shape `Slot.wait_address` needs.
+#[test]
+fn pointer_cells_materialize() {
+    use loom::sync::atomic::materialized::AtomicPtr;
+
+    loom::model(|| {
+        let backing = vec![0u64; 2];
+        let base = backing.as_ptr() as *const u8;
+        publish(base, std::mem::size_of_val(&backing[..]));
+
+        // SAFETY: `AtomicPtr` is asserted to match `*mut _`'s size and
+        // alignment, the buffer is zeroed and pointer-aligned.
+        let cell = unsafe { &*(base as *const AtomicPtr<u32>) };
+
+        assert!(cell.load(Relaxed).is_null());
+
+        let mut target = 5u32;
+        cell.store(&raw mut target, Release);
+        assert!(!cell.load(Acquire).is_null());
+    });
+}
+
 #[test]
 fn wide_cells_materialize_and_partition_by_lane() {
     loom::model(|| {
@@ -484,5 +513,18 @@ fn wide_cells_materialize_and_partition_by_lane() {
 
         assert_eq!(cell.load_masked(low, Relaxed), 0xabcd);
         assert_eq!(cell.load_masked(high, Relaxed), 0x1234 << 64);
+
+        // The typed lane views work on a materialized cell too — the shape
+        // `EpisodeMeta`'s hot path needs, where nearly every access is a lane
+        // rather than the whole 16 bytes.
+        assert_eq!(cell.lane_u64(0).load(Relaxed), 0xabcd);
+        assert_eq!(cell.lane_u64(8).load(Relaxed), 0x1234);
+        assert_eq!(cell.lane_u32(0).load(Relaxed), 0xabcd);
+
+        cell.lane_u32(4).store(0x99, Relaxed);
+        assert_eq!(cell.lane_u32(4).load(Relaxed), 0x99);
+        // A lane store leaves its siblings alone.
+        assert_eq!(cell.lane_u32(0).load(Relaxed), 0xabcd);
+        assert_eq!(cell.lane_u64(8).load(Relaxed), 0x1234);
     });
 }

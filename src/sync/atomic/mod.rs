@@ -16,6 +16,13 @@ pub use self::int::{AtomicU16, AtomicU32, AtomicU8, AtomicUsize};
 mod lane;
 pub use self::lane::{LaneU32Of64, LaneU32Of128, LaneU64Of128};
 
+/// The constructed cells' backing marker.
+///
+/// Public only because it is the default type parameter of the lane views, so
+/// it appears in their signature. Opaque: no constructor, no field, and nothing
+/// to do with one but let it be inferred.
+pub use crate::rt::ConstructedCell;
+
 pub mod materialized;
 
 #[cfg(target_has_atomic = "64")]

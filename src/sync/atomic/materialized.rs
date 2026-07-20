@@ -60,9 +60,12 @@ use std::sync::atomic::Ordering;
 /// under-approximation for memory a thread handed out at runtime: no access to
 /// it can ever be reported as unsynchronized.
 ///
-/// Declaring a range again supersedes the earlier declaration for those
-/// addresses, which is what a decommit-then-recommit cycle needs. Declarations
-/// do not outlive an execution.
+/// Declaring a range that is already live is a no-op for the overlapping part —
+/// that is what an idempotent commit looks like, and the cells already there
+/// keep their genesis — but it still orders the caller after whoever published
+/// it first, because mapping a range is serialized by the platform. To discard
+/// the contents of live memory, use [`reset`]. Declarations do not outlive an
+/// execution.
 ///
 /// This describes memory to the model; it neither reads nor writes it, and
 /// `ptr` need not be dereferenceable.
@@ -104,6 +107,15 @@ pub fn reset(ptr: *mut u8, len: usize) {
     rt::reset(ptr as usize, len, location!())
 }
 
+pub use super::ptr::materialized::AtomicPtr;
+
+/// The cells' backing markers, one per width.
+///
+/// Public only because a lane view names its cell's backing in its own type
+/// (`LaneU64Of128<'_, Cell16>`). They are opaque: no constructor, no field, and
+/// nothing to do with one but let it be inferred.
+pub use crate::rt::{Cell1, Cell16, Cell2, Cell4, Cell8};
+
 atomic_int!(@materialized AtomicU8, u8, Atomic<u8, rt::Cell1>);
 atomic_int!(@materialized AtomicI8, i8, Atomic<i8, rt::Cell1>);
 atomic_int!(@materialized AtomicU16, u16, Atomic<u16, rt::Cell2>);
@@ -123,6 +135,32 @@ atomic_int!(@materialized AtomicIsize, isize, Atomic<isize, rt::Cell8>);
 atomic_int!(@materialized AtomicUsize, usize, Atomic<usize, rt::Cell4>);
 #[cfg(target_pointer_width = "32")]
 atomic_int!(@materialized AtomicIsize, isize, Atomic<isize, rt::Cell4>);
+
+// Typed sub-word lane views, as on the constructed cells. The view types are
+// generic over the backing, so these are the same views — only the cell they
+// borrow differs.
+
+impl AtomicU64 {
+    /// An aligned 32-bit lane view at `byte_offset` (0 or 4).
+    #[track_caller]
+    pub fn lane_u32(&self, byte_offset: usize) -> super::LaneU32Of64<'_, rt::Cell8> {
+        super::LaneU32Of64::new(&self.0, byte_offset)
+    }
+}
+
+impl AtomicU128 {
+    /// An aligned 32-bit lane view at `byte_offset` (0, 4, 8, or 12).
+    #[track_caller]
+    pub fn lane_u32(&self, byte_offset: usize) -> super::LaneU32Of128<'_, rt::Cell16> {
+        super::LaneU32Of128::new(&self.0, byte_offset)
+    }
+
+    /// An aligned 64-bit lane view at `byte_offset` (0 or 8).
+    #[track_caller]
+    pub fn lane_u64(&self, byte_offset: usize) -> super::LaneU64Of128<'_, rt::Cell16> {
+        super::LaneU64Of128::new(&self.0, byte_offset)
+    }
+}
 
 // The property this module exists to provide. Asserted rather than documented:
 // if it stops holding, a cell can no longer be reinterpreted from a zeroed
