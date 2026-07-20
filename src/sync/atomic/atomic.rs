@@ -31,10 +31,16 @@ pub(crate) struct Atomic<T, B = rt::Atomic<T>> {
 const _: () = {
     use std::mem::{align_of, size_of};
 
-    assert!(size_of::<Atomic<u64, rt::CellId>>() == size_of::<u64>());
-    assert!(align_of::<Atomic<u64, rt::CellId>>() == align_of::<u64>());
-    assert!(size_of::<Atomic<u128, rt::CellId16>>() == size_of::<u128>());
-    assert!(align_of::<Atomic<u128, rt::CellId16>>() == align_of::<u128>());
+    assert!(size_of::<Atomic<u8, rt::Cell1>>() == size_of::<u8>());
+    assert!(align_of::<Atomic<u8, rt::Cell1>>() == align_of::<u8>());
+    assert!(size_of::<Atomic<u16, rt::Cell2>>() == size_of::<u16>());
+    assert!(align_of::<Atomic<u16, rt::Cell2>>() == align_of::<u16>());
+    assert!(size_of::<Atomic<u32, rt::Cell4>>() == size_of::<u32>());
+    assert!(align_of::<Atomic<u32, rt::Cell4>>() == align_of::<u32>());
+    assert!(size_of::<Atomic<u64, rt::Cell8>>() == size_of::<u64>());
+    assert!(align_of::<Atomic<u64, rt::Cell8>>() == align_of::<u64>());
+    assert!(size_of::<Atomic<u128, rt::Cell16>>() == size_of::<u128>());
+    assert!(align_of::<Atomic<u128, rt::Cell16>>() == align_of::<u128>());
 };
 
 impl<T> Atomic<T>
@@ -66,25 +72,21 @@ where
     }
 }
 
-impl<T> Atomic<T, rt::CellId> {
-    /// The unregistered cell, which is also the all-zeroes bit pattern.
-    pub(crate) const fn zeroed() -> Self {
-        Atomic {
-            state: rt::CellId::ZEROED,
-            _p: PhantomData,
+macro_rules! zeroed_ctor {
+    ($($cell:ident),* $(,)?) => {$(
+        impl<T> Atomic<T, rt::$cell> {
+            /// The unregistered cell, which is also the all-zeroes pattern.
+            pub(crate) const fn zeroed() -> Self {
+                Atomic {
+                    state: rt::$cell::ZEROED,
+                    _p: PhantomData,
+                }
+            }
         }
-    }
+    )*};
 }
 
-impl<T> Atomic<T, rt::CellId16> {
-    /// The unregistered cell, which is also the all-zeroes bit pattern.
-    pub(crate) const fn zeroed() -> Self {
-        Atomic {
-            state: rt::CellId16::ZEROED,
-            _p: PhantomData,
-        }
-    }
-}
+zeroed_ctor!(Cell1, Cell2, Cell4, Cell8, Cell16);
 
 impl<T, B> Atomic<T, B>
 where

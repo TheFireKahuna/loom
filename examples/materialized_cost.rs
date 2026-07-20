@@ -25,7 +25,14 @@ struct Region(Vec<u64>);
 
 impl Region {
     fn new(cells: usize) -> Region {
-        Region(vec![0u64; cells])
+        let backing = vec![0u64; cells];
+        // A materialized cell's identity is its address, so the memory has to
+        // be declared before any cell in it is reachable.
+        loom::sync::atomic::materialized::publish(
+            backing.as_ptr() as *const u8,
+            std::mem::size_of_val(&backing[..]),
+        );
+        Region(backing)
     }
 
     fn cell(&self, i: usize) -> &Thin {

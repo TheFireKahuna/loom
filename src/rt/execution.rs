@@ -42,6 +42,12 @@ pub(crate) struct Execution {
     /// cell. Cleared per iteration alongside every other object ref.
     pub(super) deferred_atomics: FxHashMap<u64, object::Ref<super::atomic::State>>,
 
+    /// Registrations of materialized cells, keyed by the address the cell
+    /// occupies — its identity, since such a cell carries no identity word and
+    /// cannot move (see `atomic::Cell8` and friends). Cleared per iteration
+    /// alongside every other object ref.
+    pub(super) materialized: FxHashMap<usize, object::Ref<super::atomic::State>>,
+
     /// Regions of raw memory a thread has declared published, each with the
     /// causality of the thread that published it.
     ///
@@ -116,6 +122,7 @@ impl Execution {
             raw_allocations: FxHashMap::default(),
             arc_objs: FxHashMap::default(),
             deferred_atomics: FxHashMap::default(),
+            materialized: FxHashMap::default(),
             published_regions: Vec::new(),
             dpor_update: None,
             location: false,
@@ -177,6 +184,7 @@ impl Execution {
         // iteration; their identities persist (they live in the cells), their
         // registrations do not.
         self.deferred_atomics.clear();
+        self.materialized.clear();
         self.published_regions.clear();
         self.threads.clear(id);
         self.sleep.clear();

@@ -9,27 +9,37 @@
 //! checker build, and then the checker is verifying a structure that is not the
 //! one that ships.
 //!
-//! The cells here carry no inline value and no cached registration — only an
-//! identity word, minted on first access — so:
+//! The cells here carry no value and no identity word — nothing but the
+//! modelled integer's size and alignment — so:
 //!
-//! - `size_of` and `align_of` match the modelled integer, and
-//! - the all-zeroes bit pattern is a valid, unregistered cell holding zero.
+//! - `size_of` and `align_of` match it exactly, at every width, and
+//! - the all-zeroes pattern is a valid, unregistered cell holding zero.
 //!
 //! A zeroed region of memory is therefore a valid array of these, and the same
 //! allocation path can run under the checker as in production.
 //!
+//! # Declaring the memory is mandatory
+//!
+//! A materialized cell takes its identity from **where it lives**, so the
+//! memory holding it must be declared with [`publish`]. A cell outside every
+//! published range has no identity and its first access panics.
+//!
+//! That is deliberate. Identity-by-position is what lets these cells exist at
+//! `u8` and `u16` widths at all — an identity *word* needs bits the narrow
+//! widths do not have, and a minted id would accumulate without bound because a
+//! materialized cell re-registers every execution. Requiring the declaration is
+//! the price, and it buys a second thing: [`publish`] records the publishing
+//! thread's causality as the cells' genesis, so a reader that reaches a cell
+//! without synchronizing-with the publication is reported, exactly as
+//! [`AtomicU64::new`](crate::sync::atomic::AtomicU64::new) reports it for a
+//! constructed cell.
+//!
 //! # Cost
 //!
 //! Every operation resolves its registration through a per-execution table
-//! instead of reading a cached ref — there is nowhere to cache one. Prefer the
+//! instead of reading a cached ref — there is nowhere to cache one. Measured at
+//! 1.05–1.10x a constructed cell (`examples/materialized_cost.rs`). Prefer the
 //! ordinary types unless a cell genuinely has to be materialized.
-//!
-//! # Genesis
-//!
-//! A materialized cell's initial value is zero by construction, and its
-//! initialization is modelled as preceding the execution. Unlike
-//! [`AtomicU64::new`](crate::sync::atomic::AtomicU64::new), it therefore does
-//! not detect an unsynchronized publication *of the cell itself*.
 
 use super::atomic::Atomic;
 use crate::rt;
@@ -61,12 +71,25 @@ pub fn publish(ptr: *const u8, len: usize) {
     rt::publish(ptr as usize, len)
 }
 
-atomic_int!(@materialized AtomicU64, u64, Atomic<u64, rt::CellId>);
-atomic_int!(@materialized AtomicI64, i64, Atomic<i64, rt::CellId>);
-atomic_int!(@materialized AtomicUsize, usize, Atomic<usize, rt::CellId>);
-atomic_int!(@materialized AtomicIsize, isize, Atomic<isize, rt::CellId>);
-atomic_int!(@materialized AtomicU128, u128, Atomic<u128, rt::CellId16>);
-atomic_int!(@materialized AtomicI128, i128, Atomic<i128, rt::CellId16>);
+atomic_int!(@materialized AtomicU8, u8, Atomic<u8, rt::Cell1>);
+atomic_int!(@materialized AtomicI8, i8, Atomic<i8, rt::Cell1>);
+atomic_int!(@materialized AtomicU16, u16, Atomic<u16, rt::Cell2>);
+atomic_int!(@materialized AtomicI16, i16, Atomic<i16, rt::Cell2>);
+atomic_int!(@materialized AtomicU32, u32, Atomic<u32, rt::Cell4>);
+atomic_int!(@materialized AtomicI32, i32, Atomic<i32, rt::Cell4>);
+atomic_int!(@materialized AtomicU64, u64, Atomic<u64, rt::Cell8>);
+atomic_int!(@materialized AtomicI64, i64, Atomic<i64, rt::Cell8>);
+atomic_int!(@materialized AtomicU128, u128, Atomic<u128, rt::Cell16>);
+atomic_int!(@materialized AtomicI128, i128, Atomic<i128, rt::Cell16>);
+
+#[cfg(target_pointer_width = "64")]
+atomic_int!(@materialized AtomicUsize, usize, Atomic<usize, rt::Cell8>);
+#[cfg(target_pointer_width = "64")]
+atomic_int!(@materialized AtomicIsize, isize, Atomic<isize, rt::Cell8>);
+#[cfg(target_pointer_width = "32")]
+atomic_int!(@materialized AtomicUsize, usize, Atomic<usize, rt::Cell4>);
+#[cfg(target_pointer_width = "32")]
+atomic_int!(@materialized AtomicIsize, isize, Atomic<isize, rt::Cell4>);
 
 // The property this module exists to provide. Asserted rather than documented:
 // if it stops holding, a cell can no longer be reinterpreted from a zeroed
@@ -82,11 +105,17 @@ const _: () = {
     }
 
     same_layout! {
+        AtomicU8 => u8,
+        AtomicI8 => i8,
+        AtomicU16 => u16,
+        AtomicI16 => i16,
+        AtomicU32 => u32,
+        AtomicI32 => i32,
         AtomicU64 => u64,
         AtomicI64 => i64,
-        AtomicUsize => usize,
-        AtomicIsize => isize,
         AtomicU128 => u128,
         AtomicI128 => i128,
+        AtomicUsize => usize,
+        AtomicIsize => isize,
     }
 };

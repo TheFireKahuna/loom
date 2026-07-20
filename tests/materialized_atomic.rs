@@ -6,7 +6,9 @@
 //! these tests obtain their cells the way the code this exists for does — by
 //! casting a buffer — never by calling a constructor.
 
-use loom::sync::atomic::materialized::{publish, AtomicU128, AtomicU64};
+use loom::sync::atomic::materialized::{
+    publish, AtomicU128, AtomicU16, AtomicU32, AtomicU64, AtomicU8,
+};
 use loom::sync::atomic::Ordering::{AcqRel, Acquire, Relaxed, Release, SeqCst};
 use loom::sync::Arc;
 use loom::thread;
@@ -17,10 +19,15 @@ struct Region {
 }
 
 impl Region {
+    /// Allocate and declare. A materialized cell's identity is its address, so
+    /// the declaration is what gives the cells inside identities at all.
     fn zeroed(cells: usize) -> Region {
-        Region {
-            backing: vec![0u64; cells],
-        }
+        let backing = vec![0u64; cells];
+        publish(
+            backing.as_ptr() as *const u8,
+            std::mem::size_of_val(&backing[..]),
+        );
+        Region { backing }
     }
 
     fn cells(&self) -> &[AtomicU64] {
@@ -77,14 +84,26 @@ fn distinct_slots_are_distinct_cells() {
 }
 
 /// A `static` region survives across executions, so its cells must re-register
-/// each one rather than inherit the previous execution's stores.
+/// each one rather than inherit the previous execution's stores. Its address is
+/// stable, so this is the case where address keying is most obviously exposed
+/// to leaking state between executions — the per-iteration table clear is what
+/// prevents it.
 static SHARED: [AtomicU64; 2] = [AtomicU64::ZEROED, AtomicU64::ZEROED];
+
+fn publish_static() {
+    publish(
+        SHARED.as_ptr() as *const u8,
+        std::mem::size_of_val(&SHARED),
+    );
+}
 
 #[test]
 fn static_region_resets_between_executions() {
     static EXECUTIONS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
     loom::model(|| {
+        publish_static();
+
         // Whatever the previous execution left behind must be invisible.
         assert_eq!(SHARED[0].load(Relaxed), 0);
         assert_eq!(SHARED[1].load(Relaxed), 0);
@@ -188,14 +207,20 @@ fn region_bytes(region: &[AtomicU64]) -> (*const u8, usize) {
 #[should_panic(expected = "Concurrent load and mut accesses")]
 fn access_unsynchronized_with_the_publisher_is_reported() {
     loom::model(|| {
-        let publisher = thread::spawn(|| {
-            let (ptr, len) = region_bytes(&PUBLISHED_RACY);
+        // Declared up front so no schedule can reach a cell before *some*
+        // declaration exists — otherwise the reader races the "not in any
+        // published region" panic and this test would not be measuring what it
+        // claims to. Every thread below inherits this declaration's causality.
+        let (ptr, len) = region_bytes(&PUBLISHED_RACY);
+        publish(ptr, len);
+
+        // Re-declaring supersedes: cells registering from here on take *this*
+        // thread's causality, and this thread is a sibling of the reader.
+        let publisher = thread::spawn(move || {
             publish(ptr, len);
             PUBLISHED_RACY[0].store(1, Relaxed);
         });
 
-        // Never synchronized with `publisher` — it is a sibling, so spawning
-        // it gave this thread none of its causality.
         let reader = thread::spawn(|| {
             PUBLISHED_RACY[0].load(Relaxed);
         });
@@ -223,10 +248,65 @@ fn access_synchronized_with_the_publisher_is_clean() {
     });
 }
 
+/// The width range address keying exists to reach. A minted identity needs bits
+/// these cells do not have — a `u16` cell has 65535 ids for a whole process,
+/// and a materialized cell re-registers every execution.
+#[test]
+fn narrow_cells_materialize_and_stay_distinct() {
+    loom::model(|| {
+        // `u64`-backed so the sub-word casts below are all naturally aligned.
+        let backing = vec![0u64; 2];
+        let base = backing.as_ptr() as *const u8;
+        publish(base, std::mem::size_of_val(&backing[..]));
+
+        // SAFETY: each cell is asserted to match its integer's size and
+        // alignment, the buffer is zeroed, and each offset below is a multiple
+        // of the width read there. The three cells occupy disjoint bytes.
+        let (byte, word, dword) = unsafe {
+            (
+                &*(base as *const AtomicU8),
+                &*(base.add(2) as *const AtomicU16),
+                &*(base.add(4) as *const AtomicU32),
+            )
+        };
+
+        assert_eq!(byte.load(Relaxed), 0);
+        assert_eq!(word.load(Relaxed), 0);
+        assert_eq!(dword.load(Relaxed), 0);
+
+        byte.store(0xab, Relaxed);
+        word.store(0xbeef, Relaxed);
+        dword.store(0xdead_beef, Relaxed);
+
+        // Distinct addresses are distinct cells — no aliasing across widths.
+        assert_eq!(byte.load(Relaxed), 0xab);
+        assert_eq!(word.load(Relaxed), 0xbeef);
+        assert_eq!(dword.load(Relaxed), 0xdead_beef);
+    });
+}
+
+/// The declaration is required, not advisory — the guard against a consumer
+/// silently getting the weaker, publication-blind genesis.
+#[test]
+#[should_panic(expected = "not in any published region")]
+fn undeclared_memory_is_rejected() {
+    loom::model(|| {
+        let backing = vec![0u64; 1];
+        // SAFETY: layout is right; the *declaration* is what is missing, which
+        // is the point of the test.
+        let cell = unsafe { &*(backing.as_ptr() as *const AtomicU64) };
+        cell.load(Relaxed);
+    });
+}
+
 #[test]
 fn wide_cells_materialize_and_partition_by_lane() {
     loom::model(|| {
         let mut backing = vec![0u128; 1];
+        publish(
+            backing.as_ptr() as *const u8,
+            std::mem::size_of_val(&backing[..]),
+        );
         // SAFETY: as `Region::cells`, at 128-bit width — `AtomicU128` is
         // asserted to match `u128`'s size and alignment, and the buffer is
         // zeroed and `u128`-aligned.

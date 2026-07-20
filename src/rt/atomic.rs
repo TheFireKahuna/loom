@@ -266,31 +266,78 @@ impl<T: Numeric> Resolve for Atomic<T> {
     }
 }
 
-/// A cell whose entire in-memory representation is its identity word.
+/// A cell materialized from published memory: its identity is *where it is*.
 ///
-/// No inline value and no cached registration, so `size_of` and `align_of`
-/// match the modelled integer and **a zeroed region is a valid, unregistered
-/// cell holding zero**. That is what lets memory obtained the way production
-/// obtains it — demand-committed VA handed out as slots — be modelled as it
-/// actually is, rather than the checker build substituting a differently
-/// shaped allocation it can construct.
+/// The cell carries no value and no identity word — nothing but `T`'s size and
+/// alignment — so **a zeroed region is a valid array of them**, at every width
+/// down to a single byte. That is what lets memory obtained the way production
+/// obtains it (demand-committed VA carved into records) be modelled as it
+/// actually is, rather than the checker build substituting a differently shaped
+/// allocation it is able to construct.
 ///
-/// The cost relative to [`Atomic`] is that every operation resolves through
-/// `Execution::deferred_atomics`: there is nowhere to cache a ref.
-#[derive(Debug)]
-#[repr(transparent)]
-pub(crate) struct CellId(std::sync::atomic::AtomicU64);
+/// # Why address, when [`Atomic::const_new`] mints an identity
+///
+/// The two constructors serve cells with different lifecycles, and the keying
+/// follows the lifecycle rather than being a global choice:
+///
+/// - A `const`-constructed cell can be built in a `const` context and then
+///   **moved** (`[C::const_new(..); N]` relocated into an owner). Its identity
+///   has to travel with it, so it lives in the cell.
+/// - A materialized cell is carved from a published region and **cannot move**
+///   — relocating the region invalidates every cell in it, and production VA is
+///   reserved once and never released. Its address *is* its identity.
+///
+/// Address keying is also the only scheme that works here at all. A minted
+/// identity needs bits in the cell, and a materialized cell re-mints every
+/// execution because its backing is freshly zeroed: a `u32` cell exhausts a
+/// 32-bit id space after a few deep rigs, and a `u16` cell after a fraction of
+/// one. Deriving identity from position costs no bits and accumulates nothing.
+///
+/// # Cost
+///
+/// Every operation resolves through `Execution::materialized`: there is nowhere
+/// to cache a ref.
+macro_rules! materialized_cell {
+    ($name:ident, $align:literal, $bytes:literal) => {
+        #[doc = concat!("A materialized cell ", stringify!($bytes), " bytes wide.")]
+        #[derive(Debug)]
+        #[repr(C, align($align))]
+        pub(crate) struct $name {
+            // Never read and never written *by the model* — the value lives in
+            // the execution's object store. The cell exists to occupy `T`'s
+            // layout and to have an address. `UnsafeCell` because the bytes do
+            // change underneath a shared reference: the code under test zeroes
+            // records on claim and the `MEM_RESET` model rewrites whole spans.
+            _bytes: std::cell::UnsafeCell<[u8; $bytes]>,
+        }
 
-impl CellId {
-    /// The unregistered state, which is also the all-zeroes bit pattern.
-    pub(crate) const ZEROED: CellId = CellId(std::sync::atomic::AtomicU64::new(0));
+        // SAFETY: the invariant is that these bytes are never accessed. Every
+        // read and write the model performs goes to the object store, reached
+        // by the cell's address; nothing here dereferences `_bytes`. Sharing
+        // the cell across threads therefore cannot race on anything this type
+        // owns.
+        unsafe impl Sync for $name {}
+
+        impl $name {
+            /// The unregistered state, which is also the all-zeroes pattern.
+            pub(crate) const ZEROED: $name = $name {
+                _bytes: std::cell::UnsafeCell::new([0; $bytes]),
+            };
+        }
+
+        impl Resolve for $name {
+            fn resolve(&self) -> object::Ref<State> {
+                resolve_materialized(self as *const $name as usize)
+            }
+        }
+    };
 }
 
-impl Resolve for CellId {
-    fn resolve(&self) -> object::Ref<State> {
-        register(mint_id(&self.0), 0, Some(self as *const CellId as usize))
-    }
-}
+materialized_cell!(Cell1, 1, 1);
+materialized_cell!(Cell2, 2, 2);
+materialized_cell!(Cell4, 4, 4);
+materialized_cell!(Cell8, 8, 8);
+materialized_cell!(Cell16, 16, 16);
 
 /// A range of raw memory a thread declared published, and that thread's
 /// causality at the moment it did.
@@ -305,12 +352,16 @@ pub(crate) struct PublishedRegion {
 /// Declare that the calling thread has published `len` bytes of zeroed memory
 /// at `base`.
 ///
-/// A cell materialized inside the range takes this thread's causality as its
-/// genesis, so an access by a thread that has not synchronized-with the
-/// publication is reported. Without a declaration a materialized cell is
-/// modelled as if it preceded the execution — accurate for a `static` in the
-/// binary image, and a silent under-approximation for anything a thread handed
-/// out at runtime.
+/// Required, not advisory: a materialized cell takes its identity from where it
+/// lives, so a cell outside every published range has no identity and its first
+/// access panics. That is deliberate — it makes the declaration impossible to
+/// forget, where a permissive fallback would silently model the memory as
+/// having preceded the execution and could never report a reader that reached
+/// it unsynchronized.
+///
+/// A cell inside the range takes this thread's causality as its genesis, so an
+/// access by a thread that has not synchronized-with the publication is
+/// reported.
 #[track_caller]
 pub(crate) fn publish(base: usize, len: usize) {
     let location = location!();
@@ -329,43 +380,65 @@ pub(crate) fn publish(base: usize, len: usize) {
     })
 }
 
-/// [`CellId`] at the size and alignment of a 128-bit integer.
-///
-/// The identity is still one word; the rest is padding. A distinct type rather
-/// than a const-generic parameter because `repr(align(N))` takes a literal.
-#[derive(Debug)]
-#[repr(C, align(16))]
-pub(crate) struct CellId16 {
-    id: std::sync::atomic::AtomicU64,
-    _pad: u64,
-}
-
-impl CellId16 {
-    /// The unregistered state, which is also the all-zeroes bit pattern.
-    pub(crate) const ZEROED: CellId16 = CellId16 {
-        id: std::sync::atomic::AtomicU64::new(0),
-        _pad: 0,
-    };
-}
-
-impl Resolve for CellId16 {
-    fn resolve(&self) -> object::Ref<State> {
-        register(mint_id(&self.id), 0, Some(self as *const CellId16 as usize))
-    }
-}
-
-// The property the materialized representation exists to provide. If these
-// ever stop holding, a cell can no longer be reinterpreted from a zeroed
-// region and the representation is pointless — so they are asserted, not
-// documented.
+// The property the materialized representation exists to provide. If these ever
+// stop holding, a cell can no longer be reinterpreted from a zeroed region and
+// the representation is pointless — so they are asserted, not documented.
 const _: () = {
     use std::mem::{align_of, size_of};
 
-    assert!(size_of::<CellId>() == size_of::<u64>());
-    assert!(align_of::<CellId>() == align_of::<u64>());
-    assert!(size_of::<CellId16>() == size_of::<u128>());
-    assert!(align_of::<CellId16>() == align_of::<u128>());
+    assert!(size_of::<Cell1>() == 1 && align_of::<Cell1>() == 1);
+    assert!(size_of::<Cell2>() == 2 && align_of::<Cell2>() == 2);
+    assert!(size_of::<Cell4>() == 4 && align_of::<Cell4>() == 4);
+    assert!(size_of::<Cell8>() == 8 && align_of::<Cell8>() == 8);
+    assert!(size_of::<Cell16>() == 16 && align_of::<Cell16>() == 16);
 };
+
+/// Resolve — and on first access of this execution, create — the registration
+/// of the materialized cell at `addr`.
+///
+/// Keyed by the address itself rather than by an index into
+/// `published_regions`: a range may be published more than once in an execution
+/// (`commit` is idempotent, and the pool re-commits the fringe pages a chunk
+/// shares with its neighbours as a matter of course), and re-publishing must
+/// not hand a live cell a fresh registration and drop its history. The region
+/// list is consulted only to establish that the address *is* published, and for
+/// the genesis causality.
+fn resolve_materialized(addr: usize) -> object::Ref<State> {
+    rt::execution(|execution| {
+        if let Some(&state) = execution.materialized.get(&addr) {
+            return state;
+        }
+
+        // Most-recent-first: a range published again supersedes the earlier
+        // declaration's causality for cells registering from now on.
+        let published = execution
+            .published_regions
+            .iter()
+            .rev()
+            .find(|r| addr >= r.base && addr - r.base < r.len)
+            .map(|r| (r.causality, r.location));
+
+        let Some(published) = published else {
+            panic!(
+                "materialized atomic at {addr:#x} is not in any published region.\n\
+                 A materialized cell takes its identity from where it lives, so the \
+                 memory holding it must be declared with \
+                 `loom::sync::atomic::materialized::publish(ptr, len)` — by whichever \
+                 thread published it, before any thread reaches a cell inside it."
+            );
+        };
+
+        let state = execution.objects.insert_with(State::shell, State::recycle);
+        state
+            .get_mut(&mut execution.objects)
+            .init_deferred(0, Some(published));
+        execution.materialized.insert(addr, state);
+
+        trace!(?state, addr, "atomic::resolve_materialized");
+
+        state
+    })
+}
 
 /// A cell's process-global identity, minting one if it has none.
 ///
@@ -390,27 +463,16 @@ fn mint_id(slot: &std::sync::atomic::AtomicU64) -> u64 {
 
 /// Resolve — and on first access of this execution, create — the registration
 /// of the cell with identity `id`, whose value before any store is `init`.
-fn register(id: u64, init: u128, addr: Option<usize>) -> object::Ref<State> {
+fn register(id: u64, init: u128) -> object::Ref<State> {
     rt::execution(|execution| {
         if let Some(&state) = execution.deferred_atomics.get(&id) {
             return state;
         }
 
-        // Most-recent-first, so a republished range supersedes the earlier
-        // declaration of the same addresses.
-        let published = addr.and_then(|addr| {
-            execution
-                .published_regions
-                .iter()
-                .rev()
-                .find(|r| addr >= r.base && addr - r.base < r.len)
-                .map(|r| (r.causality, r.location))
-        });
-
         let state = execution.objects.insert_with(State::shell, State::recycle);
-        state
-            .get_mut(&mut execution.objects)
-            .init_deferred(init, published);
+        // A `const`-constructed cell is in the binary image, not in memory a
+        // thread published, so its genesis precedes the execution.
+        state.get_mut(&mut execution.objects).init_deferred(init, None);
         execution.deferred_atomics.insert(id, state);
 
         trace!(?state, id, "atomic::register");
@@ -901,9 +963,7 @@ impl<T: Numeric> Atomic<T> {
     /// Resolve — and on first access of this execution, create — the
     /// registration of a deferred cell.
     fn register_deferred(&self) -> object::Ref<State> {
-        // No address: a `const`-constructed cell is in the binary image, not
-        // in memory some thread published.
-        register(mint_id(&self.cell_id), self.init, None)
+        register(mint_id(&self.cell_id), self.init)
     }
 
 }
