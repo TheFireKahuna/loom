@@ -397,6 +397,53 @@ const _: () = {
     assert!(size_of::<Cell16>() == 16 && align_of::<Cell16>() == 16);
 };
 
+/// Model a bulk zeroing of `[base, base + len)` by a thread that owns the range
+/// exclusively.
+///
+/// A materialized cell keeps its value in the object store, not in the bytes it
+/// occupies, so a `memset` over raw memory is invisible to the model. Code that
+/// recycles a record by zeroing it before any typed reference exists — the
+/// claim-time body zero of a pool — has to say so, or the reset silently does
+/// not happen and every cell keeps its previous lifecycle's value.
+///
+/// Exclusive, and checked: this is a non-atomic write, so it is tracked exactly
+/// as `with_mut` is and a peer that has not synchronized-with the caller is
+/// reported. Cells in the range that are not yet registered are already zero.
+pub(crate) fn zero_exclusive(base: usize, len: usize, location: Location) {
+    rt::execution(|execution| {
+        trace!(base, len, "atomic::zero_exclusive");
+
+        // Collected first: the loop below needs `objects` mutably while
+        // `materialized` is still borrowed by the iterator.
+        let in_range: SmallVec<[object::Ref<State>; 8]> = execution
+            .materialized
+            .iter()
+            .filter(|(&addr, _)| addr >= base && addr - base < len)
+            .map(|(_, &state)| state)
+            .collect();
+
+        for state_ref in in_range {
+            let state = state_ref.get_mut(&mut execution.objects);
+
+            state
+                .unsync_mut_locations
+                .track(location, &execution.threads);
+            // The same check `with_mut` performs: a concurrent reader or writer
+            // of a range being bulk-zeroed is a race, and the exclusivity the
+            // caller claims is what makes the write legal.
+            state.track_unsync_mut(&execution.threads);
+
+            // Overwrite in place rather than appending a store: a non-atomic
+            // write is not a modification-order event, and no reader may
+            // legally still be looking at the old value.
+            for region in &mut state.regions {
+                let index = index(region.cnt - 1);
+                region.stores[index].value = 0;
+            }
+        }
+    })
+}
+
 /// Resolve — and on first access of this execution, create — the registration
 /// of the materialized cell at `addr`.
 ///

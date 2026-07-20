@@ -7,7 +7,7 @@
 //! casting a buffer — never by calling a constructor.
 
 use loom::sync::atomic::materialized::{
-    publish, AtomicU128, AtomicU16, AtomicU32, AtomicU64, AtomicU8,
+    publish, zero_exclusive, AtomicU128, AtomicU16, AtomicU32, AtomicU64, AtomicU8,
 };
 use loom::sync::atomic::Ordering::{AcqRel, Acquire, Relaxed, Release, SeqCst};
 use loom::sync::Arc;
@@ -353,6 +353,65 @@ fn a_record_of_materialized_cells_composes_and_is_zero_valid() {
         assert_eq!(records[1].head.load(Relaxed), 0);
         assert_eq!(records[0].generation.load(Relaxed), 0);
         assert_eq!(records[1].generation.load(Relaxed), 7);
+    });
+}
+
+/// A recycled record is zeroed as raw memory, before any typed reference to it
+/// exists. The cells' values live in the model, not in those bytes, so the
+/// zeroing has to be declared — otherwise it silently does not happen and every
+/// cell keeps its previous lifecycle's value.
+#[test]
+fn bulk_zero_resets_the_cells_in_its_range() {
+    loom::model(|| {
+        let region = Region::zeroed(4);
+        let cells = region.cells();
+
+        for (i, cell) in cells.iter().enumerate() {
+            cell.store(i as u64 + 1, Relaxed);
+        }
+
+        // Zero only the first two cells, the way a pool recycles one record out
+        // of several.
+        zero_exclusive(
+            cells.as_ptr() as *mut u8,
+            2 * std::mem::size_of::<u64>(),
+        );
+
+        assert_eq!(cells[0].load(Relaxed), 0);
+        assert_eq!(cells[1].load(Relaxed), 0);
+        // Outside the range, untouched — a bulk zero must not reach past its
+        // own record.
+        assert_eq!(cells[2].load(Relaxed), 3);
+        assert_eq!(cells[3].load(Relaxed), 4);
+    });
+}
+
+/// The exclusivity is a real precondition, not a comment: a peer reading the
+/// range while it is being zeroed is the race the check exists to catch.
+#[test]
+#[should_panic(expected = "Causality violation")]
+fn bulk_zero_racing_a_reader_is_reported() {
+    loom::model(|| {
+        let region = Arc::new(Region::zeroed(2));
+        let peer = region.clone();
+
+        let t = thread::spawn(move || {
+            peer.cells()[0].load(Relaxed);
+        });
+
+        // A bulk zero takes no DPOR branch — it is an exclusive, non-atomic
+        // write, like `with_mut` — so something before it has to open the
+        // scheduling point, and that something must *conflict* with the
+        // reader. A store to a different cell would be independent of the
+        // reader's load and the interleaving would never be explored at all.
+        region.cells()[0].store(1, Relaxed);
+
+        zero_exclusive(
+            region.cells().as_ptr() as *mut u8,
+            std::mem::size_of::<u64>(),
+        );
+
+        t.join().unwrap();
     });
 }
 

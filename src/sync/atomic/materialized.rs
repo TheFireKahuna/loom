@@ -71,6 +71,23 @@ pub fn publish(ptr: *const u8, len: usize) {
     rt::publish(ptr as usize, len)
 }
 
+/// Declare that the calling thread has bulk-zeroed `len` bytes at `ptr` while
+/// owning them exclusively.
+///
+/// A materialized cell keeps its value in the model, not in the bytes it
+/// occupies, so a `memset` over the raw memory is invisible: without this call
+/// the cells keep whatever they last held. A pool that recycles a record by
+/// zeroing it before any typed reference exists has to say so here.
+///
+/// The write is non-atomic, and checked as such — a peer that has not
+/// synchronized-with the caller is reported, exactly as it would be for
+/// `with_mut`. Cells in the range that were never registered are already zero,
+/// so the range need not have been touched.
+#[track_caller]
+pub fn zero_exclusive(ptr: *mut u8, len: usize) {
+    rt::zero_exclusive(ptr as usize, len, location!())
+}
+
 atomic_int!(@materialized AtomicU8, u8, Atomic<u8, rt::Cell1>);
 atomic_int!(@materialized AtomicI8, i8, Atomic<i8, rt::Cell1>);
 atomic_int!(@materialized AtomicU16, u16, Atomic<u16, rt::Cell2>);
