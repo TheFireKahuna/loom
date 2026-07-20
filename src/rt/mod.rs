@@ -341,3 +341,13 @@ pub fn stop_exploring() {
 pub fn skip_branch() {
     execution(|execution| execution.path.skip_branch())
 }
+
+/// Explore both boolean outcomes at this point, resolved each way across
+/// executions — a bounded two-valued path branch (reuses the `Spurious`
+/// branch machinery, like `Notify` and `Condvar`). The primitive for a data
+/// race whose winner the *environment* picks nondeterministically — e.g. a
+/// kernel timer-vs-alert race whose outcome is expressed through neither
+/// scheduling nor a modeled atomic, so loom has no other way to branch on it.
+pub fn nondet_bool() -> bool {
+    execution(|execution| execution.path.branch_spurious())
+}

@@ -366,7 +366,7 @@ macro_rules! dbg {
 #[macro_use]
 mod rt;
 
-pub use rt::{explore, skip_branch, stop_exploring};
+pub use rt::{explore, nondet_bool, skip_branch, stop_exploring};
 // Expose for documentation purposes.
 pub use rt::MAX_THREADS;
 
