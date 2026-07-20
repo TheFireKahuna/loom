@@ -288,8 +288,45 @@ impl CellId {
 
 impl Resolve for CellId {
     fn resolve(&self) -> object::Ref<State> {
-        register(mint_id(&self.0), 0)
+        register(mint_id(&self.0), 0, Some(self as *const CellId as usize))
     }
+}
+
+/// A range of raw memory a thread declared published, and that thread's
+/// causality at the moment it did.
+#[derive(Debug)]
+pub(crate) struct PublishedRegion {
+    base: usize,
+    len: usize,
+    causality: VersionVec,
+    location: Location,
+}
+
+/// Declare that the calling thread has published `len` bytes of zeroed memory
+/// at `base`.
+///
+/// A cell materialized inside the range takes this thread's causality as its
+/// genesis, so an access by a thread that has not synchronized-with the
+/// publication is reported. Without a declaration a materialized cell is
+/// modelled as if it preceded the execution — accurate for a `static` in the
+/// binary image, and a silent under-approximation for anything a thread handed
+/// out at runtime.
+#[track_caller]
+pub(crate) fn publish(base: usize, len: usize) {
+    let location = location!();
+
+    rt::execution(|execution| {
+        let causality = execution.threads.active().causality;
+
+        trace!(base, len, "atomic::publish");
+
+        execution.published_regions.push(PublishedRegion {
+            base,
+            len,
+            causality,
+            location,
+        });
+    })
 }
 
 /// [`CellId`] at the size and alignment of a 128-bit integer.
@@ -313,7 +350,7 @@ impl CellId16 {
 
 impl Resolve for CellId16 {
     fn resolve(&self) -> object::Ref<State> {
-        register(mint_id(&self.id), 0)
+        register(mint_id(&self.id), 0, Some(self as *const CellId16 as usize))
     }
 }
 
@@ -353,14 +390,27 @@ fn mint_id(slot: &std::sync::atomic::AtomicU64) -> u64 {
 
 /// Resolve — and on first access of this execution, create — the registration
 /// of the cell with identity `id`, whose value before any store is `init`.
-fn register(id: u64, init: u128) -> object::Ref<State> {
+fn register(id: u64, init: u128, addr: Option<usize>) -> object::Ref<State> {
     rt::execution(|execution| {
         if let Some(&state) = execution.deferred_atomics.get(&id) {
             return state;
         }
 
+        // Most-recent-first, so a republished range supersedes the earlier
+        // declaration of the same addresses.
+        let published = addr.and_then(|addr| {
+            execution
+                .published_regions
+                .iter()
+                .rev()
+                .find(|r| addr >= r.base && addr - r.base < r.len)
+                .map(|r| (r.causality, r.location))
+        });
+
         let state = execution.objects.insert_with(State::shell, State::recycle);
-        state.get_mut(&mut execution.objects).init_deferred(init);
+        state
+            .get_mut(&mut execution.objects)
+            .init_deferred(init, published);
         execution.deferred_atomics.insert(id, state);
 
         trace!(?state, id, "atomic::register");
@@ -851,7 +901,9 @@ impl<T: Numeric> Atomic<T> {
     /// Resolve — and on first access of this execution, create — the
     /// registration of a deferred cell.
     fn register_deferred(&self) -> object::Ref<State> {
-        register(mint_id(&self.cell_id), self.init)
+        // No address: a `const`-constructed cell is in the binary image, not
+        // in memory some thread published.
+        register(mint_id(&self.cell_id), self.init, None)
     }
 
 }
@@ -1272,20 +1324,32 @@ impl State {
     ///   unconditionally modification-order-first — the correct C11 reading of
     ///   an initialization, and strictly more accurate than a genesis whose
     ///   `tick` is some thread's clock.
-    fn init_deferred(&mut self, value: u128) {
-        self.created_location = Location::default();
+    fn init_deferred(&mut self, value: u128, published: Option<(VersionVec, Location)>) {
+        self.created_location = published.map_or_else(Location::default, |(_, l)| l);
         self.loaded_at = VersionVec::new();
         self.loaded_locations = LocationSet::new();
         self.unsync_loaded_at = VersionVec::new();
         self.unsync_loaded_locations = LocationSet::new();
         self.stored_at = VersionVec::new();
         self.stored_locations = LocationSet::new();
-        self.unsync_mut_at = VersionVec::new();
+        // A cell materialized inside a published region takes the publishing
+        // thread's causality as its genesis: `track_load`/`track_store`/
+        // `track_unsync_load` all report an access whose causality does not
+        // cover this vector, which is exactly "read the memory without
+        // synchronizing-with whoever handed it out".
+        //
+        // Undeclared memory keeps the empty vector — the `const`-in-the-binary-
+        // image model, which cannot report such an access at all.
+        self.unsync_mut_at = published.map_or_else(VersionVec::new, |(c, _)| c);
         self.unsync_mut_locations = LocationSet::new();
         self.is_mutating = false;
         self.op_clock = 0;
         self.touched_by = 0;
 
+        // The genesis *store* stays pre-execution even when published: it
+        // carries no causality, so an acquiring reader inherits nothing it did
+        // not earn. Publication is modelled as the constraint above, not as a
+        // free happens-before edge.
         self.regions[0].store_pre_execution(value);
     }
 

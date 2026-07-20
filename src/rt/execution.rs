@@ -42,6 +42,18 @@ pub(crate) struct Execution {
     /// cell. Cleared per iteration alongside every other object ref.
     pub(super) deferred_atomics: FxHashMap<u64, object::Ref<super::atomic::State>>,
 
+    /// Regions of raw memory a thread has declared published, each with the
+    /// causality of the thread that published it.
+    ///
+    /// Keyed by address, which is sound here and only here: this names a
+    /// region of *memory*, which does not move, rather than a cell, which
+    /// does. Searched most-recent-first, so republishing a range after it is
+    /// recycled supersedes the earlier declaration.
+    ///
+    /// Cleared per iteration — the causality vectors index this execution's
+    /// thread numbering.
+    pub(super) published_regions: Vec<super::atomic::PublishedRegion>,
+
     /// The object whose access records the previous `schedule()` call
     /// updated (via `set_last_access`), if any. This is what makes the
     /// DPOR backtrack scan event-driven — see `schedule()`.
@@ -104,6 +116,7 @@ impl Execution {
             raw_allocations: FxHashMap::default(),
             arc_objs: FxHashMap::default(),
             deferred_atomics: FxHashMap::default(),
+            published_regions: Vec::new(),
             dpor_update: None,
             location: false,
             log: false,
@@ -164,6 +177,7 @@ impl Execution {
         // iteration; their identities persist (they live in the cells), their
         // registrations do not.
         self.deferred_atomics.clear();
+        self.published_regions.clear();
         self.threads.clear(id);
         self.sleep.clear();
 

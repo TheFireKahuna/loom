@@ -36,6 +36,31 @@ use crate::rt;
 
 use std::sync::atomic::Ordering;
 
+/// Declare that the calling thread has published `len` bytes of zeroed memory
+/// at `ptr`.
+///
+/// Cells materialized inside the range take this thread's causality as their
+/// genesis, so an access by a thread that has not synchronized-with the
+/// publication is reported as a causality violation — the check a constructed
+/// cell gets from [`AtomicU64::new`](crate::sync::atomic::AtomicU64::new), and
+/// the reason to call this rather than rely on the default.
+///
+/// Without a declaration, a materialized cell is modelled as having preceded
+/// the execution. That is accurate for a `static`, and a silent
+/// under-approximation for memory a thread handed out at runtime: no access to
+/// it can ever be reported as unsynchronized.
+///
+/// Declaring a range again supersedes the earlier declaration for those
+/// addresses, which is what a decommit-then-recommit cycle needs. Declarations
+/// do not outlive an execution.
+///
+/// This describes memory to the model; it neither reads nor writes it, and
+/// `ptr` need not be dereferenceable.
+#[track_caller]
+pub fn publish(ptr: *const u8, len: usize) {
+    rt::publish(ptr as usize, len)
+}
+
 atomic_int!(@materialized AtomicU64, u64, Atomic<u64, rt::CellId>);
 atomic_int!(@materialized AtomicI64, i64, Atomic<i64, rt::CellId>);
 atomic_int!(@materialized AtomicUsize, usize, Atomic<usize, rt::CellId>);

@@ -6,7 +6,7 @@
 //! these tests obtain their cells the way the code this exists for does — by
 //! casting a buffer — never by calling a constructor.
 
-use loom::sync::atomic::materialized::{AtomicU128, AtomicU64};
+use loom::sync::atomic::materialized::{publish, AtomicU128, AtomicU64};
 use loom::sync::atomic::Ordering::{AcqRel, Acquire, Relaxed, Release, SeqCst};
 use loom::sync::Arc;
 use loom::thread;
@@ -168,6 +168,58 @@ fn rmw_atomicity_holds() {
 
         // No interleaving may lose an increment.
         assert_eq!(region.cells()[0].load(SeqCst), 2);
+    });
+}
+
+static PUBLISHED_RACY: [AtomicU64; 1] = [AtomicU64::ZEROED];
+static PUBLISHED_CLEAN: [AtomicU64; 1] = [AtomicU64::ZEROED];
+
+fn region_bytes(region: &[AtomicU64]) -> (*const u8, usize) {
+    (
+        region.as_ptr() as *const u8,
+        std::mem::size_of_val(region),
+    )
+}
+
+/// The point of declaring publication: a thread that reads the memory without
+/// synchronizing-with whoever handed it out is reported, exactly as it would be
+/// for a constructed cell.
+#[test]
+#[should_panic(expected = "Concurrent load and mut accesses")]
+fn access_unsynchronized_with_the_publisher_is_reported() {
+    loom::model(|| {
+        let publisher = thread::spawn(|| {
+            let (ptr, len) = region_bytes(&PUBLISHED_RACY);
+            publish(ptr, len);
+            PUBLISHED_RACY[0].store(1, Relaxed);
+        });
+
+        // Never synchronized with `publisher` — it is a sibling, so spawning
+        // it gave this thread none of its causality.
+        let reader = thread::spawn(|| {
+            PUBLISHED_RACY[0].load(Relaxed);
+        });
+
+        publisher.join().unwrap();
+        reader.join().unwrap();
+    });
+}
+
+/// ...and the converse, or the check would be useless: a reader that *has*
+/// synchronized with the publisher is clean in every execution.
+#[test]
+fn access_synchronized_with_the_publisher_is_clean() {
+    loom::model(|| {
+        let publisher = thread::spawn(|| {
+            let (ptr, len) = region_bytes(&PUBLISHED_CLEAN);
+            publish(ptr, len);
+            PUBLISHED_CLEAN[0].store(1, Relaxed);
+        });
+
+        // Joining synchronizes with the publisher.
+        publisher.join().unwrap();
+
+        assert_eq!(PUBLISHED_CLEAN[0].load(Relaxed), 1);
     });
 }
 
