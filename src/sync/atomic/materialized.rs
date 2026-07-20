@@ -88,6 +88,22 @@ pub fn zero_exclusive(ptr: *mut u8, len: usize) {
     rt::zero_exclusive(ptr as usize, len, location!())
 }
 
+/// Model the `MEM_RESET` / `MADV_FREE` verb over `len` bytes at `ptr`: the
+/// content is discarded while the mapping stays.
+///
+/// Use this, not [`zero_exclusive`], whenever a reader may legally still be
+/// walking the span. A reset is modelled as a release-ordered atomic store per
+/// cell, so a concurrent atomic load races it harmlessly and each cell is its
+/// own linearization point — a reader crossing the reset may see some cells
+/// discarded and others not, which is what the span really does.
+///
+/// The modelled outcome is the worst case: every cell in the range reads zero
+/// afterwards. Real `MEM_RESET` decides per page whether to discard.
+#[track_caller]
+pub fn reset(ptr: *mut u8, len: usize) {
+    rt::reset(ptr as usize, len, location!())
+}
+
 atomic_int!(@materialized AtomicU8, u8, Atomic<u8, rt::Cell1>);
 atomic_int!(@materialized AtomicI8, i8, Atomic<i8, rt::Cell1>);
 atomic_int!(@materialized AtomicU16, u16, Atomic<u16, rt::Cell2>);

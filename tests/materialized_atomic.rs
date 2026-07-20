@@ -7,7 +7,7 @@
 //! casting a buffer — never by calling a constructor.
 
 use loom::sync::atomic::materialized::{
-    publish, zero_exclusive, AtomicU128, AtomicU16, AtomicU32, AtomicU64, AtomicU8,
+    publish, reset, zero_exclusive, AtomicU128, AtomicU16, AtomicU32, AtomicU64, AtomicU8,
 };
 use loom::sync::atomic::Ordering::{AcqRel, Acquire, Relaxed, Release, SeqCst};
 use loom::sync::Arc;
@@ -412,6 +412,52 @@ fn bulk_zero_racing_a_reader_is_reported() {
         );
 
         t.join().unwrap();
+    });
+}
+
+/// The distinguishing property, and the reason `reset` is not `zero_exclusive`
+/// with a different name: this is the *identical* rig to
+/// `bulk_zero_racing_a_reader_is_reported`, and it must come out clean. A stale
+/// walker reading a span through its own atomics while the reset lands is
+/// admissible — T3 depends on it.
+#[test]
+fn reset_racing_a_reader_is_admissible() {
+    loom::model(|| {
+        let region = Arc::new(Region::zeroed(2));
+        let peer = region.clone();
+
+        let t = thread::spawn(move || {
+            // Either value is legal: the reader may cross the reset or not.
+            let seen = peer.cells()[0].load(Acquire);
+            assert!(seen == 0 || seen == 1);
+        });
+
+        region.cells()[0].store(1, Release);
+        reset(
+            region.cells().as_ptr() as *mut u8,
+            std::mem::size_of::<u64>(),
+        );
+
+        t.join().unwrap();
+    });
+}
+
+#[test]
+fn reset_discards_only_its_own_range() {
+    loom::model(|| {
+        let region = Region::zeroed(4);
+        let cells = region.cells();
+
+        for (i, cell) in cells.iter().enumerate() {
+            cell.store(i as u64 + 1, Relaxed);
+        }
+
+        reset(cells.as_ptr() as *mut u8, 2 * std::mem::size_of::<u64>());
+
+        assert_eq!(cells[0].load(Relaxed), 0);
+        assert_eq!(cells[1].load(Relaxed), 0);
+        assert_eq!(cells[2].load(Relaxed), 3);
+        assert_eq!(cells[3].load(Relaxed), 4);
     });
 }
 

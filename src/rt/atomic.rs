@@ -444,6 +444,64 @@ pub(crate) fn zero_exclusive(base: usize, len: usize, location: Location) {
     })
 }
 
+/// Model the `MEM_RESET` / `MADV_FREE` verb over `[base, base + len)`: the
+/// content is discarded, but the mapping stays and a concurrent reader is
+/// *admissible* rather than a bug.
+///
+/// Distinct from [`zero_exclusive`] in exactly the way the two verbs are
+/// distinct, and the difference is the whole reason this is a separate
+/// function. A claim-time body zero owns its record; a reset does not — a stale
+/// reader may legally still be walking the span through its own atomics while
+/// the reset lands. So this is modelled as a release-ordered atomic store per
+/// cell, which races an atomic load harmlessly, where an exclusive write would
+/// report it.
+///
+/// One store per cell, each its own linearization point, because that is what
+/// the span really is: a reader crossing the reset may see some cells discarded
+/// and others not.
+pub(crate) fn reset(base: usize, len: usize, location: Location) {
+    // Collected before the first branch: each store below is a scheduling
+    // point, so a peer may register a further cell in the range midway. That
+    // cell registers at zero and needs no store — and it is exactly the
+    // admissible concurrent access this verb tolerates.
+    let targets: SmallVec<[object::Ref<State>; 8]> = rt::execution(|execution| {
+        trace!(base, len, "atomic::reset");
+
+        execution
+            .materialized
+            .iter()
+            .filter(|(&addr, _)| addr >= base && addr - base < len)
+            .map(|(_, &state)| state)
+            .collect()
+    });
+
+    for state_ref in targets {
+        // No re-resolve integrity check: that guards a cell's identity *word*
+        // against a stray write, and a materialized cell has none — its
+        // identity is its address, which cannot be corrupted in place.
+        state_ref.branch_action(Action::Store(FULL_MASK), location);
+
+        super::synchronize(|execution| {
+            let state = state_ref.get_mut(&mut execution.objects);
+
+            state.stored_locations.track(location, &execution.threads);
+            state.track_store(&execution.threads);
+
+            let op_id = state.next_op_id();
+            for ri in state.covered(FULL_MASK) {
+                state.regions[ri].store(
+                    &mut execution.threads,
+                    Synchronize::new(),
+                    0,
+                    Ordering::Release,
+                    None,
+                    op_id,
+                );
+            }
+        });
+    }
+}
+
 /// Resolve — and on first access of this execution, create — the registration
 /// of the materialized cell at `addr`.
 ///
