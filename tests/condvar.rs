@@ -90,24 +90,38 @@ fn wait_timeout_explores_both_outcomes() {
 }
 
 /// A `wait_timeout` no notification can ever reach must resolve via the
-/// timeout — never a reported deadlock.
+/// timeout — never a reported deadlock. Reaching the end of the model is
+/// that witness.
+///
+/// A timed wait may also surface the condvar's bounded pre-deadline spurious
+/// wake (`rt::condvar`), which is a legal, explored outcome — so absorb it the
+/// way a real caller does. The budget is at most one self-wake per condvar per
+/// execution, so this re-waits at most once before the timeout resolves it,
+/// and the loop is finite in every execution.
 #[test]
 fn wait_timeout_without_notifier_times_out() {
     loom::model(|| {
         let mutex = Mutex::new(());
         let condvar = Condvar::new();
 
-        let guard = mutex.lock().unwrap();
-        let (guard, result) = condvar.wait_timeout(guard, Duration::from_millis(1)).unwrap();
-
-        assert!(result.timed_out());
+        let mut guard = mutex.lock().unwrap();
+        loop {
+            let (g, result) = condvar.wait_timeout(guard, Duration::from_millis(1)).unwrap();
+            guard = g;
+            if result.timed_out() {
+                break;
+            }
+        }
         drop(guard);
     });
 }
 
 /// The timeout rescue also fires with other (untimed) waiters in the mix:
 /// a joiner blocked on the timed-out thread must not be reported as a
-/// deadlock either.
+/// deadlock either. The join returning is that witness.
+///
+/// The bounded spurious wake is absorbed here for the same reason as in
+/// `wait_timeout_without_notifier_times_out`.
 #[test]
 fn wait_timeout_without_notifier_cross_thread() {
     loom::model(|| {
@@ -115,11 +129,14 @@ fn wait_timeout_without_notifier_cross_thread() {
             let mutex = Mutex::new(());
             let condvar = Condvar::new();
 
-            let guard = mutex.lock().unwrap();
-            let (_guard, result) =
-                condvar.wait_timeout(guard, Duration::from_millis(1)).unwrap();
-
-            assert!(result.timed_out());
+            let mut guard = mutex.lock().unwrap();
+            loop {
+                let (g, result) = condvar.wait_timeout(guard, Duration::from_millis(1)).unwrap();
+                guard = g;
+                if result.timed_out() {
+                    break;
+                }
+            }
         })
         .join()
         .unwrap();

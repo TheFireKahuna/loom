@@ -82,7 +82,21 @@ impl Condvar {
             mutex.release_lock();
             mutex.acquire_lock(location);
 
-            return timed;
+            // An untimed self-wake is spurious (`false`). A timed self-wake is
+            // EITHER the timeout firing OR a bounded pre-deadline spurious
+            // wake — explored both ways via one extra `branch_spurious` (itself
+            // bounded: this arm runs at most once per condvar per execution).
+            // The spurious arm returns `false` (not timed out), consuming
+            // nothing, so a caller whose timeout and spurious paths diverge — a
+            // futex kernel-wait loop terminates on a timeout but re-checks and
+            // re-parks on a spurious wake — has its re-park arm model-checked.
+            // `std` does not require timed waits to spur and a spurious return
+            // is always caller-legal, so no correct caller breaks; the timeout
+            // stays reachable (this arm's `true`, and the park+rescue path).
+            if timed {
+                return !rt::execution(|execution| execution.path.branch_spurious());
+            }
+            return false;
         }
 
         rt::execution(|execution| {
