@@ -18,6 +18,20 @@ where
         Atomic { state }
     }
 
+    /// `const` constructor — see [`rt::Atomic::const_new`]. `init` is the
+    /// `u128` representation of the initial value; callers know the concrete
+    /// type and convert with a `const`-callable cast, because
+    /// `rt::Numeric::into_u128` is a trait method and cannot be one.
+    ///
+    /// No `location!()`: `Location::caller()` is not `const`-callable either,
+    /// so a cell built here reports no creation site. The cost is confined to
+    /// diagnostics — every *access* still tracks its own location.
+    pub(crate) const fn const_new(init: u128) -> Atomic<T> {
+        Atomic {
+            state: rt::Atomic::const_new(init),
+        }
+    }
+
     #[track_caller]
     pub(crate) unsafe fn unsync_load(&self) -> T {
         self.state.unsync_load(location!())

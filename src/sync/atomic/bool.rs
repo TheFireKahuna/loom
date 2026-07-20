@@ -16,6 +16,15 @@ impl AtomicBool {
         AtomicBool(Atomic::new(v, location!()))
     }
 
+    /// Creates a new instance of `AtomicBool` in a `const` context.
+    ///
+    /// Registration is deferred to first access; see
+    /// [`AtomicUsize::const_new`](crate::sync::atomic::AtomicUsize::const_new)
+    /// for what that changes and when to prefer [`new`](Self::new).
+    pub const fn const_new(v: bool) -> AtomicBool {
+        AtomicBool(Atomic::const_new(v as u128))
+    }
+
     /// Load the value without any synchronization.
     ///
     /// # Safety

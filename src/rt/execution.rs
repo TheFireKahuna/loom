@@ -26,6 +26,22 @@ pub(crate) struct Execution {
 
     pub(crate) arc_objs: FxHashMap<*const (), std::sync::Arc<super::Arc>>,
 
+    /// Registrations of `const`-constructed atomic cells, keyed by the cell's
+    /// globally-unique identity (`rt::atomic::Atomic::cell_id`).
+    ///
+    /// A cell built in a `const` context cannot register with an execution at
+    /// construction — there is none — so it registers on its first access of
+    /// each execution and looks itself up here afterwards. Keyed on the minted
+    /// identity rather than the cell's address so that moving the cell carries
+    /// its history with it, and so a later cell reusing a freed address is a
+    /// distinct entry rather than an alias.
+    ///
+    /// Per-`Execution`, so parallel workers — which share the `static`s a
+    /// const constructor exists to serve, but never share an `Execution`
+    /// (`model::check_parallel`) — each hold their own registration of the one
+    /// cell. Cleared per iteration alongside every other object ref.
+    pub(super) deferred_atomics: FxHashMap<u64, object::Ref<super::atomic::State>>,
+
     /// The object whose access records the previous `schedule()` call
     /// updated (via `set_last_access`), if any. This is what makes the
     /// DPOR backtrack scan event-driven — see `schedule()`.
@@ -87,6 +103,7 @@ impl Execution {
             objects: object::Store::with_capacity(max_branches),
             raw_allocations: FxHashMap::default(),
             arc_objs: FxHashMap::default(),
+            deferred_atomics: FxHashMap::default(),
             dpor_update: None,
             location: false,
             log: false,
@@ -143,6 +160,10 @@ impl Execution {
         self.lazy_statics.reset();
         self.raw_allocations.clear();
         self.arc_objs.clear();
+        // Deferred cells re-register on their first access of the next
+        // iteration; their identities persist (they live in the cells), their
+        // registrations do not.
+        self.deferred_atomics.clear();
         self.threads.clear(id);
         self.sleep.clear();
 

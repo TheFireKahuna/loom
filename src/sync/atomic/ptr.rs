@@ -21,6 +21,20 @@ impl<T> AtomicPtr<T> {
         AtomicPtr(Atomic::new(v, location!()))
     }
 
+    /// Creates a null `AtomicPtr` in a `const` context.
+    ///
+    /// Null rather than a general `const_new(v: *mut T)` because casting a
+    /// pointer to an integer is not permitted in a `const fn`, so the initial
+    /// value could not be recorded. This is not a real restriction: a non-null
+    /// pointer constant is not available in a `const` context either.
+    ///
+    /// Registration is deferred to first access; see
+    /// [`AtomicUsize::const_new`](crate::sync::atomic::AtomicUsize::const_new)
+    /// for what that changes and when to prefer [`new`](Self::new).
+    pub const fn const_null() -> AtomicPtr<T> {
+        AtomicPtr(Atomic::const_new(0))
+    }
+
     /// Load the value without any synchronization.
     ///
     /// # Safety

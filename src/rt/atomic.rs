@@ -192,9 +192,53 @@ use tracing::trace;
 /// Mask of a full-width access: every bit of the 128-bit cell.
 const FULL_MASK: u128 = u128::MAX;
 
+/// Source of `Atomic::cell_id` values. Process-global and monotone, so one
+/// identity is valid across every execution and every parallel worker. Zero is
+/// reserved for "not yet minted", so the counter starts at one.
+static NEXT_CELL_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
 #[derive(Debug)]
 pub(crate) struct Atomic<T> {
-    state: object::Ref<State>,
+    /// This cell's registration in the execution's object store.
+    ///
+    /// `Some` — registered eagerly by [`Atomic::new`], which is what every
+    /// runtime construction uses. The ref is captured once and read directly
+    /// by every op, exactly as it was before deferred registration existed.
+    ///
+    /// `None` — the cell was built by [`Atomic::const_new`] in a `const`
+    /// context, where there is no execution to register with. It resolves
+    /// through `Execution::deferred_atomics` on its first access of each
+    /// execution (see [`Atomic::state`]).
+    state: Option<object::Ref<State>>,
+
+    /// Identity of a deferred cell, minted on first access and `0` until then.
+    ///
+    /// A real atomic, not a `Cell`: a `const` constructor exists to serve
+    /// `static`s, and a `static` is shared by every parallel exploration
+    /// worker at once (`model::check_parallel` spawns real OS threads). Minted
+    /// by compare-exchange so racing workers agree on a single identity —
+    /// were they instead to each cache their own execution's `object::Ref`
+    /// here, the loser of every race would re-register and fragment one cell's
+    /// history across several `State` objects.
+    ///
+    /// Identity rather than address is what makes moving a deferred cell
+    /// sound: `[AtomicUsize::const_new(0); N]` built in a `const` context and
+    /// then moved keeps its history, and a later cell reusing a freed address
+    /// mints a fresh id instead of inheriting a stale registration. That is
+    /// also why no `Drop` is needed to evict — a stale entry is unreachable by
+    /// construction, and dies at the next `reset_iteration`.
+    ///
+    /// Unused (and left `0`) for eagerly registered cells.
+    cell_id: std::sync::atomic::AtomicU64,
+
+    /// Initial value of a deferred cell, held until first access registers it.
+    ///
+    /// Carried as `u128` rather than `T` for two reasons: `Numeric::into_u128`
+    /// is a trait method and so not callable from a `const fn`, and storing a
+    /// bare `T` would cost `Atomic<*mut T>` the automatic `Send`/`Sync` that
+    /// `PhantomData<fn() -> T>` grants it. Unread when `state` is `Some`.
+    init: u128,
+
     _p: PhantomData<fn() -> T>,
 }
 
@@ -587,10 +631,104 @@ impl<T: Numeric> Atomic<T> {
             trace!(?state, "Atomic::new");
 
             Atomic {
-                state,
+                state: Some(state),
+                cell_id: std::sync::atomic::AtomicU64::new(0),
+                init: 0,
                 _p: PhantomData,
             }
         })
+    }
+
+    /// Create a cell in a `const` context, initialized to `init` (the value's
+    /// `u128` representation — the caller knows the concrete type and converts
+    /// with a `const`-callable cast, since `Numeric::into_u128` is a trait
+    /// method and cannot be one).
+    ///
+    /// Registration is *deferred* to the cell's first access in each execution
+    /// rather than performed here, which is what makes this constructor
+    /// `const`: registering means allocating a slot in the live execution's
+    /// object store, and a `const` context has no execution. Nothing observes
+    /// the difference — a cell no thread has touched has no stores for anyone
+    /// to read, so whether it is registered is not a property of the model.
+    ///
+    /// Deferring also *is* the per-execution reset that a `const`-initialized
+    /// `static` needs: `Execution::deferred_atomics` is cleared each
+    /// iteration, so the next one re-registers the cell at `init` instead of
+    /// inheriting its predecessor's stores.
+    ///
+    /// The genesis store of a deferred cell carries an **empty** causality
+    /// rather than the constructing thread's (`State::init_deferred`), which
+    /// is the truth for the case this constructor serves: a `const`-initialized
+    /// value is in the binary image, so every thread trivially happens-after
+    /// it. The cost is that a cell built here does not carry the
+    /// initialization-race check that [`Atomic::new`]'s thread-attributed
+    /// genesis provides, which is why `new` keeps that genesis and every
+    /// runtime construction keeps using it.
+    pub(crate) const fn const_new(init: u128) -> Atomic<T> {
+        Atomic {
+            state: None,
+            cell_id: std::sync::atomic::AtomicU64::new(0),
+            init,
+            _p: PhantomData,
+        }
+    }
+
+    /// This cell's registration in the *current* execution, registering it
+    /// first if this is a deferred cell's first access here.
+    ///
+    /// Every operation resolves through this rather than reading the field, so
+    /// a deferred cell is indistinguishable from an eager one from its first
+    /// touch onward. Must be called *outside* an `rt::execution` borrow — the
+    /// deferred path takes one itself, and the borrow is not reentrant.
+    #[inline]
+    fn state(&self) -> object::Ref<State> {
+        match self.state {
+            Some(state) => state,
+            None => self.register_deferred(),
+        }
+    }
+
+    /// Resolve — and on first access of this execution, create — the
+    /// registration of a deferred cell.
+    fn register_deferred(&self) -> object::Ref<State> {
+        let id = self.cell_id();
+
+        rt::execution(|execution| {
+            if let Some(&state) = execution.deferred_atomics.get(&id) {
+                return state;
+            }
+
+            let state = execution.objects.insert_with(State::shell, State::recycle);
+            state
+                .get_mut(&mut execution.objects)
+                .init_deferred(self.init);
+            execution.deferred_atomics.insert(id, state);
+
+            trace!(?state, id, "Atomic::register_deferred");
+
+            state
+        })
+    }
+
+    /// This cell's process-global identity, minting one if it has none.
+    ///
+    /// `compare_exchange` rather than `fetch_add`-and-store so that workers
+    /// racing on a shared `static` settle on exactly one identity; a loser
+    /// discards the id it minted (ids are cheap and need only be unique, not
+    /// dense) and adopts the winner's.
+    fn cell_id(&self) -> u64 {
+        use std::sync::atomic::Ordering::Relaxed;
+
+        match self.cell_id.load(Relaxed) {
+            0 => {
+                let fresh = NEXT_CELL_ID.fetch_add(1, Relaxed);
+                match self.cell_id.compare_exchange(0, fresh, Relaxed, Relaxed) {
+                    Ok(_) => fresh,
+                    Err(won) => won,
+                }
+            }
+            id => id,
+        }
     }
 
     /// Loads a value from the atomic cell.
@@ -600,8 +738,9 @@ impl<T: Numeric> Atomic<T> {
 
     /// Loads a value from the atomic cell without performing synchronization
     pub(crate) fn unsync_load(&self, location: Location) -> T {
+        let state_ref = self.state();
         rt::execution(|execution| {
-            let state = self.state.get_mut(&mut execution.objects);
+            let state = state_ref.get_mut(&mut execution.objects);
 
             state
                 .unsync_loaded_locations
@@ -610,7 +749,7 @@ impl<T: Numeric> Atomic<T> {
             // An unsync load counts as a "read" access
             state.track_unsync_load(&execution.threads);
 
-            trace!(state = ?self.state, "Atomic::unsync_load");
+            trace!(state = ?state_ref, "Atomic::unsync_load");
 
             // Compose the most recent value across every region.
             T::from_u128(state.newest_value())
@@ -648,17 +787,18 @@ impl<T: Numeric> Atomic<T> {
     /// of the lanes' readable sets — independent per-lane staleness — while the
     /// op stays one linearization point.
     pub(crate) fn load_masked(&self, location: Location, mask: u128, ordering: Ordering) -> u128 {
-        self.ensure_partition(mask);
-        self.branch(Action::Load(mask), location);
+        let state_ref = self.state();
+        self.ensure_partition(state_ref, mask);
+        self.branch(state_ref, Action::Load(mask), location);
 
         super::synchronize(|execution| {
-            let state = self.state.get_mut(&mut execution.objects);
+            let state = state_ref.get_mut(&mut execution.objects);
 
             state.loaded_locations.track(location, &execution.threads);
             // Validate memory safety (cell-wide).
             state.track_load(&execution.threads);
 
-            trace!(state = ?self.state, ?ordering, ?mask, "Atomic::load_masked");
+            trace!(state = ?state_ref, ?ordering, ?mask, "Atomic::load_masked");
 
             let covered = state.covered(mask);
             // `apply_floor = false`: `load_masked` is documented
@@ -706,16 +846,17 @@ impl<T: Numeric> Atomic<T> {
         mask: u128,
         ordering: Ordering,
     ) -> u128 {
-        self.ensure_partition(mask);
-        self.branch(Action::Load(mask), location);
+        let state_ref = self.state();
+        self.ensure_partition(state_ref, mask);
+        self.branch(state_ref, Action::Load(mask), location);
 
         super::synchronize(|execution| {
-            let state = self.state.get_mut(&mut execution.objects);
+            let state = state_ref.get_mut(&mut execution.objects);
 
             state.loaded_locations.track(location, &execution.threads);
             state.track_load(&execution.threads);
 
-            trace!(state = ?self.state, ?ordering, ?mask, "Atomic::load_coherent_lane");
+            trace!(state = ?state_ref, ?ordering, ?mask, "Atomic::load_coherent_lane");
 
             let covered = state.covered(mask);
             state.compose_load(
@@ -732,18 +873,19 @@ impl<T: Numeric> Atomic<T> {
     /// full store passes `FULL_MASK` and writes every region as one event
     /// (one shared SC position).
     pub(crate) fn store_masked(&self, location: Location, mask: u128, val: u128, ordering: Ordering) {
-        self.ensure_partition(mask);
-        self.branch(Action::Store(mask), location);
+        let state_ref = self.state();
+        self.ensure_partition(state_ref, mask);
+        self.branch(state_ref, Action::Store(mask), location);
 
         super::synchronize(|execution| {
-            let state = self.state.get_mut(&mut execution.objects);
+            let state = state_ref.get_mut(&mut execution.objects);
 
             state.stored_locations.track(location, &execution.threads);
             // An atomic store counts as a read access to the underlying memory
             // cell (cell-wide).
             state.track_store(&execution.threads);
 
-            trace!(state = ?self.state, ?ordering, ?mask, "Atomic::store_masked");
+            trace!(state = ?state_ref, ?ordering, ?mask, "Atomic::store_masked");
 
             // A SeqCst store is one event in S even when it spans regions: one
             // position, handed to each region so they share it. Likewise one
@@ -784,18 +926,19 @@ impl<T: Numeric> Atomic<T> {
     where
         F: FnOnce(u128) -> Result<u128, E>,
     {
-        self.ensure_partition(mask);
-        self.branch(Action::Rmw(mask), location);
+        let state_ref = self.state();
+        self.ensure_partition(state_ref, mask);
+        self.branch(state_ref, Action::Rmw(mask), location);
 
         super::synchronize(|execution| {
-            let state = self.state.get_mut(&mut execution.objects);
+            let state = state_ref.get_mut(&mut execution.objects);
 
             state.loaded_locations.track(location, &execution.threads);
             // Track the load is happening in order to ensure correct
             // synchronization to the underlying cell (cell-wide).
             state.track_load(&execution.threads);
 
-            trace!(state = ?self.state, ?success, ?failure, ?mask, "Atomic::rmw_masked");
+            trace!(state = ?state_ref, ?success, ?failure, ?mask, "Atomic::rmw_masked");
 
             // Read the current value: each covered region's RMW reads a
             // modification-order-maximal store (`match_rmw_to_stores`).
@@ -861,8 +1004,9 @@ impl<T: Numeric> Atomic<T> {
     ///
     /// `with_mut` must happen-after all stores to the cell.
     pub(crate) fn with_mut<R>(&mut self, location: Location, f: impl FnOnce(&mut T) -> R) -> R {
+        let state_ref = self.state();
         let value = super::execution(|execution| {
-            let state = self.state.get_mut(&mut execution.objects);
+            let state = state_ref.get_mut(&mut execution.objects);
 
             state
                 .unsync_mut_locations
@@ -871,7 +1015,7 @@ impl<T: Numeric> Atomic<T> {
             state.track_unsync_mut(&execution.threads);
             state.is_mutating = true;
 
-            trace!(state = ?self.state, "Atomic::with_mut");
+            trace!(state = ?state_ref, "Atomic::with_mut");
 
             // Compose the most recent value across every region.
             T::from_u128(state.newest_value())
@@ -904,15 +1048,20 @@ impl<T: Numeric> Atomic<T> {
         }
 
         // Unset on exit
-        let mut reset = Reset(value, self.state);
+        let mut reset = Reset(value, state_ref);
         f(&mut reset.0)
     }
 
-    fn branch(&self, action: Action, location: Location) {
-        let r = self.state;
-        r.branch_action(action, location);
+    fn branch(&self, state_ref: object::Ref<State>, action: Action, location: Location) {
+        state_ref.branch_action(action, location);
+        // Re-resolve rather than compare against the ref we were handed: the
+        // point of the check is that the algorithm under test has not written
+        // through an invalid pointer into *this cell's own memory*, so the
+        // second read must go back to the cell. For a deferred cell that means
+        // re-reading `cell_id` — a corrupted identity resolves to a different
+        // registration and trips the same assert.
         assert!(
-            r.ref_eq(self.state),
+            state_ref.ref_eq(self.state()),
             "Internal state mutated during branch. This is \
                 usually due to a bug in the algorithm being tested writing in \
                 an invalid memory location."
@@ -925,12 +1074,12 @@ impl<T: Numeric> Atomic<T> {
     /// lanes it touched, or a coarse-then-split record would leak the access
     /// into a disjoint lane and spuriously couple them. A full-width mask never
     /// splits, so it is skipped.
-    fn ensure_partition(&self, mask: u128) {
+    fn ensure_partition(&self, state_ref: object::Ref<State>, mask: u128) {
         if mask == FULL_MASK {
             return;
         }
         rt::execution(|execution| {
-            self.state
+            state_ref
                 .get_mut(&mut execution.objects)
                 .ensure_partition(mask);
         });
@@ -1003,6 +1152,44 @@ impl State {
         //
         // This is verified using `cell`.
         self.regions[0].store(threads, Synchronize::new(), value, Ordering::Release, None, 0);
+    }
+
+    /// Initialize a shell for a `const`-constructed cell, whose genesis store
+    /// precedes the execution rather than belonging to any thread in it.
+    ///
+    /// Differs from [`State::init`] in exactly the three places thread
+    /// attribution shows up, and nowhere else:
+    ///
+    /// - **No `track_unsync_mut`.** `init`'s call cannot fire any of its panic
+    ///   arms (every `*_at` vector was just zeroed), so its only effect there
+    ///   is to seed `unsync_mut_at` with the constructing thread's causality —
+    ///   the edge that makes a later unsynchronized access a reported race.
+    ///   A `const`-initialized value is in the binary image before any thread
+    ///   runs, so there is no such edge to record and leaving the vector empty
+    ///   is the accurate model, not a relaxation of one.
+    /// - **`touched_by` stays `0`.** No thread has seen the genesis store, so
+    ///   acquire fences and SC promotion correctly skip this cell until one
+    ///   does.
+    /// - **The genesis store carries an empty causality** and `creator` lane 0
+    ///   at tick 0 (`Region::store_pre_execution`), which makes it
+    ///   unconditionally modification-order-first — the correct C11 reading of
+    ///   an initialization, and strictly more accurate than a genesis whose
+    ///   `tick` is some thread's clock.
+    fn init_deferred(&mut self, value: u128) {
+        self.created_location = Location::default();
+        self.loaded_at = VersionVec::new();
+        self.loaded_locations = LocationSet::new();
+        self.unsync_loaded_at = VersionVec::new();
+        self.unsync_loaded_locations = LocationSet::new();
+        self.stored_at = VersionVec::new();
+        self.stored_locations = LocationSet::new();
+        self.unsync_mut_at = VersionVec::new();
+        self.unsync_mut_locations = LocationSet::new();
+        self.is_mutating = false;
+        self.op_clock = 0;
+        self.touched_by = 0;
+
+        self.regions[0].store_pre_execution(value);
     }
 
     /// Allocate the next store-op id for this cell. A wide op passes the same
@@ -1722,6 +1909,44 @@ impl Region {
                 None => resolved.push((op_id, seen)),
             }
         }
+    }
+
+    /// Plant the genesis store of a `const`-constructed cell: an
+    /// initialization that precedes the execution and belongs to no thread.
+    ///
+    /// Every field that `store` would derive from the active thread is instead
+    /// the empty/neutral value, and the effects `store` has on thread state
+    /// (`sync_store`, `first_seen.touch`) are simply absent — there is no
+    /// thread to have released or seen anything.
+    ///
+    /// `creator: 0` with an empty `happens_before` gives `tick() == 0`, so
+    /// `mo_before(genesis, x)` holds for every other store `x` and
+    /// `mo_before(x, genesis)` for none: the initialization is
+    /// modification-order-first, unconditionally and by construction. That is
+    /// what C11 says an initialization is, and it is why lane 0 being a real
+    /// thread's lane is harmless — a real store's `tick()` is its creator's
+    /// own clock, which `thread::Set` has already advanced past 0.
+    fn store_pre_execution(&mut self, value: u128) {
+        debug_assert_eq!(
+            self.cnt, 0,
+            "pre-execution genesis into a region that already has stores"
+        );
+
+        self.stores[0] = Store {
+            value,
+            happens_before: VersionVec::new(),
+            modification_order: VersionVec::new(),
+            id: 0,
+            op_id: 0,
+            creator: 0,
+            rmw_read: None,
+            sync: Synchronize::new(),
+            // Untouched: no thread has seen this store yet, including the one
+            // that will read it first.
+            first_seen: FirstSeen::new(),
+            sc_rank: None,
+        };
+        self.cnt = 1;
     }
 
     fn store(

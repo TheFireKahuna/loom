@@ -22,6 +22,24 @@ macro_rules! atomic_int {
                 Self(Atomic::new(v, location!()))
             }
 
+            #[doc = concat!(
+                " Creates a new instance of `", stringify!($name), "` in a `const` context.\n\n\
+                 Unlike [`new`](Self::new), which registers the cell with the running \
+                 model execution immediately, this defers registration to the cell's \
+                 first access in each execution — which is what makes it `const`, and \
+                 what gives a `const`-initialized `static` a fresh cell every iteration.\n\n\
+                 The initialization is modelled as preceding the execution (every thread \
+                 happens-after it), which is the truth for a value in the binary image. \
+                 A cell built at *runtime* should use [`new`](Self::new), whose \
+                 thread-attributed genesis additionally detects an unsynchronized \
+                 publication of the cell itself.",
+            )]
+            pub const fn const_new(v: $int_type) -> Self {
+                // Sign-extending for the signed types, exactly as
+                // `Numeric::into_u128` does for them.
+                Self(Atomic::const_new(v as u128))
+            }
+
             /// Get access to a mutable reference to the inner value.
             #[track_caller]
             pub fn with_mut<R>(&mut self, f: impl FnOnce(&mut $int_type) -> R) -> R {
