@@ -5,15 +5,10 @@ use std::sync::atomic::Ordering;
 
 #[rustfmt::skip] // rustfmt cannot properly format multi-line concat!.
 macro_rules! atomic_int {
+    // Constructed cells: the default backing caches its registration inline,
+    // so it is wider than `$int_type` and must be built by a constructor.
     ($name: ident, $int_type: ty) => {
-        #[doc = concat!(
-            " Mock implementation of `std::sync::atomic::", stringify!($name), "`.\n\n\
-             NOTE: Unlike `std::sync::atomic::", stringify!($name), "`, \
-             this type has a different in-memory representation than `",
-             stringify!($int_type), "`.",
-        )]
-        #[derive(Debug)]
-        pub struct $name(Atomic<$int_type>);
+        atomic_int!(@ops $name, $int_type, Atomic<$int_type>);
 
         impl $name {
             #[doc = concat!(" Creates a new instance of `", stringify!($name), "`.")]
@@ -39,7 +34,53 @@ macro_rules! atomic_int {
                 // `Numeric::into_u128` does for them.
                 Self(Atomic::const_new(v as u128))
             }
+        }
 
+        impl Default for $name {
+            fn default() -> Self {
+                Self::new(Default::default())
+            }
+        }
+
+        impl From<$int_type> for $name {
+            fn from(v: $int_type) -> Self {
+                Self::new(v)
+            }
+        }
+    };
+
+    // Materialized cells: the backing is nothing but an identity word, so the
+    // cell matches `$int_type`'s layout and is reinterpretable from zeroed
+    // memory. No constructor — `ZEROED` is the only way to name one, and it is
+    // the all-zeroes bit pattern.
+    (@materialized $name: ident, $int_type: ty, $backing: ty) => {
+        atomic_int!(@ops $name, $int_type, $backing);
+
+        impl $name {
+            #[doc = concat!(
+                " An unregistered `", stringify!($name), "` holding zero.\n\n\
+                 Bit-identical to `", stringify!($int_type), "`'s all-zeroes pattern, so a \
+                 zeroed region of memory is a valid array of these.",
+            )]
+            pub const ZEROED: Self = Self(<$backing>::zeroed());
+        }
+
+        impl Default for $name {
+            fn default() -> Self {
+                Self::ZEROED
+            }
+        }
+    };
+
+    (@ops $name: ident, $int_type: ty, $backing: ty) => {
+        #[doc = concat!(
+            " Mock implementation of `std::sync::atomic::", stringify!($name), "`.",
+        )]
+        #[derive(Debug)]
+        #[repr(transparent)]
+        pub struct $name($backing);
+
+        impl $name {
             /// Get access to a mutable reference to the inner value.
             #[track_caller]
             pub fn with_mut<R>(&mut self, f: impl FnOnce(&mut $int_type) -> R) -> R {
@@ -254,17 +295,6 @@ macro_rules! atomic_int {
             }
         }
 
-        impl Default for $name {
-            fn default() -> Self {
-                Self::new(Default::default())
-            }
-        }
-
-        impl From<$int_type> for $name {
-            fn from(v: $int_type) -> Self {
-                Self::new(v)
-            }
-        }
     };
 }
 

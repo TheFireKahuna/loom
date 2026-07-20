@@ -12,7 +12,7 @@ mod arc;
 pub(crate) use self::arc::Arc;
 
 mod atomic;
-pub(crate) use self::atomic::{fence, Atomic};
+pub(crate) use self::atomic::{fence, Atomic, CellId, CellId16, ModelOps, FULL_MASK};
 
 pub(crate) mod cell;
 pub(crate) use self::cell::Cell;

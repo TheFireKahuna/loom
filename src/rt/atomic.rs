@@ -190,7 +190,7 @@ use std::u16;
 use tracing::trace;
 
 /// Mask of a full-width access: every bit of the 128-bit cell.
-const FULL_MASK: u128 = u128::MAX;
+pub(crate) const FULL_MASK: u128 = u128::MAX;
 
 /// Source of `Atomic::cell_id` values. Process-global and monotone, so one
 /// identity is valid across every execution and every parallel worker. Zero is
@@ -240,6 +240,166 @@ pub(crate) struct Atomic<T> {
     init: u128,
 
     _p: PhantomData<fn() -> T>,
+}
+
+/// A cell that can name its registration in the *current* execution.
+///
+/// The C11 model below — regions, modification order, SC promotion, RMW
+/// atomicity — is written once against a resolved [`object::Ref<State>`] and
+/// is reached only through this trait. What differs between cell
+/// representations is how identity is established, never what the operations
+/// mean: an eagerly registered cell hands back a cached ref, a deferred one
+/// resolves through `Execution::deferred_atomics`.
+///
+/// `resolve` is called *outside* any `rt::execution` borrow, and may be called
+/// more than once per operation — `branch` re-resolves on purpose, to check
+/// that the algorithm under test has not written through an invalid pointer
+/// into the cell's own memory.
+pub(super) trait Resolve {
+    fn resolve(&self) -> object::Ref<State>;
+}
+
+impl<T: Numeric> Resolve for Atomic<T> {
+    #[inline]
+    fn resolve(&self) -> object::Ref<State> {
+        self.state()
+    }
+}
+
+/// A cell whose entire in-memory representation is its identity word.
+///
+/// No inline value and no cached registration, so `size_of` and `align_of`
+/// match the modelled integer and **a zeroed region is a valid, unregistered
+/// cell holding zero**. That is what lets memory obtained the way production
+/// obtains it — demand-committed VA handed out as slots — be modelled as it
+/// actually is, rather than the checker build substituting a differently
+/// shaped allocation it can construct.
+///
+/// The cost relative to [`Atomic`] is that every operation resolves through
+/// `Execution::deferred_atomics`: there is nowhere to cache a ref.
+#[derive(Debug)]
+#[repr(transparent)]
+pub(crate) struct CellId(std::sync::atomic::AtomicU64);
+
+impl CellId {
+    /// The unregistered state, which is also the all-zeroes bit pattern.
+    pub(crate) const ZEROED: CellId = CellId(std::sync::atomic::AtomicU64::new(0));
+}
+
+impl Resolve for CellId {
+    fn resolve(&self) -> object::Ref<State> {
+        register(mint_id(&self.0), 0)
+    }
+}
+
+/// [`CellId`] at the size and alignment of a 128-bit integer.
+///
+/// The identity is still one word; the rest is padding. A distinct type rather
+/// than a const-generic parameter because `repr(align(N))` takes a literal.
+#[derive(Debug)]
+#[repr(C, align(16))]
+pub(crate) struct CellId16 {
+    id: std::sync::atomic::AtomicU64,
+    _pad: u64,
+}
+
+impl CellId16 {
+    /// The unregistered state, which is also the all-zeroes bit pattern.
+    pub(crate) const ZEROED: CellId16 = CellId16 {
+        id: std::sync::atomic::AtomicU64::new(0),
+        _pad: 0,
+    };
+}
+
+impl Resolve for CellId16 {
+    fn resolve(&self) -> object::Ref<State> {
+        register(mint_id(&self.id), 0)
+    }
+}
+
+// The property the materialized representation exists to provide. If these
+// ever stop holding, a cell can no longer be reinterpreted from a zeroed
+// region and the representation is pointless — so they are asserted, not
+// documented.
+const _: () = {
+    use std::mem::{align_of, size_of};
+
+    assert!(size_of::<CellId>() == size_of::<u64>());
+    assert!(align_of::<CellId>() == align_of::<u64>());
+    assert!(size_of::<CellId16>() == size_of::<u128>());
+    assert!(align_of::<CellId16>() == align_of::<u128>());
+};
+
+/// A cell's process-global identity, minting one if it has none.
+///
+/// `compare_exchange` rather than `fetch_add`-and-store so that workers racing
+/// on a shared cell settle on exactly one identity; a loser discards the id it
+/// minted (ids are cheap and need only be unique, not dense) and adopts the
+/// winner's.
+fn mint_id(slot: &std::sync::atomic::AtomicU64) -> u64 {
+    use std::sync::atomic::Ordering::Relaxed;
+
+    match slot.load(Relaxed) {
+        0 => {
+            let fresh = NEXT_CELL_ID.fetch_add(1, Relaxed);
+            match slot.compare_exchange(0, fresh, Relaxed, Relaxed) {
+                Ok(_) => fresh,
+                Err(won) => won,
+            }
+        }
+        id => id,
+    }
+}
+
+/// Resolve — and on first access of this execution, create — the registration
+/// of the cell with identity `id`, whose value before any store is `init`.
+fn register(id: u64, init: u128) -> object::Ref<State> {
+    rt::execution(|execution| {
+        if let Some(&state) = execution.deferred_atomics.get(&id) {
+            return state;
+        }
+
+        let state = execution.objects.insert_with(State::shell, State::recycle);
+        state.get_mut(&mut execution.objects).init_deferred(init);
+        execution.deferred_atomics.insert(id, state);
+
+        trace!(?state, id, "atomic::register");
+
+        state
+    })
+}
+
+/// The C11 model, written once over any [`Resolve`]able cell.
+///
+/// These are the width-agnostic (`u128`) operations: every typed entry point
+/// — `Atomic<T>`'s `load`/`store`/`rmw`, the lane views, and any other cell
+/// representation — reduces to one of these. Keeping a single implementation
+/// is what stops two representations from drifting apart on the parts that
+/// actually carry the semantics: region partitioning, modification order, SC
+/// promotion, and RMW atomicity.
+pub(crate) trait ModelOps {
+    fn load_masked(&self, location: Location, mask: u128, ordering: Ordering) -> u128;
+
+    fn load_coherent_lane(&self, location: Location, mask: u128, ordering: Ordering) -> u128;
+
+    fn store_masked(&self, location: Location, mask: u128, val: u128, ordering: Ordering);
+
+    fn rmw_masked<F, E>(
+        &self,
+        location: Location,
+        mask: u128,
+        success: Ordering,
+        failure: Ordering,
+        f: F,
+    ) -> Result<u128, E>
+    where
+        F: FnOnce(u128) -> Result<u128, E>;
+
+    /// Read the composed newest value with no synchronization.
+    fn unsync_load(&self, location: Location) -> u128;
+
+    /// Access the newest value mutably. Must happen-after all stores.
+    fn with_mut<R>(&mut self, location: Location, f: impl FnOnce(&mut u128) -> R) -> R;
 }
 
 #[derive(Debug)]
@@ -691,93 +851,12 @@ impl<T: Numeric> Atomic<T> {
     /// Resolve — and on first access of this execution, create — the
     /// registration of a deferred cell.
     fn register_deferred(&self) -> object::Ref<State> {
-        let id = self.cell_id();
-
-        rt::execution(|execution| {
-            if let Some(&state) = execution.deferred_atomics.get(&id) {
-                return state;
-            }
-
-            let state = execution.objects.insert_with(State::shell, State::recycle);
-            state
-                .get_mut(&mut execution.objects)
-                .init_deferred(self.init);
-            execution.deferred_atomics.insert(id, state);
-
-            trace!(?state, id, "Atomic::register_deferred");
-
-            state
-        })
+        register(mint_id(&self.cell_id), self.init)
     }
 
-    /// This cell's process-global identity, minting one if it has none.
-    ///
-    /// `compare_exchange` rather than `fetch_add`-and-store so that workers
-    /// racing on a shared `static` settle on exactly one identity; a loser
-    /// discards the id it minted (ids are cheap and need only be unique, not
-    /// dense) and adopts the winner's.
-    fn cell_id(&self) -> u64 {
-        use std::sync::atomic::Ordering::Relaxed;
+}
 
-        match self.cell_id.load(Relaxed) {
-            0 => {
-                let fresh = NEXT_CELL_ID.fetch_add(1, Relaxed);
-                match self.cell_id.compare_exchange(0, fresh, Relaxed, Relaxed) {
-                    Ok(_) => fresh,
-                    Err(won) => won,
-                }
-            }
-            id => id,
-        }
-    }
-
-    /// Loads a value from the atomic cell.
-    pub(crate) fn load(&self, location: Location, ordering: Ordering) -> T {
-        T::from_u128(self.load_masked(location, FULL_MASK, ordering))
-    }
-
-    /// Loads a value from the atomic cell without performing synchronization
-    pub(crate) fn unsync_load(&self, location: Location) -> T {
-        let state_ref = self.state();
-        rt::execution(|execution| {
-            let state = state_ref.get_mut(&mut execution.objects);
-
-            state
-                .unsync_loaded_locations
-                .track(location, &execution.threads);
-
-            // An unsync load counts as a "read" access
-            state.track_unsync_load(&execution.threads);
-
-            trace!(state = ?state_ref, "Atomic::unsync_load");
-
-            // Compose the most recent value across every region.
-            T::from_u128(state.newest_value())
-        })
-    }
-
-    /// Stores a value into the atomic cell.
-    pub(crate) fn store(&self, location: Location, val: T, ordering: Ordering) {
-        self.store_masked(location, FULL_MASK, val.into_u128(), ordering)
-    }
-
-    /// Read-modify-write over the full cell.
-    pub(crate) fn rmw<F, E>(
-        &self,
-        location: Location,
-        success: Ordering,
-        failure: Ordering,
-        f: F,
-    ) -> Result<T, E>
-    where
-        F: FnOnce(T) -> Result<T, E>,
-    {
-        self.rmw_masked(location, FULL_MASK, success, failure, |num| {
-            f(T::from_u128(num)).map(T::into_u128)
-        })
-        .map(T::from_u128)
-    }
-
+impl<C: Resolve + ?Sized> ModelOps for C {
     /// Loads only the bits under `mask` (other bits returned as zero). A full
     /// load passes `FULL_MASK` and composes every region.
     ///
@@ -786,10 +865,10 @@ impl<T: Numeric> Atomic<T> {
     /// `push_load`/`branch_load` pair, so exploration walks the cross-product
     /// of the lanes' readable sets — independent per-lane staleness — while the
     /// op stays one linearization point.
-    pub(crate) fn load_masked(&self, location: Location, mask: u128, ordering: Ordering) -> u128 {
-        let state_ref = self.state();
-        self.ensure_partition(state_ref, mask);
-        self.branch(state_ref, Action::Load(mask), location);
+    fn load_masked(&self, location: Location, mask: u128, ordering: Ordering) -> u128 {
+        let state_ref = self.resolve();
+        ensure_partition(state_ref, mask);
+        branch(self, state_ref, Action::Load(mask), location);
 
         super::synchronize(|execution| {
             let state = state_ref.get_mut(&mut execution.objects);
@@ -840,15 +919,10 @@ impl<T: Numeric> Atomic<T> {
     /// own value — a wide store — carries `FULL_MASK` and is already dependent
     /// on this region. Reading only the lane's own regions is what preserves
     /// the pruning (2) grants (module docs, "Sub-word sub-locations").
-    pub(crate) fn load_coherent_lane(
-        &self,
-        location: Location,
-        mask: u128,
-        ordering: Ordering,
-    ) -> u128 {
-        let state_ref = self.state();
-        self.ensure_partition(state_ref, mask);
-        self.branch(state_ref, Action::Load(mask), location);
+    fn load_coherent_lane(&self, location: Location, mask: u128, ordering: Ordering) -> u128 {
+        let state_ref = self.resolve();
+        ensure_partition(state_ref, mask);
+        branch(self, state_ref, Action::Load(mask), location);
 
         super::synchronize(|execution| {
             let state = state_ref.get_mut(&mut execution.objects);
@@ -872,10 +946,10 @@ impl<T: Numeric> Atomic<T> {
     /// Stores `val`'s masked bits, leaving the rest of the cell untouched. A
     /// full store passes `FULL_MASK` and writes every region as one event
     /// (one shared SC position).
-    pub(crate) fn store_masked(&self, location: Location, mask: u128, val: u128, ordering: Ordering) {
-        let state_ref = self.state();
-        self.ensure_partition(state_ref, mask);
-        self.branch(state_ref, Action::Store(mask), location);
+    fn store_masked(&self, location: Location, mask: u128, val: u128, ordering: Ordering) {
+        let state_ref = self.resolve();
+        ensure_partition(state_ref, mask);
+        branch(self, state_ref, Action::Store(mask), location);
 
         super::synchronize(|execution| {
             let state = state_ref.get_mut(&mut execution.objects);
@@ -915,7 +989,7 @@ impl<T: Numeric> Atomic<T> {
     /// others zero) and returns the new full value; only the covered regions'
     /// bits are written, all as one linearization point sharing one SC
     /// position. A full RMW passes `FULL_MASK`.
-    pub(crate) fn rmw_masked<F, E>(
+    fn rmw_masked<F, E>(
         &self,
         location: Location,
         mask: u128,
@@ -926,9 +1000,9 @@ impl<T: Numeric> Atomic<T> {
     where
         F: FnOnce(u128) -> Result<u128, E>,
     {
-        let state_ref = self.state();
-        self.ensure_partition(state_ref, mask);
-        self.branch(state_ref, Action::Rmw(mask), location);
+        let state_ref = self.resolve();
+        ensure_partition(state_ref, mask);
+        branch(self, state_ref, Action::Rmw(mask), location);
 
         super::synchronize(|execution| {
             let state = state_ref.get_mut(&mut execution.objects);
@@ -1000,11 +1074,27 @@ impl<T: Numeric> Atomic<T> {
         })
     }
 
-    /// Access a mutable reference to value most recently stored.
-    ///
-    /// `with_mut` must happen-after all stores to the cell.
-    pub(crate) fn with_mut<R>(&mut self, location: Location, f: impl FnOnce(&mut T) -> R) -> R {
-        let state_ref = self.state();
+    fn unsync_load(&self, location: Location) -> u128 {
+        let state_ref = self.resolve();
+        rt::execution(|execution| {
+            let state = state_ref.get_mut(&mut execution.objects);
+
+            state
+                .unsync_loaded_locations
+                .track(location, &execution.threads);
+
+            // An unsync load counts as a "read" access
+            state.track_unsync_load(&execution.threads);
+
+            trace!(state = ?state_ref, "Atomic::unsync_load");
+
+            // Compose the most recent value across every region.
+            state.newest_value()
+        })
+    }
+
+    fn with_mut<R>(&mut self, location: Location, f: impl FnOnce(&mut u128) -> R) -> R {
+        let state_ref = self.resolve();
         let value = super::execution(|execution| {
             let state = state_ref.get_mut(&mut execution.objects);
 
@@ -1018,12 +1108,12 @@ impl<T: Numeric> Atomic<T> {
             trace!(state = ?state_ref, "Atomic::with_mut");
 
             // Compose the most recent value across every region.
-            T::from_u128(state.newest_value())
+            state.newest_value()
         });
 
-        struct Reset<T: Numeric>(T, object::Ref<State>);
+        struct Reset(u128, object::Ref<State>);
 
-        impl<T: Numeric> Drop for Reset<T> {
+        impl Drop for Reset {
             fn drop(&mut self) {
                 super::execution(|execution| {
                     let state = self.1.get_mut(&mut execution.objects);
@@ -1034,7 +1124,7 @@ impl<T: Numeric> Atomic<T> {
 
                     // The value may have been mutated, so it must be placed
                     // back into every region (masked to each region's bits).
-                    let val = T::into_u128(self.0);
+                    let val = self.0;
                     for region in &mut state.regions {
                         let index = index(region.cnt - 1);
                         region.stores[index].value = val;
@@ -1051,39 +1141,46 @@ impl<T: Numeric> Atomic<T> {
         let mut reset = Reset(value, state_ref);
         f(&mut reset.0)
     }
+}
 
-    fn branch(&self, state_ref: object::Ref<State>, action: Action, location: Location) {
-        state_ref.branch_action(action, location);
-        // Re-resolve rather than compare against the ref we were handed: the
-        // point of the check is that the algorithm under test has not written
-        // through an invalid pointer into *this cell's own memory*, so the
-        // second read must go back to the cell. For a deferred cell that means
-        // re-reading `cell_id` — a corrupted identity resolves to a different
-        // registration and trips the same assert.
-        assert!(
-            state_ref.ref_eq(self.state()),
-            "Internal state mutated during branch. This is \
-                usually due to a bug in the algorithm being tested writing in \
-                an invalid memory location."
-        );
-    }
+/// Register the operation's DPOR branch, then check the algorithm under test
+/// has not written through an invalid pointer into the cell's own memory.
+fn branch<C: Resolve + ?Sized>(
+    cell: &C,
+    state_ref: object::Ref<State>,
+    action: Action,
+    location: Location,
+) {
+    state_ref.branch_action(action, location);
+    // Re-resolve rather than compare against the ref we were handed: the point
+    // of the check is that the algorithm under test has not written through an
+    // invalid pointer into *this cell's own memory*, so the second read must go
+    // back to the cell. For a deferred cell that means re-reading `cell_id` — a
+    // corrupted identity resolves to a different registration and trips the
+    // same assert.
+    assert!(
+        state_ref.ref_eq(cell.resolve()),
+        "Internal state mutated during branch. This is \
+            usually due to a bug in the algorithm being tested writing in \
+            an invalid memory location."
+    );
+}
 
-    /// Refine the region partition to `mask` **before** the DPOR branch, so
-    /// `set_last_access` records the access on the final per-lane regions — the
-    /// mask-intersection pruning needs each op's record scoped to exactly the
-    /// lanes it touched, or a coarse-then-split record would leak the access
-    /// into a disjoint lane and spuriously couple them. A full-width mask never
-    /// splits, so it is skipped.
-    fn ensure_partition(&self, state_ref: object::Ref<State>, mask: u128) {
-        if mask == FULL_MASK {
-            return;
-        }
-        rt::execution(|execution| {
-            state_ref
-                .get_mut(&mut execution.objects)
-                .ensure_partition(mask);
-        });
+/// Refine the region partition to `mask` **before** the DPOR branch, so
+/// `set_last_access` records the access on the final per-lane regions — the
+/// mask-intersection pruning needs each op's record scoped to exactly the lanes
+/// it touched, or a coarse-then-split record would leak the access into a
+/// disjoint lane and spuriously couple them. A full-width mask never splits, so
+/// it is skipped.
+fn ensure_partition(state_ref: object::Ref<State>, mask: u128) {
+    if mask == FULL_MASK {
+        return;
     }
+    rt::execution(|execution| {
+        state_ref
+            .get_mut(&mut execution.objects)
+            .ensure_partition(mask);
+    });
 }
 
 // ===== impl State =====

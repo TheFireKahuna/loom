@@ -1,12 +1,41 @@
 use crate::rt;
 
+use std::marker::PhantomData;
 use std::sync::atomic::Ordering;
 
+/// The typed façade over a modelled cell.
+///
+/// `B` is the cell's in-memory representation. It carries no model semantics —
+/// those live once in `rt::ModelOps` — only how the cell names its
+/// registration, which is what decides its layout:
+///
+/// - [`rt::Atomic<T>`] (the default) caches a registration inline, so it is
+///   wider than `T` and must be built by a constructor.
+/// - [`rt::CellId`] / [`rt::CellId16`] are nothing but an identity word, so
+///   they match `T`'s size and alignment and a zeroed region is a valid,
+///   unregistered cell holding zero.
+///
+/// Everything below is numeric conversion, written once and shared by both.
 #[derive(Debug)]
-pub(crate) struct Atomic<T> {
+#[repr(transparent)]
+pub(crate) struct Atomic<T, B = rt::Atomic<T>> {
     /// Atomic object
-    state: rt::Atomic<T>,
+    state: B,
+    _p: PhantomData<fn() -> T>,
 }
+
+// A materialized cell must be layout-identical to the integer it models, or it
+// cannot be reinterpreted from a zeroed region. The façade adds only a
+// `PhantomData`, so this holds exactly when the backing's does — asserted here
+// because it is the façade that consumers name.
+const _: () = {
+    use std::mem::{align_of, size_of};
+
+    assert!(size_of::<Atomic<u64, rt::CellId>>() == size_of::<u64>());
+    assert!(align_of::<Atomic<u64, rt::CellId>>() == align_of::<u64>());
+    assert!(size_of::<Atomic<u128, rt::CellId16>>() == size_of::<u128>());
+    assert!(align_of::<Atomic<u128, rt::CellId16>>() == align_of::<u128>());
+};
 
 impl<T> Atomic<T>
 where
@@ -15,7 +44,10 @@ where
     pub(crate) fn new(value: T, location: rt::Location) -> Atomic<T> {
         let state = rt::Atomic::new(value, location);
 
-        Atomic { state }
+        Atomic {
+            state,
+            _p: PhantomData,
+        }
     }
 
     /// `const` constructor — see [`rt::Atomic::const_new`]. `init` is the
@@ -29,17 +61,44 @@ where
     pub(crate) const fn const_new(init: u128) -> Atomic<T> {
         Atomic {
             state: rt::Atomic::const_new(init),
+            _p: PhantomData,
         }
     }
+}
 
+impl<T> Atomic<T, rt::CellId> {
+    /// The unregistered cell, which is also the all-zeroes bit pattern.
+    pub(crate) const fn zeroed() -> Self {
+        Atomic {
+            state: rt::CellId::ZEROED,
+            _p: PhantomData,
+        }
+    }
+}
+
+impl<T> Atomic<T, rt::CellId16> {
+    /// The unregistered cell, which is also the all-zeroes bit pattern.
+    pub(crate) const fn zeroed() -> Self {
+        Atomic {
+            state: rt::CellId16::ZEROED,
+            _p: PhantomData,
+        }
+    }
+}
+
+impl<T, B> Atomic<T, B>
+where
+    T: rt::Numeric,
+    B: rt::ModelOps,
+{
     #[track_caller]
     pub(crate) unsafe fn unsync_load(&self) -> T {
-        self.state.unsync_load(location!())
+        T::from_u128(self.state.unsync_load(location!()))
     }
 
     #[track_caller]
     pub(crate) fn load(&self, order: Ordering) -> T {
-        self.state.load(location!(), order)
+        T::from_u128(self.state.load_masked(location!(), rt::FULL_MASK, order))
     }
 
     /// Sub-word load: reads only the bits under `mask` (other bits zero). The
@@ -68,7 +127,8 @@ where
 
     #[track_caller]
     pub(crate) fn store(&self, value: T, order: Ordering) {
-        self.state.store(location!(), value, order)
+        self.state
+            .store_masked(location!(), rt::FULL_MASK, value.into_u128(), order)
     }
 
     /// Sub-word store: writes only the bits under `mask`, leaving the rest of
@@ -83,7 +143,12 @@ where
 
     #[track_caller]
     pub(crate) fn with_mut<R>(&mut self, f: impl FnOnce(&mut T) -> R) -> R {
-        self.state.with_mut(location!(), f)
+        self.state.with_mut(location!(), |raw| {
+            let mut value = T::from_u128(*raw);
+            let r = f(&mut value);
+            *raw = value.into_u128();
+            r
+        })
     }
 
     /// Read-modify-write
@@ -102,7 +167,11 @@ where
     where
         F: FnOnce(T) -> Result<T, E>,
     {
-        self.state.rmw(location!(), success, failure, f)
+        self.state
+            .rmw_masked(location!(), rt::FULL_MASK, success, failure, |num| {
+                f(T::from_u128(num)).map(T::into_u128)
+            })
+            .map(T::from_u128)
     }
 
     #[track_caller]

@@ -7,12 +7,16 @@ use self::atomic::Atomic;
 mod bool;
 pub use self::bool::AtomicBool;
 
+// `atomic_int!` is shared with `materialized`, which is declared after it.
+#[macro_use]
 mod int;
 pub use self::int::{AtomicI16, AtomicI32, AtomicI8, AtomicIsize};
 pub use self::int::{AtomicU16, AtomicU32, AtomicU8, AtomicUsize};
 
 mod lane;
 pub use self::lane::{LaneU32Of64, LaneU32Of128, LaneU64Of128};
+
+pub mod materialized;
 
 #[cfg(target_has_atomic = "64")]
 pub use self::int::{AtomicI64, AtomicU64};
