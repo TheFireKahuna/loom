@@ -756,6 +756,16 @@ pub(super) struct State {
     spares: Vec<Region>,
 }
 
+/// The wide-op visibility a multi-region load has fixed so far: one
+/// `(op_id, seen)` per op the regions already resolved speak for.
+///
+/// The walk carries a single buffer and treats it as a stack — a candidate
+/// pushes what it implies, is tested, and winds back — so a rejected prefix
+/// costs no copy. Sized inline for the structural worst case, one entry per
+/// live store of every region of a 32-bit-laned 128-bit cell, so that
+/// push/truncate never reaches the allocator on the lookahead's hot path.
+type Resolved = SmallVec<[(u64, bool); MAX_ATOMIC_HISTORY * 4]>;
+
 /// The reader-side state a multi-region load filters its candidates against.
 ///
 /// A wide load resolves one region at a time, and `Region::load` *changes* what
@@ -1680,7 +1690,7 @@ impl State {
         apply_floor: bool,
     ) -> u128 {
         let multi = covered.len() > 1;
-        let mut resolved: SmallVec<[(u64, bool); 8]> = SmallVec::new();
+        let mut resolved = Resolved::new();
         let mut result = 0u128;
 
         for (k, &ri) in covered.iter().enumerate() {
@@ -1730,24 +1740,30 @@ impl State {
                     let mut w = 0;
                     for r in 0..n {
                         let ci = seed[r] as usize;
-                        if !self.regions[ri].is_consistent(ci, &resolved) {
+
+                        // The prefix is a stack: extend it for this candidate,
+                        // test, wind back. Nothing is committed here — the walk
+                        // extends `resolved` for real only once `branch_load`
+                        // has chosen.
+                        let mark = resolved.len();
+                        if !self.regions[ri].try_resolve(ci, &mut resolved) {
                             continue;
                         }
-                        if !rest.is_empty() {
-                            let mut next: SmallVec<[(u64, bool); 8]> =
-                                SmallVec::from_slice(&resolved);
-                            self.regions[ri].record_resolutions(ci, &mut next);
+                        let complete = rest.is_empty() || {
                             let next_view = view.extend(&self.regions[ri], ri, ci, ordering);
-                            if !self.has_consistent_completion(
+                            self.has_consistent_completion(
                                 rest,
                                 threads,
                                 ordering,
                                 apply_floor,
-                                &next,
+                                &mut resolved,
                                 &next_view,
-                            ) {
-                                continue;
-                            }
+                            )
+                        };
+                        resolved.truncate(mark);
+
+                        if !complete {
+                            continue;
                         }
                         seed[w] = seed[r];
                         w += 1;
@@ -1767,7 +1783,13 @@ impl State {
 
             let index = path.branch_load();
             if multi {
-                self.regions[ri].record_resolutions(index, &mut resolved);
+                // The chosen candidate is one the filter above passed — a
+                // replayed path replays a seed that same filter recorded — so
+                // it agrees with the prefix by construction.
+                assert!(
+                    self.regions[ri].try_resolve(index, &mut resolved),
+                    "[loom internal bug] wide load committed to an inconsistent store"
+                );
             }
             let mask_ri = self.regions[ri].mask;
             let v = self.regions[ri].load(threads, index, ordering);
@@ -1793,7 +1815,7 @@ impl State {
         threads: &thread::Set,
         ordering: Ordering,
         apply_floor: bool,
-        resolved: &[(u64, bool)],
+        resolved: &mut Resolved,
         view: &LoadView,
     ) -> bool {
         let Some((&rj, tail)) = rest.split_first() else {
@@ -1813,23 +1835,27 @@ impl State {
 
         for r in 0..n {
             let ci = seed[r] as usize;
-            if !self.regions[rj].is_consistent(ci, resolved) {
+
+            let mark = resolved.len();
+            if !self.regions[rj].try_resolve(ci, resolved) {
                 continue;
             }
             if tail.is_empty() {
+                resolved.truncate(mark);
                 return true;
             }
-            let mut next: SmallVec<[(u64, bool); 8]> = SmallVec::from_slice(resolved);
-            self.regions[rj].record_resolutions(ci, &mut next);
             let next_view = view.extend(&self.regions[rj], rj, ci, ordering);
-            if self.has_consistent_completion(
+            let complete = self.has_consistent_completion(
                 tail,
                 threads,
                 ordering,
                 apply_floor,
-                &next,
+                resolved,
                 &next_view,
-            ) {
+            );
+            resolved.truncate(mark);
+
+            if complete {
                 return true;
             }
         }
@@ -1873,7 +1899,7 @@ impl State {
         let region = &self.regions[ri];
         let mut w = 0;
 
-        // `op_seen_through_other_region` is an O(regions x stores^2) sweep whose
+        // `op_seen_through_other_region` is an O(regions x stores) sweep whose
         // answer depends only on the floor slot (`f.op_id` is a function of
         // `f_idx` — one region holds one store per op). The candidate loop
         // re-asks it for the same floors up to `n` times, so resolve each slot
@@ -1919,8 +1945,7 @@ impl State {
     /// True when the active thread has observed whole-cell op `op_id` through
     /// some region other than `ri` — i.e. that region holds a store `g` the
     /// thread has *seen* (loaded or itself created; `first_seen`) which is
-    /// op `op_id`'s sibling there or modification-order-after it
-    /// (`Region::sees_op`).
+    /// op `op_id`'s sibling there or modification-order-after it.
     ///
     /// This is the union of both routes the single-copy-atomicity claim rests
     /// on: the thread *read* the wide op through another lane (`g` is that op's
@@ -1934,10 +1959,23 @@ impl State {
             if rj == ri {
                 continue;
             }
+
+            // The op's own store in `other` is a property of `(other, op_id)`,
+            // not of the candidate `g`: resolve it once per region rather than
+            // re-searching the ring for every `g`. A region the op never wrote
+            // holds no constraint at all and is skipped whole.
+            let Some(d_idx) = other.slot_of_op(op_id) else {
+                continue;
+            };
+            let d = &other.stores[d_idx];
+
             for g_idx in 0..other.live_stores() {
-                if view.is_seen(&other.stores[g_idx], rj, g_idx)
-                    && other.sees_op(g_idx, op_id) == Some(true)
-                {
+                let g = &other.stores[g_idx];
+
+                // Structural test first — an id compare and a single-lane
+                // marker read — ahead of `is_seen`'s all-lane compare and
+                // touched-list scan. Both are pure, so the order is free.
+                if (g.id == d.id || mo_before(d, g)) && view.is_seen(g, rj, g_idx) {
                     return true;
                 }
             }
@@ -2260,51 +2298,58 @@ impl Region {
         store.value
     }
 
-    /// True if reading store `c_index` sees op `op_id` in this region: either
-    /// the read store *is* that op's store here, or it is modification-order
-    /// after it. Used to keep a wide op single-copy-atomic across regions.
-    fn sees_op(&self, c_index: usize, op_id: u64) -> Option<bool> {
-        let c = &self.stores[c_index];
-        for i in 0..self.live_stores() {
-            let d = &self.stores[i];
-            if d.op_id == op_id {
-                return Some(c.id == d.id || mo_before(d, c));
-            }
-        }
-        // This region was not written by that op — no constraint.
-        None
+    /// The slot holding op `op_id`'s store in this region, or `None` when the
+    /// op never wrote these bits (it constrains nothing here).
+    ///
+    /// A store op appends exactly one store per region it covers, so the slot
+    /// is unique — which is what lets a caller resolve the op *once* for a
+    /// region instead of re-searching the ring per candidate.
+    fn slot_of_op(&self, op_id: u64) -> Option<usize> {
+        (0..self.live_stores()).find(|&i| self.stores[i].op_id == op_id)
     }
 
-    /// True if reading store `c_index` is consistent with the wide-op
-    /// visibility already committed by earlier regions of a multi-region load:
-    /// for every committed `(op_id, seen)` this region shares, the read must
-    /// agree on whether it sees that op (all-or-none — single-copy atomicity).
-    fn is_consistent(&self, c_index: usize, resolved: &[(u64, bool)]) -> bool {
-        for &(op_id, seen) in resolved {
-            if let Some(here) = self.sees_op(c_index, op_id) {
-                if here != seen {
+    /// Check candidate `c_index` against the wide-op visibility `resolved`
+    /// already fixes and, if they agree, extend `resolved` with the visibility
+    /// this region's read newly implies.
+    ///
+    /// The rule is single-copy atomicity: a wide op's stores are seen
+    /// all-or-none, so every region of one load must agree on whether it sees
+    /// op X. Reading store `c` sees op X here iff `c` *is* X's store in this
+    /// region or is modification-order after it. Ops only this region holds are
+    /// unconstrained and simply join `resolved` for the regions still to come.
+    ///
+    /// One scan of the ring does both halves: every live store here is either
+    /// an op `resolved` already speaks for (check it) or one it does not
+    /// (record it).
+    ///
+    /// On disagreement `resolved` is restored to its entry length, so a
+    /// rejected candidate leaves nothing behind and the caller may try the next
+    /// one against the same prefix.
+    fn try_resolve(&self, c_index: usize, resolved: &mut Resolved) -> bool {
+        let mark = resolved.len();
+        let c = &self.stores[c_index];
+
+        for i in 0..self.live_stores() {
+            let d = &self.stores[i];
+            let seen = c.id == d.id || mo_before(d, c);
+
+            // Copied out, so the search's borrow ends before the push.
+            let fixed = resolved
+                .iter()
+                .find(|(o, _)| *o == d.op_id)
+                .map(|&(_, s)| s);
+
+            match fixed {
+                Some(s) if s != seen => {
+                    resolved.truncate(mark);
                     return false;
                 }
+                Some(_) => {}
+                None => resolved.push((d.op_id, seen)),
             }
         }
-        true
-    }
 
-    /// Record the wide-op visibility this region's chosen store `c_index`
-    /// implies, so later regions of the same multi-region load stay consistent
-    /// with it. Every live op in this region is resolved by the read's mo
-    /// position relative to it.
-    fn record_resolutions(&self, c_index: usize, resolved: &mut SmallVec<[(u64, bool); 8]>) {
-        let c = &self.stores[c_index];
-        for i in 0..self.live_stores() {
-            let d = &self.stores[i];
-            let op_id = d.op_id;
-            let seen = c.id == d.id || mo_before(d, c);
-            match resolved.iter_mut().find(|(o, _)| *o == op_id) {
-                Some((_, s)) => *s = seen,
-                None => resolved.push((op_id, seen)),
-            }
-        }
+        true
     }
 
     /// Plant the genesis store of a `const`-constructed cell: an
