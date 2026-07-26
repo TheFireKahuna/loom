@@ -47,6 +47,15 @@
 //!   the lane's own value, a wide store, carries `FULL_MASK` and is already
 //!   dependent on the lane's region. This composes with the mask-intersection
 //!   store pruning: loads were the last op still re-coupling decoupled lanes.
+//! - **A wide RMW declares reads and writes separately**
+//!   (`ModelOps::rmw_preserving`, `Action::Rmw { read, write }`): a
+//!   `cmpxchg16b` that installs two lanes of a three-lane word compares all
+//!   sixteen bytes but leaves the third at the value it read, and saying so is
+//!   what keeps that lane independent — the op is a *reader* there, appends no
+//!   store, and commutes with the lane's own readers. Whole-cell coherence
+//!   survives it ([`PreservedOp`] reconstructs the floor the elided identity
+//!   write supplied); the release into the carried lane does not, and
+//!   `State::check_preserved_scope` traps rather than let that pass silently.
 //!
 //! # Modification order implications (figure 7)
 //!
@@ -668,6 +677,34 @@ pub(crate) trait ModelOps {
 
     fn store_masked(&self, location: Location, mask: u128, val: u128, ordering: Ordering);
 
+    /// Read-modify-write over the bits under `read_mask`, of which only those
+    /// also under `write_mask` may change. `write_mask ⊆ read_mask`.
+    ///
+    /// The two differ for a **preserving** RMW: a wide compare-and-swap that
+    /// consults bits it writes back verbatim — a `cmpxchg16b` installing two
+    /// lanes of a three-lane word compares all sixteen bytes but leaves the
+    /// third lane at the value it read. Declaring that is what lets the model
+    /// treat the preserved lane as read rather than written: the op commutes
+    /// with that lane's readers, and the lane gains no store, no candidate and
+    /// no modification order of its own. The claim is checked, not trusted —
+    /// the commit asserts the preserved bits came back identical.
+    ///
+    /// What it costs is stated at [`PreservedOp`] and guarded by
+    /// [`State::check_preserved_scope`].
+    fn rmw_preserving<F, E>(
+        &self,
+        location: Location,
+        read_mask: u128,
+        write_mask: u128,
+        success: Ordering,
+        failure: Ordering,
+        f: F,
+    ) -> Result<u128, E>
+    where
+        F: FnOnce(u128) -> Result<u128, E>;
+
+    /// Read-modify-write over just the bits under `mask` — the ordinary form,
+    /// which may change every bit it reads.
     fn rmw_masked<F, E>(
         &self,
         location: Location,
@@ -677,7 +714,10 @@ pub(crate) trait ModelOps {
         f: F,
     ) -> Result<u128, E>
     where
-        F: FnOnce(u128) -> Result<u128, E>;
+        F: FnOnce(u128) -> Result<u128, E>,
+    {
+        self.rmw_preserving(location, mask, mask, success, failure, f)
+    }
 
     /// Read the composed newest value with no synchronization.
     fn unsync_load(&self, location: Location) -> u128;
@@ -854,6 +894,36 @@ struct Region {
 
     /// Last time each thread accessed this region with a store or rmw.
     last_non_load_access: Box<[Option<Access>; MAX_THREADS]>,
+
+    /// Wide ops that compared these bits and wrote them back verbatim
+    /// ([`PreservedOp`]) — the store-less stand-ins for the identity writes
+    /// they replace. A ring of the same depth as `stores`, for the same
+    /// reason: a record whose window has passed constrains no candidate the
+    /// ring can still offer.
+    preserved: [PreservedOp; MAX_ATOMIC_HISTORY],
+
+    /// Total number of preserving ops over this region. Non-zero is what
+    /// makes the region *elision-tainted* — the state
+    /// [`State::check_preserved_scope`] guards.
+    preserved_cnt: u16,
+
+    /// Threads that have read these bits, since a preserving op landed, with
+    /// an operation covering none of the regions that op wrote. Those reads
+    /// are sound on their own (they acquired nothing), but a later
+    /// `fence(Acquire)` in the same thread would consume a release the elided
+    /// identity write no longer offers, so the fence traps on this set.
+    unrouted_readers: u32,
+
+    /// Threads that have read these bits at all, and the subset that did so
+    /// while acquiring.
+    ///
+    /// A preserving op and a read of the lane it carries are, by construction,
+    /// DPOR-independent — that is the whole point — so the search is entitled
+    /// to explore one order between them and never the other. The guard
+    /// therefore cannot live only on the read: it runs from **both** ends, and
+    /// these are what let the op ask what has already read its carried lane.
+    readers: u32,
+    acquiring_readers: u32,
 }
 
 #[derive(Debug, Copy, Clone, PartialEq)]
@@ -864,28 +934,52 @@ pub(super) enum Action {
     /// Atomic store to the bits under the mask
     Store(u128),
 
-    /// Atomic read-modify-write of the bits under the mask
-    Rmw(u128),
+    /// Atomic read-modify-write: `read` are the bits the operation consults,
+    /// `write` the bits it may change, and `write ⊆ read`. They differ only
+    /// for a **preserving** RMW (`ModelOps::rmw_preserving`) — a wide CAS that
+    /// compares bits it writes back verbatim. On the preserved bits the
+    /// operation is a reader, and DPOR treats it as one.
+    Rmw { read: u128, write: u128 },
 }
 
 impl Action {
-    /// The bits this action touches. Two atomic ops on one cell are
-    /// DPOR-dependent only when their masks intersect — disjoint lanes commute.
-    fn mask(self) -> u128 {
+    /// The bits this action reads.
+    fn read_mask(self) -> u128 {
         match self {
-            Action::Load(m) | Action::Store(m) | Action::Rmw(m) => m,
+            Action::Load(m) => m,
+            Action::Store(_) => 0,
+            Action::Rmw { read, .. } => read,
         }
     }
 
-    fn is_load(self) -> bool {
-        matches!(self, Action::Load(_))
+    /// The bits this action may change.
+    fn write_mask(self) -> u128 {
+        match self {
+            Action::Load(_) => 0,
+            Action::Store(m) => m,
+            Action::Rmw { write, .. } => write,
+        }
     }
 
-    /// DPOR dependence between two operations on this cell — overlapping bits
-    /// and at least one writer, the same pairing `for_each_dependent_access`
-    /// reports — decided from the actions alone, without the access records.
+    /// The bits this action touches at all — the regions it must resolve.
+    fn mask(self) -> u128 {
+        self.read_mask() | self.write_mask()
+    }
+
+    /// DPOR dependence between two operations on this cell — the ordinary
+    /// read/write dependence over the bit masks, the same pairing
+    /// `for_each_dependent_access` reports, decided from the actions alone
+    /// without the access records.
+    ///
+    /// Equivalent to the old "overlapping bits and at least one writer"
+    /// wherever an RMW reads and writes the same bits; a preserving RMW's
+    /// preserved lane commutes with that lane's readers, exactly as a load
+    /// of it would.
     pub(super) fn conflicts_with(self, other: Action) -> bool {
-        self.mask() & other.mask() != 0 && !(self.is_load() && other.is_load())
+        (self.write_mask() & other.read_mask())
+            | (self.read_mask() & other.write_mask())
+            | (self.write_mask() & other.write_mask())
+            != 0
     }
 }
 
@@ -947,7 +1041,7 @@ struct Store {
 
 /// Creation stamp of the store an RMW write read — the persistent record of
 /// the "nothing may split this pair" obligation.
-#[derive(Debug, Copy, Clone)]
+#[derive(Debug, Copy, Clone, Default)]
 struct RmwRead {
     /// `Store::id` of the read store, to exclude the read store itself from
     /// the closure (it is mo-*before* its own RMW successor).
@@ -978,6 +1072,92 @@ impl Store {
 /// the "vectors grew apart after the join" imprecision (see module docs).
 fn mo_before(a: &Store, b: &Store) -> bool {
     a.id != b.id && b.modification_order.lane(a.creator) >= a.tick()
+}
+
+/// [`mo_before`] for a store recorded only as a creation stamp: `stamp` names
+/// store `a`, and this is `mo_before(a, b)` verbatim. The stamp form is what
+/// lets the relation outlive `a`'s eviction from the ring.
+fn stamp_mo_before(stamp: &RmwRead, b: &Store) -> bool {
+    stamp.read_id != b.id && b.modification_order.lane(stamp.creator) >= stamp.tick
+}
+
+/// A wide op that **compared** this region's bits and wrote them back
+/// verbatim, recorded without a store of its own
+/// (`ModelOps::rmw_preserving`).
+///
+/// Write `s` for the store the op read here and `s'` for the identity write it
+/// would have appended. RMW atomicity puts `s'` modification-order-immediately
+/// after `s` with nothing insertable between, and `s'` carries `s`'s value, so
+/// the pair is one run of equal bits. Everything below follows from that.
+///
+/// **The coherence floor is exact in value.** Seeing the op through a written
+/// region must stop this lane reading older than what the op left here. With
+/// `s'` the rule reads "drop candidates mo-before `s'`" — which drops `s`
+/// too; here it reads "drop candidates mo-before `s`", keeping `s`. The two
+/// admit the *same values*, because `s` and `s'` hold the same bits; they
+/// differ only in which coherence node the reader lands on. That difference is
+/// the residual below, not a difference in what can be read.
+///
+/// **All-or-none visibility is vacuous here, and the record stays out of it**
+/// ([`Region::try_resolve`]). A wide op's regions must be seen all-or-none to
+/// forbid a torn snapshot; a lane the op wrote back verbatim cannot tear.
+///
+/// **Being seen *through* this lane resolves strictly** ([`OpPin::Preserved`],
+/// via [`State::op_seen_through_other_region`]): only a candidate strictly
+/// mo-after `s` witnesses the op. Reading `s` itself is ambiguous once `s` and
+/// `s'` are one node — it is what a reader that ran *before* the op sees, and
+/// what a reader of `s'` would have seen — and answering "witnessed" would
+/// floor a sibling lane for a reader that legitimately preceded the op,
+/// forbidding a real behavior. Answering "not witnessed" only declines to
+/// floor, which admits behaviors rather than removing them.
+///
+/// **The residual.** The record does not carry `s'`'s release: an acquiring
+/// read of this lane can no longer synchronize-with the op through these bits
+/// (it still can through the bits the op wrote). That is the one behavior
+/// elision costs, and [`State::check_preserved_scope`] makes reaching it a
+/// hard error rather than a silent under-exploration.
+///
+/// **The floor is also a cost, which is why elision is a trade and not a pure
+/// win.** The identity write is a coherence ratchet: it sits mo-latest, so a
+/// thread that observes the op through a written region has this lane's
+/// readable set floored to the newest node. Carrying the lane moves that floor
+/// one node earlier, handing back one candidate of staleness per op for the
+/// search to explore. Against that stands what carriage buys — no store
+/// appended here, and no dependence with this lane's readers. Which wins is a
+/// property of the *lane*, not of the operation: on a lane whose only writes
+/// are these identity writes the ratchet was pruning nothing real and carriage
+/// is a clear win, while on a lane with genuine traffic of its own the two
+/// terms cancel. Measure per call site; do not assume.
+#[derive(Debug, Copy, Clone, Default)]
+struct PreservedOp {
+    /// The op's `Store::op_id` in the regions it *did* write. Zero in an
+    /// unused ring slot, which no real op id ever takes (`op_clock` starts
+    /// at one, and the genesis store's id 0 belongs to no preserving op).
+    op_id: u64,
+
+    /// Creation stamp of the store the op read here — its modification-order
+    /// pin, standing in for the identity write's own position.
+    read: RmwRead,
+
+    /// The bits the op *did* write, so a reader that also covers one of those
+    /// regions is known to still have a route to the op's release.
+    write_mask: u128,
+
+    /// Lane index of the thread that ran the op. It cannot lose a release it
+    /// published itself — its own causality already contains it — so it is
+    /// never an unrouted reader of its own preserved lane.
+    creator: usize,
+}
+
+/// Where one store operation sits in one region's modification order — see
+/// [`Region::pin_of_op`].
+#[derive(Debug, Copy, Clone)]
+enum OpPin {
+    /// The op wrote this region; the slot holding its store.
+    Wrote(usize),
+
+    /// The op preserved this region; the creation stamp of the store it read.
+    Preserved(RmwRead),
 }
 
 /// Per-thread "version at which this thread first saw the store", padded to
@@ -1021,6 +1201,16 @@ fn fence_acq(execution: &mut Execution) {
         if state.touched_by & active_bit == 0 {
             continue;
         }
+        // A relaxed read of a preserved lane takes no causality, so it is
+        // sound where it stands; this fence is where it would have taken the
+        // elided identity write's release, and cannot (`PreservedOp`).
+        assert!(
+            !state.has_unrouted_reader(execution.threads.active_id().as_usize()),
+            "fence(Acquire) over a cell this thread read only through a preserved lane.\n\
+             `rmw_preserving` elides the identity write there, so the fence cannot draw the \
+             preserving operation's release. Use `rmw_masked` for that operation, or read a \
+             lane it writes."
+        );
         // Iterate every region's stores
         for store in state.all_stores_mut() {
             if !store.first_seen.is_touched_by(execution.threads.active_id()) {
@@ -1173,6 +1363,7 @@ impl<C: Resolve + ?Sized> ModelOps for C {
             state.loaded_locations.track(location, &execution.threads);
             // Validate memory safety (cell-wide).
             state.track_load(&execution.threads);
+            state.check_preserved_scope(mask, acquires(ordering), &execution.threads);
 
             trace!(state = ?state_ref, ?ordering, ?mask, "Atomic::load_masked");
 
@@ -1226,6 +1417,7 @@ impl<C: Resolve + ?Sized> ModelOps for C {
 
             state.loaded_locations.track(location, &execution.threads);
             state.track_load(&execution.threads);
+            state.check_preserved_scope(mask, acquires(ordering), &execution.threads);
 
             trace!(state = ?state_ref, ?ordering, ?mask, "Atomic::load_coherent_lane");
 
@@ -1286,10 +1478,11 @@ impl<C: Resolve + ?Sized> ModelOps for C {
     /// others zero) and returns the new full value; only the covered regions'
     /// bits are written, all as one linearization point sharing one SC
     /// position. A full RMW passes `FULL_MASK`.
-    fn rmw_masked<F, E>(
+    fn rmw_preserving<F, E>(
         &self,
         location: Location,
-        mask: u128,
+        read_mask: u128,
+        write_mask: u128,
         success: Ordering,
         failure: Ordering,
         f: F,
@@ -1297,9 +1490,29 @@ impl<C: Resolve + ?Sized> ModelOps for C {
     where
         F: FnOnce(u128) -> Result<u128, E>,
     {
+        assert!(
+            write_mask & !read_mask == 0,
+            "rmw_preserving: write mask {:#034x} is not contained in read mask {:#034x} \
+             — an operation cannot change bits it does not consult",
+            write_mask,
+            read_mask,
+        );
+
         let state_ref = self.resolve();
-        ensure_partition(state_ref, mask);
-        branch(self, state_ref, Action::Rmw(mask), location);
+        // Both masks must be unions of whole regions: the read mask so the
+        // value is composed from exactly the bits consulted, the write mask so
+        // no region is half-written and half-preserved.
+        ensure_partition(state_ref, read_mask);
+        ensure_partition(state_ref, write_mask);
+        branch(
+            self,
+            state_ref,
+            Action::Rmw {
+                read: read_mask,
+                write: write_mask,
+            },
+            location,
+        );
 
         super::synchronize(|execution| {
             let state = state_ref.get_mut(&mut execution.objects);
@@ -1308,15 +1521,22 @@ impl<C: Resolve + ?Sized> ModelOps for C {
             // Track the load is happening in order to ensure correct
             // synchronization to the underlying cell (cell-wide).
             state.track_load(&execution.threads);
+            // Either arm's ordering may acquire, and which one runs is not
+            // known until `f` has been applied.
+            state.check_preserved_scope(
+                read_mask,
+                acquires(success) || acquires(failure),
+                &execution.threads,
+            );
 
-            trace!(state = ?state_ref, ?success, ?failure, ?mask, "Atomic::rmw_masked");
+            trace!(state = ?state_ref, ?success, ?failure, ?read_mask, ?write_mask, "Atomic::rmw_preserving");
 
             // Read the current value: each covered region's RMW reads a
             // modification-order-maximal store (`match_rmw_to_stores`).
             let mut current = 0u128;
             let mut reads: SmallVec<[(usize, usize); 4]> = SmallVec::new();
 
-            for ri in state.covered(mask) {
+            for ri in state.covered(read_mask) {
                 if execution.path.is_traversed() {
                     let mut seed = [0; MAX_ATOMIC_HISTORY];
                     let n = state.regions[ri].match_rmw_to_stores(&mut seed[..]);
@@ -1332,6 +1552,10 @@ impl<C: Resolve + ?Sized> ModelOps for C {
 
             match f(current) {
                 Ok(next) => {
+                    // Unconditional even when `write_mask` is empty: the
+                    // hardware op owns the line and writes it, so the races
+                    // these track — against `with_mut` and `unsync_load` — are
+                    // real whatever the model does with the preserved bits.
                     state.stored_locations.track(location, &execution.threads);
                     // Track a store operation happened (cell-wide).
                     state.track_store(&execution.threads);
@@ -1344,13 +1568,44 @@ impl<C: Resolve + ?Sized> ModelOps for C {
                     let op_id = state.next_op_id();
 
                     for (ri, index) in reads {
-                        state.regions[ri].rmw_commit(
+                        let mask_ri = state.regions[ri].mask;
+
+                        if mask_ri & write_mask != 0 {
+                            state.regions[ri].rmw_commit(
+                                &mut execution.threads,
+                                index,
+                                next,
+                                success,
+                                sc_rank,
+                                op_id,
+                            );
+                            continue;
+                        }
+
+                        // The preservation claim, enforced rather than
+                        // trusted: the whole elision rests on these bits
+                        // coming back exactly as they were read, which is
+                        // what the caller's own compare over them
+                        // guarantees.
+                        assert_eq!(
+                            next & mask_ri,
+                            current & mask_ri,
+                            "rmw_preserving changed bits outside its write mask \
+                             (region {:#034x}) — the preserved lane is not preserved",
+                            mask_ri,
+                        );
+
+                        state.regions[ri].preserve_commit(
                             &mut execution.threads,
                             index,
-                            next,
                             success,
-                            sc_rank,
                             op_id,
+                            write_mask,
+                        );
+                        state.check_preserved_against_prior_reads(
+                            ri,
+                            write_mask,
+                            execution.threads.active_id().as_usize(),
                         );
                     }
 
@@ -1603,6 +1858,113 @@ impl State {
     fn next_op_id(&mut self) -> u64 {
         self.op_clock += 1;
         self.op_clock
+    }
+
+    /// Guard the one behavior a preserving RMW gives up (see [`PreservedOp`]):
+    /// the elided identity write cannot be read-from, so an acquiring read
+    /// confined to the preserved bits can no longer synchronize-with the op.
+    ///
+    /// A read is *routed* around a preserving op X when it also reaches a
+    /// region X wrote — there X's store is present and its release still
+    /// available, so nothing is lost. A thread that ran X itself is routed
+    /// trivially. An unrouted read is lost causality, and the two ways to
+    /// consume it are handled separately:
+    ///
+    /// - **acquiring now** — the edge would be taken at this operation, so
+    ///   this is the loss, and it traps;
+    /// - **acquiring later, through a fence** — the read itself takes nothing,
+    ///   so it is sound on its own; the thread is recorded on the region and
+    ///   `fence_acq` traps if it ever reaches the fence.
+    ///
+    /// This is only the read end. The op end is
+    /// [`Self::check_preserved_against_prior_reads`], and both are needed: the
+    /// two are DPOR-independent, so the search may explore either order and
+    /// only that order.
+    fn check_preserved_scope(&mut self, op_mask: u128, acquiring: bool, threads: &thread::Set) {
+        let reader = threads.active_id().as_usize();
+        let bit = 1u32 << reader;
+
+        for region in &mut self.regions {
+            if region.mask & op_mask == 0 {
+                continue;
+            }
+
+            // Recorded for the op end, whether or not this cell has ever seen
+            // a preserving op — the op that will ask has not run yet.
+            region.readers |= bit;
+            if acquiring {
+                region.acquiring_readers |= bit;
+            }
+
+            for i in 0..region.live_preserved() {
+                let p = region.preserved[i];
+                if op_mask & p.write_mask != 0 || p.creator == reader {
+                    continue;
+                }
+
+                assert!(
+                    !acquiring,
+                    "acquiring read of a preserved lane (region {:#034x}) that cannot reach \
+                     the preserving operation's own bits ({:#034x}).\n\
+                     `rmw_preserving` elides the identity write on the preserved lane, so \
+                     there is no store here to read-from and no release to acquire. The \
+                     declaration that the lane publishes nothing is wrong for this cell — \
+                     use `rmw_masked` for that operation, or stop acquiring here.",
+                    region.mask,
+                    p.write_mask,
+                );
+
+                region.unrouted_readers |= bit;
+            }
+        }
+    }
+
+    /// The op end of [`Self::check_preserved_scope`]: reads of the carried
+    /// lane that already happened, which the op is about to render unroutable.
+    ///
+    /// `ri` is the region being preserved and `write_mask` the bits the op
+    /// does write. A prior reader is routed if it also read some region under
+    /// `write_mask` — for the acquire test it must have acquired there, since
+    /// that is what would carry the release; for the fence test any read will
+    /// do, because a fence collects from every store the thread touched.
+    fn check_preserved_against_prior_reads(&mut self, ri: usize, write_mask: u128, creator: usize) {
+        let mine = 1u32 << creator;
+        let readers = self.regions[ri].readers & !mine;
+        let acquirers = self.regions[ri].acquiring_readers & !mine;
+
+        if readers == 0 {
+            return;
+        }
+
+        let mut routed = 0u32;
+        let mut acq_routed = 0u32;
+        for region in &self.regions {
+            if region.mask & write_mask != 0 {
+                routed |= region.readers;
+                acq_routed |= region.acquiring_readers;
+            }
+        }
+
+        assert!(
+            acquirers & !acq_routed == 0,
+            "preserving RMW over a lane (region {:#034x}) another thread has already \
+             acquire-read without reaching the bits this operation writes ({:#034x}).\n\
+             `rmw_preserving` elides the identity write on the preserved lane, so that \
+             reader has no store of this operation to have read-from. Use `rmw_masked` \
+             here, or stop acquiring through the carried lane.",
+            self.regions[ri].mask,
+            write_mask,
+        );
+
+        self.regions[ri].unrouted_readers |= readers & !routed;
+    }
+
+    /// True when the active thread holds a read of some preserved lane of this
+    /// cell that an acquire fence would try, and fail, to draw causality from
+    /// (`check_preserved_scope`).
+    fn has_unrouted_reader(&self, thread: usize) -> bool {
+        let bit = 1u32 << thread;
+        self.regions.iter().any(|r| r.unrouted_readers & bit != 0)
     }
 
     /// Refine the region partition so `mask` is a union of whole regions:
@@ -1908,6 +2270,15 @@ impl State {
         let live = region.live_stores();
         let mut seen_memo: [Option<bool>; MAX_ATOMIC_HISTORY] = [None; MAX_ATOMIC_HISTORY];
 
+        // The same memo for the floors a preserving op contributes. Its floor
+        // is the store it read: the identity write it replaces sat immediately
+        // after that store, so "mo-before the identity write" and "strictly
+        // mo-before the store it read" name the same candidates
+        // (`PreservedOp`). The store itself stays readable — it is the node the
+        // identity write's readers now land on.
+        let live_pre = region.live_preserved();
+        let mut pre_memo: [Option<bool>; MAX_ATOMIC_HISTORY] = [None; MAX_ATOMIC_HISTORY];
+
         'candidate: for k in 0..n {
             let c = &region.stores[seed[k] as usize];
 
@@ -1922,6 +2293,33 @@ impl State {
                     None => {
                         let seen = self.op_seen_through_other_region(ri, f.op_id, view);
                         seen_memo[f_idx] = Some(seen);
+                        seen
+                    }
+                };
+
+                if seen {
+                    continue 'candidate;
+                }
+            }
+
+            for p_idx in 0..live_pre {
+                let p = &region.preserved[p_idx];
+
+                // A floor the ring no longer holds cannot be compared against;
+                // it lapses with the store, exactly as an evicted store's own
+                // floor does.
+                let Some(s_idx) = region.slot_of_store(p.read.read_id) else {
+                    continue;
+                };
+                if !mo_before(c, &region.stores[s_idx]) {
+                    continue;
+                }
+
+                let seen = match pre_memo[p_idx] {
+                    Some(seen) => seen,
+                    None => {
+                        let seen = self.op_seen_through_other_region(ri, p.op_id, view);
+                        pre_memo[p_idx] = Some(seen);
                         seen
                     }
                 };
@@ -1960,14 +2358,14 @@ impl State {
                 continue;
             }
 
-            // The op's own store in `other` is a property of `(other, op_id)`,
+            // The op's position in `other` is a property of `(other, op_id)`,
             // not of the candidate `g`: resolve it once per region rather than
-            // re-searching the ring for every `g`. A region the op never wrote
-            // holds no constraint at all and is skipped whole.
-            let Some(d_idx) = other.slot_of_op(op_id) else {
+            // re-searching the ring for every `g`. A region the op neither
+            // wrote nor preserved holds no constraint at all and is skipped
+            // whole.
+            let Some(pin) = other.pin_of_op(op_id) else {
                 continue;
             };
-            let d = &other.stores[d_idx];
 
             for g_idx in 0..other.live_stores() {
                 let g = &other.stores[g_idx];
@@ -1975,7 +2373,7 @@ impl State {
                 // Structural test first — an id compare and a single-lane
                 // marker read — ahead of `is_seen`'s all-lane compare and
                 // touched-list scan. Both are pure, so the order is free.
-                if (g.id == d.id || mo_before(d, g)) && view.is_seen(g, rj, g_idx) {
+                if other.pin_sees(&pin, g) && view.is_seen(g, rj, g_idx) {
                     return true;
                 }
             }
@@ -2164,17 +2562,22 @@ impl State {
     /// A wide op's access is recorded in every region it wrote, so a peer op is
     /// reported once per shared region; `Path::backtrack` and the DPOR clock
     /// join are idempotent, so the redundancy costs work, never correctness.
+    ///
+    /// The op's kind is decided **per region**, not once: a preserving RMW is a
+    /// writer in the regions its `write` mask covers and a reader in the ones
+    /// only its `read` mask does, so its preserved lane raises no backtrack
+    /// point against that lane's readers.
     pub(super) fn for_each_dependent_access<'a>(
         &'a self,
         action: Action,
         mut f: impl FnMut(&'a Access),
     ) {
         let mask = action.mask();
-        let is_load = action.is_load();
+        let write = action.write_mask();
 
         for region in &self.regions {
             if region.mask & mask != 0 {
-                region.for_each_dependent_access(is_load, &mut f);
+                region.for_each_dependent_access(region.mask & write == 0, &mut f);
             }
         }
     }
@@ -2188,12 +2591,12 @@ impl State {
         version: &VersionVec,
     ) {
         let mask = action.mask();
-        let is_load = action.is_load();
+        let write = action.write_mask();
         let index = thread_id.as_usize();
 
         for region in &mut self.regions {
             if region.mask & mask != 0 {
-                region.set_last_access(is_load, index, path_id, version);
+                region.set_last_access(region.mask & write == 0, index, path_id, version);
             }
         }
     }
@@ -2209,6 +2612,11 @@ impl Region {
             cnt: 0,
             last_access: Default::default(),
             last_non_load_access: Default::default(),
+            preserved: Default::default(),
+            preserved_cnt: 0,
+            unrouted_readers: 0,
+            readers: 0,
+            acquiring_readers: 0,
         }
     }
 
@@ -2220,11 +2628,16 @@ impl Region {
         self.cnt = 0;
         *self.last_access = Default::default();
         *self.last_non_load_access = Default::default();
+        self.preserved_cnt = 0;
+        self.unrouted_readers = 0;
+        self.readers = 0;
+        self.acquiring_readers = 0;
     }
 
     /// Keep the `keep_mask` bits of this region in place; split the remaining
-    /// bits into a new region that inherits a full copy of the history **and
-    /// the DPOR access records**. Both halves start perfectly coherent
+    /// bits into a new region that inherits a full copy of the history, **the
+    /// DPOR access records and the preserving-op records**. Both halves start
+    /// perfectly coherent
     /// (identical stores) and carry the same past accesses — a peer op that
     /// conflicted with the pre-split region conflicts with whichever half it
     /// still overlaps — and diverge only as future masked ops touch one but
@@ -2245,6 +2658,11 @@ impl Region {
                 region
                     .last_non_load_access
                     .clone_from(&self.last_non_load_access);
+                region.preserved = self.preserved;
+                region.preserved_cnt = self.preserved_cnt;
+                region.unrouted_readers = self.unrouted_readers;
+                region.readers = self.readers;
+                region.acquiring_readers = self.acquiring_readers;
                 region
             }
             None => Region {
@@ -2253,6 +2671,11 @@ impl Region {
                 cnt: self.cnt,
                 last_access: self.last_access.clone(),
                 last_non_load_access: self.last_non_load_access.clone(),
+                preserved: self.preserved,
+                preserved_cnt: self.preserved_cnt,
+                unrouted_readers: self.unrouted_readers,
+                readers: self.readers,
+                acquiring_readers: self.acquiring_readers,
             },
         }
     }
@@ -2308,6 +2731,94 @@ impl Region {
         (0..self.live_stores()).find(|&i| self.stores[i].op_id == op_id)
     }
 
+    /// Where op `op_id` sits in this region's modification order, or `None`
+    /// when the op neither wrote nor preserved these bits and so constrains
+    /// nothing here.
+    ///
+    /// An op reaches a region in exactly one of two ways, and both pin it to
+    /// one point of the order — its own store, or the store it read and wrote
+    /// back verbatim. [`PreservedOp`] is where the two pins are shown to
+    /// select the same candidates.
+    fn pin_of_op(&self, op_id: u64) -> Option<OpPin> {
+        if let Some(slot) = self.slot_of_op(op_id) {
+            return Some(OpPin::Wrote(slot));
+        }
+
+        self.preserved_ops()
+            .find(|p| p.op_id == op_id)
+            .map(|p| OpPin::Preserved(p.read))
+    }
+
+    /// Does reading store `c` imply having seen the op pinned at `pin`?
+    ///
+    /// - **Wrote** — `c` is the op's own store, or modification-order after it.
+    /// - **Preserved** — `c` is *strictly* modification-order after the store
+    ///   the op read. Strict is the deliberate side of an ambiguity the
+    ///   elision creates, argued at [`PreservedOp`]: that store is also what a
+    ///   reader running before the op sees, and calling it a witness would
+    ///   floor such a reader's sibling lanes for an op it never observed.
+    fn pin_sees(&self, pin: &OpPin, c: &Store) -> bool {
+        match pin {
+            OpPin::Wrote(slot) => {
+                let d = &self.stores[*slot];
+                c.id == d.id || mo_before(d, c)
+            }
+            OpPin::Preserved(read) => stamp_mo_before(read, c),
+        }
+    }
+
+    /// The live slot holding the store with `id`, if the ring still has it.
+    fn slot_of_store(&self, id: u16) -> Option<usize> {
+        (0..self.live_stores()).find(|&i| self.stores[i].id == id)
+    }
+
+    /// Number of `preserved` slots holding a real record — the ring discipline
+    /// of `live_stores`, for the same reason.
+    fn live_preserved(&self) -> usize {
+        cmp::min(self.preserved_cnt as usize, MAX_ATOMIC_HISTORY)
+    }
+
+    /// The live preserving-op records over these bits. Slot order, like
+    /// `live_stores`: the ring's rotation is immaterial because every consumer
+    /// asks each record an independent question.
+    fn preserved_ops(&self) -> impl Iterator<Item = &PreservedOp> {
+        self.preserved[..self.live_preserved()].iter()
+    }
+
+    /// Record a wide op that compared these bits and wrote them back verbatim.
+    ///
+    /// `index` is the slot the op read here; its creation stamp is captured
+    /// now, so the record survives that store's eviction exactly as
+    /// `Store::rmw_read` does. The op's `success` ordering performs its load
+    /// synchronization just as a committing RMW's does — the op *did* read
+    /// these bits — but no store is appended, so this region gains no
+    /// coherence node, no candidate, and no modification order.
+    fn preserve_commit(
+        &mut self,
+        threads: &mut thread::Set,
+        index: usize,
+        success: Ordering,
+        op_id: u64,
+        write_mask: u128,
+    ) {
+        debug_assert!(index < self.live_stores(), "preserve_commit of dead slot");
+        self.stores[index].sync.sync_load(threads, success);
+
+        let read = RmwRead {
+            read_id: self.stores[index].id,
+            creator: self.stores[index].creator,
+            tick: self.stores[index].tick(),
+        };
+
+        self.preserved[self::index(self.preserved_cnt)] = PreservedOp {
+            op_id,
+            read,
+            write_mask,
+            creator: threads.active_id().as_usize(),
+        };
+        self.preserved_cnt += 1;
+    }
+
     /// Check candidate `c_index` against the wide-op visibility `resolved`
     /// already fixes and, if they agree, extend `resolved` with the visibility
     /// this region's read newly implies.
@@ -2321,6 +2832,16 @@ impl Region {
     /// One scan of the ring does both halves: every live store here is either
     /// an op `resolved` already speaks for (check it) or one it does not
     /// (record it).
+    ///
+    /// A **preserving** op reaches this region without a store and imposes
+    /// nothing here, deliberately. All-or-none exists to forbid a torn
+    /// snapshot — half an op's bytes with half a peer's — and a preserved lane
+    /// has no such half: the op wrote the value it read, so "before the op"
+    /// and "after the op" are the same bits. There is nothing for the regions
+    /// to disagree about. Constraining it would instead be actively wrong: it
+    /// would demand a candidate strictly mo-after the store the op read, and
+    /// on a quiescent lane no such store exists, so a snapshot that saw the op
+    /// through a written region would have no completion at all.
     ///
     /// On disagreement `resolved` is restored to its entry length, so a
     /// rejected candidate leaves nothing behind and the caller may try the next

@@ -287,6 +287,69 @@ macro_rules! atomic_int {
                 })
             }
 
+            /// Single-step read-modify-write that consults the **whole** value
+            /// but may change only the bits under `write_mask`, returning the
+            /// previous whole value.
+            ///
+            /// The general form of [`Self::compare_exchange_preserving`], for
+            /// a wide operation whose decision is not a plain equality — a
+            /// 16-byte RMW that installs one lane and advances a counter in
+            /// another while carrying a third through. `f` receives every bit
+            /// and must return them unchanged outside `write_mask`; the model
+            /// asserts it, because the whole treatment of those bits as read
+            /// rather than written rests on it.
+            #[track_caller]
+            pub fn fetch_modify_preserving<F>(
+                &self,
+                write_mask: $int_type,
+                f: F,
+                order: Ordering,
+            ) -> $int_type
+            where
+                F: FnOnce($int_type) -> $int_type,
+            {
+                self.0
+                    .rmw_preserving::<_, ()>(write_mask, order, order, |v| Ok(f(v)))
+                    .unwrap()
+            }
+
+            /// Compare-exchange whose compare consults **every** bit but whose
+            /// write leaves the bits under `preserve` at the value it read —
+            /// one modelled atomic step.
+            ///
+            /// This is the model of a wide CAS that installs some lanes of a
+            /// single-copy-atomic cell while writing others back verbatim: a
+            /// `cmpxchg16b` that advances two lanes of a three-lane word
+            /// compares all sixteen bytes, and the third lane's bytes go back
+            /// unchanged because the compare says what they are. Declaring
+            /// that is what keeps the preserved lane's independence: the
+            /// operation is a *reader* there, so it commutes with that lane's
+            /// readers and adds nothing to its history — where
+            /// [`Self::compare_exchange`] would make it a writer of the whole
+            /// cell and couple every lane to every other.
+            ///
+            /// The one thing the preserved lane gives up is being acquired
+            /// through: there is no store of this operation there to
+            /// read-from. A rig that tries traps rather than silently
+            /// exploring less.
+            #[track_caller]
+            pub fn compare_exchange_preserving(
+                &self,
+                preserve: $int_type,
+                current: $int_type,
+                new: $int_type,
+                success: Ordering,
+                failure: Ordering,
+            ) -> Result<$int_type, $int_type> {
+                self.0.rmw_preserving(!preserve, success, failure, |actual| {
+                    if actual == current {
+                        Ok((actual & preserve) | (new & !preserve))
+                    } else {
+                        Err(actual)
+                    }
+                })
+            }
+
             /// Fetches the value, and applies a function to it that returns an optional new value.
             /// Returns a [`Result`] of [`Ok`]`(previous_value)` if the function returned
             /// [`Some`]`(_)`, else [`Err`]`(previous_value)`.

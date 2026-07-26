@@ -214,6 +214,43 @@ where
             .map(T::from_u128)
     }
 
+    /// Read-modify-write that consults every bit but may change only those
+    /// under `write_mask` (one modelled step). The modelling primitive for a
+    /// **preserving** wide CAS: a `cmpxchg16b` that compares all sixteen bytes
+    /// yet leaves some aligned lane at the value it read.
+    ///
+    /// `f` receives the whole current value — so the caller's compare is over
+    /// every bit, exactly as the instruction's is — and its result's bits
+    /// outside `write_mask` must equal the ones it was given; the commit
+    /// asserts it. In exchange the preserved lane is modelled as read, not
+    /// written: it gains no store and commutes with its own readers.
+    ///
+    /// Nothing may acquire through a preserved lane — see
+    /// `rt::ModelOps::rmw_preserving`, which traps rather than let the lost
+    /// edge pass unnoticed.
+    #[track_caller]
+    pub(crate) fn rmw_preserving<F, E>(
+        &self,
+        write_mask: T,
+        success: Ordering,
+        failure: Ordering,
+        f: F,
+    ) -> Result<T, E>
+    where
+        F: FnOnce(T) -> Result<T, E>,
+    {
+        self.state
+            .rmw_preserving(
+                location!(),
+                rt::FULL_MASK,
+                write_mask.into_u128(),
+                success,
+                failure,
+                |cur| f(T::from_u128(cur)).map(T::into_u128),
+            )
+            .map(T::from_u128)
+    }
+
     #[track_caller]
     pub(crate) fn compare_and_swap(&self, current: T, new: T, order: Ordering) -> T {
         use self::Ordering::*;
