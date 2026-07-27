@@ -107,6 +107,25 @@ pub fn reset(ptr: *mut u8, len: usize) {
     rt::reset(ptr as usize, len, location!())
 }
 
+/// Model the `MEM_DECOMMIT` verb over `len` bytes at `ptr`: the mapping itself
+/// goes, not merely its contents.
+///
+/// The inverse of [`publish`]. Every cell in the range loses its registration
+/// and the range leaves the published set, so a **later access panics** —
+/// decommitted memory faults on real hardware, and a stale-but-plausible value
+/// here would pass exactly the executions the caller's unreachability argument
+/// exists to forbid.
+///
+/// Use [`reset`] instead wherever a reader may legally still be in the span.
+/// This verb asserts there is none. A later [`publish`] re-registers the range's
+/// cells at zero, which is what re-committing decommitted pages hands back.
+///
+/// This describes memory to the model; it neither reads nor writes it.
+#[track_caller]
+pub fn unpublish(ptr: *const u8, len: usize) {
+    rt::unpublish(ptr as usize, len)
+}
+
 pub use super::ptr::materialized::AtomicPtr;
 
 /// The cells' backing markers, one per width.

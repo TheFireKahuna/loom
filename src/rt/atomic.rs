@@ -456,6 +456,63 @@ pub(crate) fn publish(base: usize, len: usize) {
     })
 }
 
+/// Withdraw the declaration over `[base, base + len)`: the mapping itself is
+/// gone, not merely its contents.
+///
+/// The inverse of [`publish`], and the model of a `MEM_DECOMMIT` / `munmap`.
+/// Every cell in the range loses its registration and the range leaves the
+/// published list, so a **subsequent access panics** with the not-published
+/// message rather than reading the value the cell last held. That is the whole
+/// point: a decommitted span faults on real hardware, and a checker that
+/// returned a plausible stale value instead would pass exactly the executions
+/// the caller's unreachability argument exists to forbid.
+///
+/// Not [`reset`]: that verb keeps the mapping and admits a concurrent reader.
+/// This one asserts there is none, and the assertion is what the panic checks.
+/// A later [`publish`] over the range re-registers its cells at zero, which is
+/// what re-committing decommitted pages really hands back.
+pub(crate) fn unpublish(base: usize, len: usize) {
+    rt::execution(|execution| {
+        trace!(base, len, "atomic::unpublish");
+
+        // The registrations go first. They are keyed by address, so a cell that
+        // survived here would be adopted by a later publication of the same
+        // range together with its whole store history — the recycled-identity
+        // bug the address keying otherwise avoids.
+        execution
+            .materialized
+            .retain(|&addr, _| addr < base || addr - base >= len);
+
+        // Then the declaration, clipped rather than dropped: a decommit spans
+        // whole pages inside a reservation that stays published around it.
+        let mut kept = Vec::with_capacity(execution.published_regions.len() + 1);
+        for r in execution.published_regions.drain(..) {
+            let (lo, hi) = (r.base, r.base + r.len);
+            if hi <= base || lo >= base + len {
+                kept.push(r);
+                continue;
+            }
+            if lo < base {
+                kept.push(PublishedRegion {
+                    base: lo,
+                    len: base - lo,
+                    causality: r.causality,
+                    location: r.location,
+                });
+            }
+            if base + len < hi {
+                kept.push(PublishedRegion {
+                    base: base + len,
+                    len: hi - (base + len),
+                    causality: r.causality,
+                    location: r.location,
+                });
+            }
+        }
+        execution.published_regions = kept;
+    })
+}
+
 // The property the materialized representation exists to provide. If these ever
 // stop holding, a cell can no longer be reinterpreted from a zeroed region and
 // the representation is pointless — so they are asserted, not documented.

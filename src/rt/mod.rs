@@ -13,7 +13,7 @@ pub(crate) use self::arc::Arc;
 
 mod atomic;
 pub(crate) use self::atomic::{
-    fence, publish, reset, zero_exclusive, Atomic, ModelOps, FULL_MASK,
+    fence, publish, reset, unpublish, zero_exclusive, Atomic, ModelOps, FULL_MASK,
 };
 // Re-exported further by `sync::atomic::materialized`, which is why these are
 // `pub` rather than `pub(crate)` — `rt` itself is private, so nothing leaks
