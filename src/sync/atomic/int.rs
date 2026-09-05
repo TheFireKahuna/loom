@@ -244,7 +244,7 @@ macro_rules! atomic_int {
             /// Single-step read-modify-write over only the bits under `mask`,
             /// returning the previous value of those bits (other bits zero).
             ///
-            /// Unlike [`Self::fetch_update`] (a load followed by a CAS — two
+            /// Unlike [`Self::try_update`] (a load followed by a CAS — two
             /// modelled steps that can interleave), this is **one** modelled
             /// atomic step reading the most recent value of the masked lane.
             /// It models a *sub-word* RMW on a wider single-copy-atomic cell
@@ -354,7 +354,7 @@ macro_rules! atomic_int {
             /// Returns a [`Result`] of [`Ok`]`(previous_value)` if the function returned
             /// [`Some`]`(_)`, else [`Err`]`(previous_value)`.
             #[track_caller]
-            pub fn fetch_update<F>(
+            pub fn try_update<F>(
                 &self,
                 set_order: Ordering,
                 fetch_order: Ordering,
@@ -363,7 +363,7 @@ macro_rules! atomic_int {
             where
                 F: FnMut($int_type) -> Option<$int_type>,
             {
-                self.0.fetch_update(set_order, fetch_order, f)
+                self.0.try_update(set_order, fetch_order, f)
             }
         }
 

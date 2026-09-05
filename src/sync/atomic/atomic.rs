@@ -285,7 +285,7 @@ where
     }
 
     #[track_caller]
-    pub(crate) fn fetch_update<F>(
+    pub(crate) fn try_update<F>(
         &self,
         set_order: Ordering,
         fetch_order: Ordering,

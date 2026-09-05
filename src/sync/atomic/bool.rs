@@ -122,7 +122,7 @@ impl AtomicBool {
     /// a [`Result`] of [`Ok`]`(previous_value)` if the function returned [`Some`]`(_)`, else
     /// [`Err`]`(previous_value)`.
     #[track_caller]
-    pub fn fetch_update<F>(
+    pub fn try_update<F>(
         &self,
         set_order: Ordering,
         fetch_order: Ordering,
@@ -131,7 +131,7 @@ impl AtomicBool {
     where
         F: FnMut(bool) -> Option<bool>,
     {
-        self.0.fetch_update(set_order, fetch_order, f)
+        self.0.try_update(set_order, fetch_order, f)
     }
 }
 
