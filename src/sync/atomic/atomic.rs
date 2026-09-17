@@ -48,28 +48,88 @@ impl<T> Atomic<T>
 where
     T: rt::Numeric,
 {
-    pub(crate) fn new(value: T, location: rt::Location) -> Atomic<T> {
-        let state = rt::Atomic::new(value, location);
+    /// Creates a cell holding the value `init` represents — the typed façade
+    /// converts, since `rt::Numeric::into_u128` is a trait method and not
+    /// `const`-callable.
+    ///
+    /// One constructor for both contexts. At runtime it registers the cell
+    /// with the execution at once, attributing the genesis store to the
+    /// constructing thread so an unsynchronized publication of the cell itself
+    /// is reported. In `const` evaluation there is no execution, so it defers
+    /// registration to the cell's first access in each execution — the
+    /// per-execution reset a `const`-initialized `static` needs. The creation
+    /// site is recorded either way.
+    #[track_caller]
+    pub(crate) const fn new(init: u128) -> Atomic<T> {
+        let created = std::panic::Location::caller();
+        core::intrinsics::const_eval_select((init, created), Self::deferred, Self::eager)
+    }
 
+    /// The `const` arm of [`new`](Self::new).
+    const fn deferred(init: u128, created: &'static std::panic::Location<'static>) -> Atomic<T> {
         Atomic {
-            state,
+            state: rt::Atomic::const_new(init, Some(created)),
             _p: PhantomData,
         }
     }
 
-    /// `const` constructor — see [`rt::Atomic::const_new`]. `init` is the
-    /// `u128` representation of the initial value; callers know the concrete
-    /// type and convert with a `const`-callable cast, because
-    /// `rt::Numeric::into_u128` is a trait method and cannot be one.
-    ///
-    /// No `location!()`: `Location::caller()` is not `const`-callable either,
-    /// so a cell built here reports no creation site. The cost is confined to
-    /// diagnostics — every *access* still tracks its own location.
-    pub(crate) const fn const_new(init: u128) -> Atomic<T> {
+    /// The runtime arm of [`new`](Self::new).
+    fn eager(init: u128, created: &'static std::panic::Location<'static>) -> Atomic<T> {
         Atomic {
-            state: rt::Atomic::const_new(init),
+            state: rt::Atomic::new(T::from_u128(init), captured(created)),
             _p: PhantomData,
         }
+    }
+
+    /// Creates a cell with registration deferred to first access whatever the
+    /// context — the deferred genesis for a cell built at *runtime*, which
+    /// [`new`](Self::new) would register eagerly. See [`rt::Atomic::const_new`].
+    pub(crate) const fn const_new(init: u128) -> Atomic<T> {
+        Atomic {
+            state: rt::Atomic::const_new(init, None),
+            _p: PhantomData,
+        }
+    }
+}
+
+impl<T> Atomic<*mut T> {
+    /// The `const` arm of `AtomicPtr::new`: only a null pointer exists in
+    /// `const` evaluation, and it is the one value the record can hold without
+    /// the pointer-to-integer cast a `const fn` cannot perform.
+    pub(crate) const fn deferred_null(
+        v: *mut T,
+        created: &'static std::panic::Location<'static>,
+    ) -> Atomic<*mut T> {
+        assert!(
+            v.is_null(),
+            "a `const`-built AtomicPtr must be null: no other pointer exists in const evaluation"
+        );
+        Atomic {
+            state: rt::Atomic::const_new(0, Some(created)),
+            _p: PhantomData,
+        }
+    }
+
+    /// The runtime arm of `AtomicPtr::new`.
+    pub(crate) fn eager_ptr(
+        v: *mut T,
+        created: &'static std::panic::Location<'static>,
+    ) -> Atomic<*mut T> {
+        Atomic {
+            state: rt::Atomic::new(v, captured(created)),
+            _p: PhantomData,
+        }
+    }
+}
+
+/// `created` as the execution records it: captured when location tracking is
+/// on, disabled otherwise — what `location!()` does, for a site captured by a
+/// `const fn` the macro cannot run in.
+fn captured(created: &'static std::panic::Location<'static>) -> rt::Location {
+    if rt::execution(|execution| execution.location) {
+        rt::Location::from(created)
+    } else {
+        rt::Location::disabled()
     }
 }
 

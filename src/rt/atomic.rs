@@ -253,6 +253,11 @@ pub struct Atomic<T> {
     /// `PhantomData<fn() -> T>` grants it. Unread when `state` is `Some`.
     init: u128,
 
+    /// The creation site of a deferred cell, recorded when its registration
+    /// lands. `None` for an eagerly registered cell, whose `State` carries it
+    /// from construction, and for a deferred cell built with no caller.
+    created: Option<&'static std::panic::Location<'static>>,
+
     _p: PhantomData<fn() -> T>,
 }
 
@@ -701,7 +706,11 @@ fn mint_id(slot: &std::sync::atomic::AtomicU64) -> u64 {
 
 /// Resolve — and on first access of this execution, create — the registration
 /// of the cell with identity `id`, whose value before any store is `init`.
-fn register(id: u64, init: u128) -> object::Ref<State> {
+fn register(
+    id: u64,
+    init: u128,
+    created: Option<&'static std::panic::Location<'static>>,
+) -> object::Ref<State> {
     rt::execution(|execution| {
         if let Some(&state) = execution.deferred_atomics.get(&id) {
             return state;
@@ -710,7 +719,13 @@ fn register(id: u64, init: u128) -> object::Ref<State> {
         let state = execution.objects.insert_with(State::shell, State::recycle);
         // A `const`-constructed cell is in the binary image, not in memory a
         // thread published, so its genesis precedes the execution.
-        state.get_mut(&mut execution.objects).init_deferred(init, None);
+        let cell = state.get_mut(&mut execution.objects);
+        cell.init_deferred(init, None);
+        if execution.location {
+            if let Some(created) = created {
+                cell.created_location = Location::from(created);
+            }
+        }
         execution.deferred_atomics.insert(id, state);
 
         trace!(?state, id, "atomic::register");
@@ -1338,6 +1353,7 @@ impl<T: Numeric> Atomic<T> {
                 state: Some(state),
                 cell_id: std::sync::atomic::AtomicU64::new(0),
                 init: 0,
+                created: None,
                 _p: PhantomData,
             }
         })
@@ -1368,11 +1384,15 @@ impl<T: Numeric> Atomic<T> {
     /// initialization-race check that [`Atomic::new`]'s thread-attributed
     /// genesis provides, which is why `new` keeps that genesis and every
     /// runtime construction keeps using it.
-    pub(crate) const fn const_new(init: u128) -> Atomic<T> {
+    pub(crate) const fn const_new(
+        init: u128,
+        created: Option<&'static std::panic::Location<'static>>,
+    ) -> Atomic<T> {
         Atomic {
             state: None,
             cell_id: std::sync::atomic::AtomicU64::new(0),
             init,
+            created,
             _p: PhantomData,
         }
     }
@@ -1395,7 +1415,7 @@ impl<T: Numeric> Atomic<T> {
     /// Resolve — and on first access of this execution, create — the
     /// registration of a deferred cell.
     fn register_deferred(&self) -> object::Ref<State> {
-        register(mint_id(&self.cell_id), self.init)
+        register(mint_id(&self.cell_id), self.init, self.created)
     }
 
 }

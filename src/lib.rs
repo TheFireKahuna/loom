@@ -1,5 +1,9 @@
 #![deny(missing_debug_implementations, missing_docs, rust_2018_idioms)]
 #![cfg_attr(docsrs, feature(doc_cfg))]
+// `const_eval_select`: one `const fn new` on every cell, registering eagerly
+// at runtime and deferring in `const` evaluation. Nightly-only, as the fork is.
+#![feature(core_intrinsics, const_eval_select)]
+#![allow(internal_features)]
 
 //! Loom is a tool for testing concurrent programs.
 //!

@@ -10,17 +10,17 @@ use std::sync::atomic::Ordering;
 pub struct AtomicBool(Atomic<bool>);
 
 impl AtomicBool {
-    /// Creates a new instance of `AtomicBool`.
+    /// Creates a new instance of `AtomicBool`. `const`, as `core`'s is; see
+    /// [`AtomicUsize::new`](crate::sync::atomic::AtomicUsize::new) for how the
+    /// two contexts register.
     #[track_caller]
-    pub fn new(v: bool) -> AtomicBool {
-        AtomicBool(Atomic::new(v, location!()))
+    pub const fn new(v: bool) -> AtomicBool {
+        AtomicBool(Atomic::new(v as u128))
     }
 
-    /// Creates a new instance of `AtomicBool` in a `const` context.
-    ///
-    /// Registration is deferred to first access; see
-    /// [`AtomicUsize::const_new`](crate::sync::atomic::AtomicUsize::const_new)
-    /// for what that changes and when to prefer [`new`](Self::new).
+    /// Creates a new instance of `AtomicBool` with registration deferred to
+    /// first access whatever the context; see
+    /// [`AtomicUsize::const_new`](crate::sync::atomic::AtomicUsize::const_new).
     pub const fn const_new(v: bool) -> AtomicBool {
         AtomicBool(Atomic::const_new(v as u128))
     }

@@ -10,23 +10,23 @@ macro_rules! atomic_ptr {
         atomic_ptr!(@ops [] $name, Atomic<*mut T>);
 
         impl<T> $name<T> {
-            /// Creates a new instance of `AtomicPtr`.
+            /// Creates a new instance of `AtomicPtr`. `const`, as `core`'s is; see
+            /// [`AtomicUsize::new`](crate::sync::atomic::AtomicUsize::new) for how
+            /// the two contexts register. In `const` evaluation only a null
+            /// pointer exists, and a non-null one is a compile error here.
             #[track_caller]
-            pub fn new(v: *mut T) -> $name<T> {
-                $name(Atomic::new(v, location!()))
+            pub const fn new(v: *mut T) -> $name<T> {
+                let created = std::panic::Location::caller();
+                $name(core::intrinsics::const_eval_select(
+                    (v, created),
+                    Atomic::<*mut T>::deferred_null,
+                    Atomic::<*mut T>::eager_ptr,
+                ))
             }
 
-            /// Creates a null `AtomicPtr` in a `const` context.
-            ///
-            /// Null rather than a general `const_new(v: *mut T)` because casting
-            /// a pointer to an integer is not permitted in a `const fn`, so the
-            /// initial value could not be recorded. This is not a real
-            /// restriction: a non-null pointer constant is not available in a
-            /// `const` context either.
-            ///
-            /// Registration is deferred to first access; see
-            /// [`AtomicUsize::const_new`](crate::sync::atomic::AtomicUsize::const_new)
-            /// for what that changes and when to prefer [`new`](Self::new).
+            /// Creates a null `AtomicPtr` with registration deferred to first
+            /// access whatever the context; see
+            /// [`AtomicUsize::const_new`](crate::sync::atomic::AtomicUsize::const_new).
             pub const fn const_null() -> $name<T> {
                 $name(Atomic::const_new(0))
             }

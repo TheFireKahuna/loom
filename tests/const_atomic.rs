@@ -550,3 +550,25 @@ fn unsync_load_of_a_deferred_cell_is_clean() {
         assert_eq!(unsafe { x.unsync_load() }, 4);
     });
 }
+
+// ===== `new` in both contexts =====
+
+/// `new` is `const` and defers in `const` evaluation: a `static` built with it
+/// presents its initializer at the start of every execution, exactly as one
+/// built with `const_new` does.
+#[test]
+fn new_in_a_static_resets_between_executions() {
+    static X: AtomicUsize = AtomicUsize::new(0);
+    static B: AtomicBool = AtomicBool::new(false);
+    static P: AtomicPtr<u32> = AtomicPtr::new(std::ptr::null_mut());
+
+    loom::model(|| {
+        assert_eq!(X.load(Relaxed), 0, "static built by `new` leaked a store");
+        assert!(!B.load(Relaxed));
+        assert!(P.load(Relaxed).is_null());
+        X.store(41, Relaxed);
+        B.store(true, Relaxed);
+        P.store(std::ptr::NonNull::<u32>::dangling().as_ptr(), Relaxed);
+    });
+}
+
