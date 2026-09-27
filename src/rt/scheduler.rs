@@ -97,8 +97,8 @@ impl Scheduler {
         if !STATE.is_set() {
             return None;
         }
-        STATE.with(|state| {
-            let mut state = state.try_borrow_mut().ok()?;
+        STATE.with(|run| {
+            let mut state = run.state.try_borrow_mut().ok()?;
             Some(f(state.execution))
         })
     }

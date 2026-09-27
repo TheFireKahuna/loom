@@ -130,7 +130,10 @@ fn block(location: Location, timed: bool) {
 /// token check. The spurious return is explored at most once per thread per
 /// execution: a caller's park loop then re-checks and parks for real, so every
 /// such loop terminates while every call site can still be the one that spurs.
-pub(crate) fn park_thread(location: Location) {
+///
+/// A `timed` park (`park_timeout`) may also end without the token when its
+/// timeout fires, which `Execution::schedule` does once no thread can run.
+pub(crate) fn park_thread(location: Location, timed: bool) {
     let id = execution(|execution| execution.threads.active_id());
 
     branch_park(id, location);
@@ -150,7 +153,7 @@ pub(crate) fn park_thread(location: Location) {
         }
 
         trace!(thread = ?id, "park: blocked");
-        execution.threads.active_mut().set_parked(location);
+        execution.threads.active_mut().set_parked(location, timed);
         true
     });
 
@@ -165,8 +168,12 @@ pub(crate) fn park_thread(location: Location) {
     branch_park(id, location);
 
     execution(|execution| {
-        let taken = execution.threads.active_mut().take_park_token();
-        assert!(taken, "[loom internal bug] parked thread woken without a token");
+        let active = execution.threads.active_mut();
+        if !active.take_park_token() {
+            assert!(timed, "[loom internal bug] parked thread woken without a token");
+            trace!(thread = ?id, "park: timed out");
+            active.clear_parked();
+        }
     });
 }
 

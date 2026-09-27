@@ -186,7 +186,7 @@ where
 /// forever, and callers should be prepared for this possibility.
 #[track_caller]
 pub fn park() {
-    rt::park_thread(location!());
+    rt::park_thread(location!(), false);
 }
 
 /// Mock implementation of `std::thread::park_timeout`.
@@ -197,7 +197,7 @@ pub fn park() {
 /// [`Condvar::wait_timeout`](crate::sync::Condvar::wait_timeout).
 #[track_caller]
 pub fn park_timeout(_dur: Duration) {
-    rt::park_timed(location!());
+    rt::park_thread(location!(), true);
 }
 
 /// Mock implementation of `std::thread::sleep`.

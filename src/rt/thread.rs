@@ -281,9 +281,14 @@ impl Thread {
     }
 
     /// Block in `park` until `unpark` makes the token available.
-    pub(crate) fn set_parked(&mut self, location: Location) {
+    pub(crate) fn set_parked(&mut self, location: Location, timed: bool) {
         self.parked = true;
-        self.set_blocked(location, false);
+        self.set_blocked(location, timed);
+    }
+
+    /// End a park its timeout ended, so a later `unpark` only sets the token.
+    pub(crate) fn clear_parked(&mut self) {
+        self.parked = false;
     }
 
     /// Whether this execution's one spurious `park` return is still unspent.
