@@ -318,6 +318,11 @@ impl Path {
         }
     }
 
+    /// Whether a preemption bound limits the search.
+    pub(crate) fn is_bounded(&self) -> bool {
+        self.preemption_bound.is_some()
+    }
+
     /// Branches below this are frozen: their choice here is fixed, and their
     /// alternatives are claimed through [`Frozen`] rather than explored
     /// directly.

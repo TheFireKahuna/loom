@@ -67,6 +67,12 @@ pub(crate) struct Thread {
     /// Tracks DPOR relations
     pub dpor_vv: VersionVec,
 
+    /// `dpor_vv` as it stood before the current operation joined its own
+    /// dependences: what the operation is ordered after by everything but
+    /// itself. `None` under a preemption bound, where the search does not
+    /// promise every reordering of unordered operations.
+    pub dpor_prior: Option<VersionVec>,
+
     /// Version at which the thread last yielded
     pub last_yield: Option<u16>,
 
@@ -187,6 +193,7 @@ impl Thread {
             parked: false,
             park_spurred: false,
             dpor_vv: VersionVec::new(),
+            dpor_prior: None,
             last_yield: None,
             yield_count: 0,
             symmetry_rank: None,

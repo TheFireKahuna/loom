@@ -427,7 +427,9 @@ impl Execution {
             // i.e. all threads' dependent accesses, not just the most
             // recent one overall.
             {
-                let dpor_vv = &mut threads.active_mut().dpor_vv;
+                let active = threads.active_mut();
+                active.dpor_prior = (!self.path.is_bounded()).then_some(active.dpor_vv);
+                let dpor_vv = &mut active.dpor_vv;
                 self.objects.for_each_dependent_access(operation, |access| {
                     dpor_vv.join(access.version());
                 });

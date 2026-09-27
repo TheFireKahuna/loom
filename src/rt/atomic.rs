@@ -1892,6 +1892,11 @@ struct Store {
     /// Lane index of the storing thread.
     creator: usize,
 
+    /// The storing thread's own DPOR clock component at the store: another
+    /// operation is ordered after the store by the search exactly when its
+    /// thread's DPOR clock reaches this in lane `creator`.
+    dpor: u16,
+
     /// Manages causality transfers between threads
     sync: Synchronize,
 
@@ -3444,7 +3449,7 @@ impl State {
         let readable = if cmp.is_always() && !may_spur {
             0
         } else {
-            region.readable_mask(threads, &view, failure)
+            region.rmw_readable(threads, &view, failure)
         };
 
         let spur = may_spur && passing(readable, true) != 0 && path.branch_spurious();
@@ -3500,7 +3505,7 @@ impl State {
             0
         };
         let readable = if acc.failure.is_some() {
-            region.readable_mask(threads, &view.causality, failure)
+            region.rmw_readable(threads, &view.causality, failure)
         } else {
             0
         };
@@ -4490,6 +4495,7 @@ impl Region {
             rmw_write: None,
             op_id: 0,
             creator: 0,
+            dpor: 0,
             sync: Synchronize::new(),
             // Untouched: no thread has seen this store yet, including the one
             // that will read it first.
@@ -4560,6 +4566,7 @@ impl Region {
             rmw_write: None,
             op_id,
             creator: threads.active_id().as_usize(),
+            dpor: threads.active().dpor_vv[threads.active_id()],
             sync,
             first_seen,
             sc_rank,
@@ -4625,6 +4632,7 @@ impl Region {
             rmw_write: None,
             op_id,
             creator: threads.active_id().as_usize(),
+            dpor: threads.active().dpor_vv[threads.active_id()],
             sync: Synchronize::new(),
             first_seen,
             sc_rank: None,
@@ -4691,7 +4699,7 @@ impl Region {
     /// (`Region::rmw_edges`, run on a scratch copy of the order).
     fn rmw_writable(&self, threads: &thread::Set, view: &VersionVec, success: Ordering) -> Slots {
         let maximal = self.maximal_mask();
-        let inner = self.readable_mask(threads, view, success) & !maximal;
+        let inner = self.readable_mask(threads, view, success) & self.overtaken(threads);
         if inner == 0 {
             return maximal;
         }
@@ -4719,6 +4727,46 @@ impl Region {
             }
         }
         writable
+    }
+
+    /// The stores a failing RMW — a load at `failure` — may read with
+    /// causality `view`: those a load could, less the non-maximal ones no
+    /// schedule needs (`Region::overtaken`).
+    fn rmw_readable(&self, threads: &thread::Set, view: &VersionVec, failure: Ordering) -> Slots {
+        self.readable_mask(threads, view, failure) & (self.maximal_mask() | self.overtaken(threads))
+    }
+
+    /// The non-maximal stores an RMW now running must be able to read: each
+    /// has a successor the search already orders before this RMW, through
+    /// program order and every dependence its thread has taken
+    /// (`Thread::dpor_prior`), so no schedule runs the RMW while the store is
+    /// still last.
+    ///
+    /// Reading any other non-maximal store is an execution the search reaches
+    /// anyway: the RMW and each successor of the store it read are dependent
+    /// and unordered, so the search also runs the RMW ahead of all of them,
+    /// where that store is maximal and the RMW reads it there, giving the same
+    /// reads-from and modification order. Offering it here too only walks that
+    /// execution twice. A preemption bound may cut the reordered schedule, so
+    /// under one every non-maximal store is offered.
+    fn overtaken(&self, threads: &thread::Set) -> Slots {
+        let Some(prior) = &threads.active().dpor_prior else {
+            return self.all_slots() & !self.maximal_mask();
+        };
+        let mut forced = 0;
+        for (i, x) in self.stores.iter().enumerate() {
+            if prior.lane(x.creator) >= x.dpor {
+                forced |= bit(i);
+            }
+        }
+
+        let mut overtaken = 0;
+        for (i, s) in self.stores.iter().enumerate() {
+            if s.after & forced != 0 {
+                overtaken |= bit(i);
+            }
+        }
+        overtaken
     }
 
     /// Place an RMW's write `w`, which read `s`: after `preds`, and before
