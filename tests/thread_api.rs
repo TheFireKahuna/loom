@@ -115,7 +115,7 @@ fn thread_stack_size() {
         thread::Builder::new()
             .stack_size(
                 // Include space for function calls in addition to the array.
-                2 * STACK_SIZE,
+                2 * STACK_SIZE * std::mem::size_of::<usize>(),
             )
             .spawn(body)
             .unwrap()

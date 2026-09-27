@@ -3,7 +3,8 @@ use crate::rt::sleep::SleepSet;
 use crate::rt::{lazy_static, object, thread, Path};
 
 use rustc_hash::FxHashMap;
-use std::fmt;
+use std::any::Any;
+use std::fmt::{self, Write};
 
 use tracing::info;
 
@@ -95,6 +96,26 @@ pub(crate) struct Execution {
 
 #[derive(Debug, Eq, PartialEq, Hash, Clone, Copy)]
 pub(crate) struct Id(usize);
+
+/// Why an execution failed. Raised once, on the thread that called
+/// `Builder::check`, after exploration has stopped.
+pub(crate) enum Failure {
+    /// A model thread panicked. Its hook has already reported the panic at
+    /// its site, so this is re-raised without running the hook again.
+    Panic(Box<dyn Any + Send>),
+
+    /// A failure the runtime detected, not yet reported anywhere.
+    Report(String),
+}
+
+impl Failure {
+    pub(crate) fn raise(self) -> ! {
+        match self {
+            Failure::Panic(payload) => std::panic::resume_unwind(payload),
+            Failure::Report(report) => panic!("{report}"),
+        }
+    }
+}
 
 impl Execution {
     /// Create a new execution.
@@ -365,24 +386,20 @@ impl Execution {
             }
         }
 
+        // No thread can run. Unless all threads have terminated, the test has
+        // deadlocked: the execution fails with the active thread left in
+        // place, and that thread switches out to the driver for good.
+        if next.is_none() && !self.threads.iter().all(|(_, th)| th.is_terminated()) {
+            std::hint::cold_path();
+            super::Scheduler::fail(Failure::Report(self.deadlock_report()));
+            return true;
+        }
+
         let switched = Some(self.threads.active_id()) != next;
 
         self.threads.set_active(next);
 
-        // There is no active thread. Unless all threads have terminated, the
-        // test has deadlocked.
         if !self.threads.is_active() {
-            let terminal = self.threads.iter().all(|(_, th)| th.is_terminated());
-
-            assert!(
-                terminal,
-                "deadlock; threads = {:?}",
-                self.threads
-                    .iter()
-                    .map(|(i, th)| { (i, th.state) })
-                    .collect::<Vec<_>>()
-            );
-
             return true;
         }
 
@@ -450,6 +467,66 @@ impl Execution {
         }
 
         curr_thread != self.threads.active_id()
+    }
+
+    /// Every thread and what it waits on, for a deadlock's failure report.
+    #[cold]
+    fn deadlock_report(&self) -> String {
+        use crate::rt::thread::State;
+
+        let mut report = String::from("deadlock: no thread can make progress");
+        let mut located = false;
+
+        for (id, th) in self.threads.iter() {
+            let _ = write!(report, "\n    thread {}: ", id.as_usize());
+
+            let location = match th.state {
+                State::Blocked { location, timed } => {
+                    // A pending operation on a stored object is what the
+                    // thread blocked on; a thread that parked has none.
+                    let object = th.operation.and_then(|operation| {
+                        let obj = operation.object();
+                        Some((self.objects.kind(obj)?, obj.index()))
+                    });
+
+                    match object {
+                        Some((kind, index)) => {
+                            let _ = write!(report, "blocked on {kind} #{index}");
+                        }
+                        None => report.push_str("parked"),
+                    }
+
+                    if timed {
+                        report.push_str(" (timed)");
+                    }
+
+                    Some(location)
+                }
+                State::Runnable { .. } => {
+                    report.push_str("runnable");
+                    None
+                }
+                State::Yield => {
+                    report.push_str("yielded");
+                    None
+                }
+                State::Terminated => {
+                    report.push_str("terminated");
+                    None
+                }
+            };
+
+            if let Some(location) = location.filter(|l| l.is_captured()) {
+                let _ = write!(report, " at {location}");
+                located = true;
+            }
+        }
+
+        if !located {
+            report.push_str("\n(set LOOM_LOCATION=1 to name where each thread blocked)");
+        }
+
+        report
     }
 
     /// Panics if any leaks were detected

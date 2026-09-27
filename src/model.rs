@@ -1,7 +1,6 @@
 //! Model concurrent programs.
 
-use crate::rt::{self, Execution, Scheduler};
-use std::any::Any;
+use crate::rt::{self, Execution, Failure, Scheduler};
 use std::panic::{self, AssertUnwindSafe};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
@@ -13,6 +12,14 @@ use tracing_subscriber::{fmt, EnvFilter};
 
 const DEFAULT_MAX_THREADS: usize = 5;
 const DEFAULT_MAX_BRANCHES: usize = 1_000;
+
+/// Stack size of a model thread, in bytes: a real thread's, so that a deep
+/// call chain or a panic hook printing a backtrace fits where it would
+/// outside the model. The stacks are committed when built and reused across
+/// executions, so the cost is address space and commit charge per pooled
+/// thread, not per execution; pages the thread never touches stay
+/// non-resident.
+const DEFAULT_STACK_SIZE: usize = 1 << 20;
 
 /// How often a worker offers part of its remaining subtree to idle peers.
 /// Each check is an uncontended mutex acquire, so this only has to be small
@@ -89,9 +96,11 @@ pub struct Builder {
     /// Defaults to `LOOM_MAX_PERMUTATIONS` environment variable.
     pub max_permutations: Option<usize>,
 
-    /// Maximum amount of time to spend on checking
+    /// Maximum amount of time to spend on checking. A run that reaches it
+    /// before exploring the whole state space fails: the unexplored part may
+    /// hold the bug. Every exploring worker stops within one execution.
     ///
-    /// Defaults to `LOOM_MAX_DURATION` environment variable.
+    /// Defaults to `LOOM_MAX_DURATION` environment variable, in seconds.
     pub max_duration: Option<Duration>,
 
     /// Maximum number of thread preemptions to explore
@@ -127,6 +136,13 @@ pub struct Builder {
     ///
     /// Defaults to existence of `LOOM_LOG` environment variable.
     pub log: bool,
+
+    /// Stack size, in bytes, of each model thread — the model's main thread
+    /// and every thread spawned without an explicit
+    /// [`thread::Builder::stack_size`](crate::thread::Builder::stack_size).
+    ///
+    /// Defaults to the `LOOM_STACK_SIZE` environment variable, else 1 MiB.
+    pub stack_size: usize,
 
     /// Number of OS threads exploring the state space concurrently.
     ///
@@ -274,6 +290,9 @@ impl Builder {
             expect_explicit_explore: false,
             location,
             log,
+            stack_size: env::var("LOOM_STACK_SIZE")
+                .map(|v| v.parse().expect("invalid value for `LOOM_STACK_SIZE`"))
+                .unwrap_or(DEFAULT_STACK_SIZE),
             threads,
             budgeted: true,
             split_depth: env::var("LOOM_SPLIT_DEPTH")
@@ -315,10 +334,25 @@ impl Builder {
     }
 
     /// Check the provided model.
+    ///
+    /// # Panics
+    ///
+    /// When an execution fails, once, after exploration has stopped: a
+    /// deadlock panics with a report of what each thread waits on, and a
+    /// panic in a model thread is re-raised with its own payload. A failed
+    /// execution is not unwound further: once a model thread panics, the
+    /// first tracked operation a destructor attempts during its unwinding
+    /// stops that thread for good and fails the model with the panic's
+    /// message — even if the panic would have been caught inside the model.
+    ///
+    /// Also panics when `max_duration` passes before the state space is
+    /// fully explored.
     pub fn check<F>(&self, f: F) -> Stats
     where
         F: Fn() + Sync + Send + 'static,
     {
+        Scheduler::install_panic_hook();
+
         let f = Arc::new(f);
 
         // One worker is always ours; the rest are whatever the machine has
@@ -348,21 +382,34 @@ impl Builder {
             Some(start + self.probe)
         };
 
-        let stats = match self.check_serial(&f, probe) {
-            Ok(stats) => stats,
-            Err((probed, probed_pruned, probed_conservative, seed)) => {
-                let stats = self.check_parallel(&f, workers, seed);
+        let (stats, timed_out) = match self.on_driver(|| self.check_serial(&f, start, probe)) {
+            Walk::Done(stats) => (stats, false),
+            Walk::TimedOut(stats) => (stats, true),
+            Walk::Failed(failure) => failure.raise(),
+            Walk::Handover(probed, seed) => {
+                let (stats, timed_out) = self.check_parallel(&f, workers, start, seed);
 
-                Stats {
-                    executions: stats.executions + probed,
-                    pruned: stats.pruned + probed_pruned,
-                    conservative: stats.conservative + probed_conservative,
+                let stats = Stats {
+                    executions: stats.executions + probed.executions,
+                    pruned: stats.pruned + probed.pruned,
+                    conservative: stats.conservative + probed.conservative,
                     ..stats
-                }
+                };
+
+                (stats, timed_out)
             }
         };
 
         drop(grant);
+
+        if timed_out {
+            panic!(
+                "loom model exceeded max_duration ({:?}) after {} executions, \
+                 before exploring its whole state space",
+                self.max_duration.unwrap_or_default(),
+                stats.executions,
+            );
+        }
 
         // `LOOM_LOG` forces a serial walk, so it cannot report what a sharded
         // run explored. This can, and the execution count is the number that
@@ -382,6 +429,28 @@ impl Builder {
         stats
     }
 
+    /// Run `walk` on a thread of its own, named for the caller.
+    ///
+    /// A failed execution can leave its driver's OS thread with a raised
+    /// panic count — the unwind it abandoned — so every walk that runs
+    /// executions owns the thread it does so on, and that thread ends with
+    /// the walk.
+    fn on_driver<T: Send>(&self, walk: impl FnOnce() -> T + Send) -> T {
+        let dispatch = tracing::dispatcher::get_default(|d| d.clone());
+
+        let driver = std::thread::scope(|scope| {
+            driver_thread()
+                .spawn_scoped(scope, || tracing::dispatcher::with_default(&dispatch, walk))
+                .expect("failed to spawn the loom driver thread")
+                .join()
+        });
+
+        match driver {
+            Ok(value) => value,
+            Err(payload) => panic::resume_unwind(payload),
+        }
+    }
+
     fn new_execution(&self) -> Execution {
         let mut execution = Execution::new(
             self.max_threads,
@@ -397,34 +466,29 @@ impl Builder {
         execution
     }
 
-    /// Whether the run has hit a configured ceiling. Checked once per
-    /// execution; `max_duration` reads the clock, so it is only consulted on
-    /// the same cadence as work donation.
-    fn limit_reached(&self, executions: usize, start: Instant) -> bool {
+    /// The configured ceiling the run has hit, if any. Checked once per
+    /// execution; the clock is read only when `max_duration` is set, and a
+    /// read is noise against an execution.
+    fn limit_reached(&self, executions: usize, start: Instant) -> Option<Limit> {
         if let Some(max) = self.max_permutations {
             if executions >= max {
-                return true;
+                return Some(Limit::Permutations);
             }
         }
 
         if let Some(max) = self.max_duration {
-            if executions % DONATE_INTERVAL == 0 && start.elapsed() >= max {
-                return true;
+            if start.elapsed() >= max {
+                return Some(Limit::Duration);
             }
         }
 
-        false
+        None
     }
 
-    /// Walk the whole tree on this thread. Returns `Err` with the executions
-    /// done so far and the path to continue from if `deadline` passes first —
-    /// the caller then knows the model is large enough to be worth handing to a
-    /// worker pool.
-    fn check_serial<F>(
-        &self,
-        f: &Arc<F>,
-        deadline: Option<Instant>,
-    ) -> Result<Stats, (usize, usize, usize, rt::Path)>
+    /// Walk the whole tree on this thread, until it is exhausted, a ceiling
+    /// is hit, or an execution fails. If `probe` passes first, hands the rest
+    /// of the tree back: the model is large enough to be worth a worker pool.
+    fn check_serial<F>(&self, f: &Arc<F>, start: Instant, probe: Option<Instant>) -> Walk
     where
         F: Fn() + Sync + Send + 'static,
     {
@@ -433,7 +497,7 @@ impl Builder {
         let mut _span = tracing::info_span!("iter", message = i).entered();
 
         let mut execution = self.new_execution();
-        let mut scheduler = Scheduler::new(self.max_threads);
+        let mut scheduler = Scheduler::new(self.max_threads, self.stack_size);
 
         if let Some(ref path) = self.checkpoint_file {
             if path.exists() {
@@ -442,7 +506,6 @@ impl Builder {
             }
         }
 
-        let start = Instant::now();
         loop {
             if i % self.checkpoint_interval == 0 {
                 info!(parent: None, "");
@@ -455,18 +518,6 @@ impl Builder {
                 if let Some(ref path) = self.checkpoint_file {
                     checkpoint::store_execution_path(&execution.path, path);
                 }
-
-                if let Some(max_permutations) = self.max_permutations {
-                    if i >= max_permutations {
-                        return Ok(self.stats(i - 1, 1, execution.pruned, conservative));
-                    }
-                }
-
-                if let Some(max_duration) = self.max_duration {
-                    if start.elapsed() >= max_duration {
-                        return Ok(self.stats(i - 1, 1, execution.pruned, conservative));
-                    }
-                }
             }
 
             // Only a run that is deciding whether to shard reads the clock
@@ -474,13 +525,18 @@ impl Builder {
             // execution itself. Checking on the donation cadence instead would
             // overshoot the probe by up to a full interval, and those
             // executions are thrown away along with the tree they built.
-            if let Some(deadline) = deadline {
+            if let Some(deadline) = probe {
                 if Instant::now() >= deadline {
-                    return Err((i - 1, execution.pruned, conservative, execution.path));
+                    let probed = self.stats(i - 1, 1, execution.pruned, conservative);
+                    return Walk::Handover(probed, execution.path);
                 }
             }
 
-            run_once(&mut scheduler, &mut execution, f);
+            if let Err(failure) = run_once(&mut scheduler, &mut execution, f) {
+                // Its user values must not be destroyed (`Scheduler::run`).
+                std::mem::forget(execution);
+                return Walk::Failed(failure);
+            }
 
             execution.check_for_leaks();
 
@@ -488,16 +544,26 @@ impl Builder {
                 conservative += 1;
             }
 
-            i += 1;
-
             // Create the next iteration's `tracing` span before trying to step to the next
             // execution, as the `Execution` will capture the current span when
             // it's reset.
-            _span = tracing::info_span!(parent: None, "iter", message = i).entered();
+            _span = tracing::info_span!(parent: None, "iter", message = i + 1).entered();
             if !execution.step() {
-                info!(parent: None, "Completed in {} iterations", i - 1);
-                return Ok(self.stats(i - 1, 1, execution.pruned, conservative));
+                info!(parent: None, "Completed in {} iterations", i);
+                return Walk::Done(self.stats(i, 1, execution.pruned, conservative));
             }
+
+            match self.limit_reached(i, start) {
+                None => {}
+                Some(Limit::Permutations) => {
+                    return Walk::Done(self.stats(i, 1, execution.pruned, conservative))
+                }
+                Some(Limit::Duration) => {
+                    return Walk::TimedOut(self.stats(i, 1, execution.pruned, conservative))
+                }
+            }
+
+            i += 1;
         }
     }
 
@@ -509,7 +575,15 @@ impl Builder {
     /// share an `Execution`, a `Scheduler`, or a coroutine — only the task pool
     /// and the frozen prefixes — so each explores exactly as a serial walk
     /// does, one path at a time.
-    fn check_parallel<F>(&self, f: &Arc<F>, workers: usize, mut seed: rt::Path) -> Stats
+    ///
+    /// Returns the stats and whether the run stopped at `max_duration`.
+    fn check_parallel<F>(
+        &self,
+        f: &Arc<F>,
+        workers: usize,
+        start: Instant,
+        mut seed: rt::Path,
+    ) -> (Stats, bool)
     where
         F: Fn() + Sync + Send + 'static,
     {
@@ -519,7 +593,6 @@ impl Builder {
 
         // Worker threads do not inherit the caller's `tracing` subscriber.
         let dispatch = tracing::dispatcher::get_default(|d| d.clone());
-        let start = Instant::now();
 
         std::thread::scope(|scope| {
             for _ in 0..workers {
@@ -527,42 +600,44 @@ impl Builder {
                 let f = f.clone();
                 let dispatch = dispatch.clone();
 
-                scope.spawn(move || {
-                    tracing::dispatcher::with_default(&dispatch, || {
-                        // The `Scheduler` is built inside the guarded scope so
-                        // that a model panic unwinds through its `Drop` with
-                        // the thread still flagged as panicking, leaving
-                        // suspended coroutines to the generator crate exactly
-                        // as an unguarded serial run does.
-                        let run = panic::catch_unwind(AssertUnwindSafe(|| {
-                            self.worker(shared, &f, workers, start);
-                        }));
+                driver_thread()
+                    .spawn_scoped(scope, move || {
+                        tracing::dispatcher::with_default(&dispatch, || {
+                            // The `Scheduler` is built inside the guarded
+                            // scope so that a driver-side panic (a leak
+                            // report) unwinds through its `Drop` with the
+                            // thread flagged as panicking.
+                            let run = panic::catch_unwind(AssertUnwindSafe(|| {
+                                self.worker(shared, &f, workers, start);
+                            }));
 
-                        if let Err(payload) = run {
-                            shared.fail(payload);
-                        }
-                    });
-                });
+                            if let Err(payload) = run {
+                                shared.fail(Failure::Panic(payload));
+                            }
+                        });
+                    })
+                    .expect("failed to spawn a loom worker thread");
             }
         });
 
         let executions = shared.executions.load(Relaxed);
         let pruned = shared.pruned.load(Relaxed);
         let conservative = shared.conservative.load(Relaxed);
+        let timed_out = shared.timed_out.load(Relaxed);
 
-        if let Some(payload) = shared.into_failure() {
-            panic::resume_unwind(payload);
+        if let Some(failure) = shared.into_failure() {
+            failure.raise();
         }
 
         info!(parent: None, "Completed in {} iterations", executions);
-        self.stats(executions, workers, pruned, conservative)
+        (self.stats(executions, workers, pruned, conservative), timed_out)
     }
 
     fn worker<F>(&self, shared: &Shared, f: &Arc<F>, workers: usize, start: Instant)
     where
         F: Fn() + Sync + Send + 'static,
     {
-        let mut scheduler = Scheduler::new(self.max_threads);
+        let mut scheduler = Scheduler::new(self.max_threads, self.stack_size);
 
         // One `Execution` for the worker's whole life: taking a new subtree
         // swaps the path in and epoch-resets the rest, so the object store's
@@ -576,7 +651,13 @@ impl Builder {
             execution.reset_iteration();
 
             loop {
-                run_once(&mut scheduler, &mut execution, f);
+                if let Err(failure) = run_once(&mut scheduler, &mut execution, f) {
+                    // Its user values must not be destroyed (`Scheduler::run`),
+                    // and this thread runs no further execution.
+                    std::mem::forget(execution);
+                    shared.fail(failure);
+                    return;
+                }
 
                 execution.check_for_leaks();
 
@@ -586,7 +667,11 @@ impl Builder {
 
                 let done = shared.executions.fetch_add(1, Relaxed) + 1;
 
-                if self.limit_reached(done, start) {
+                if let Some(limit) = self.limit_reached(done, start) {
+                    if limit == Limit::Duration {
+                        shared.timed_out.store(true, Relaxed);
+                    }
+
                     shared.stop();
                     shared.pruned.fetch_add(execution.pruned, Relaxed);
                     shared.conservative.fetch_add(conservative, Relaxed);
@@ -599,12 +684,13 @@ impl Builder {
 
                 if done % DONATE_INTERVAL == 0 {
                     shared.donate(&mut execution.path);
+                }
 
-                    if shared.stopped() {
-                        shared.pruned.fetch_add(execution.pruned, Relaxed);
-                        shared.conservative.fetch_add(conservative, Relaxed);
-                        return;
-                    }
+                // A peer failed or hit a ceiling: the verdict is in.
+                if shared.stopped() {
+                    shared.pruned.fetch_add(execution.pruned, Relaxed);
+                    shared.conservative.fetch_add(conservative, Relaxed);
+                    return;
                 }
             }
         }
@@ -625,7 +711,11 @@ impl Builder {
     }
 }
 
-fn run_once<F>(scheduler: &mut Scheduler, execution: &mut Execution, f: &Arc<F>)
+fn run_once<F>(
+    scheduler: &mut Scheduler,
+    execution: &mut Execution,
+    f: &Arc<F>,
+) -> Result<(), Failure>
 where
     F: Fn() + Sync + Send + 'static,
 {
@@ -645,7 +735,39 @@ where
         drop(lazy_statics);
 
         rt::thread_done();
-    });
+    })
+}
+
+/// A thread to drive executions on, named for the thread that asked for the
+/// check, so a panic reported from one of its model threads names the test.
+fn driver_thread() -> std::thread::Builder {
+    let builder = std::thread::Builder::new();
+
+    match std::thread::current().name() {
+        Some(name) => builder.name(name.to_string()),
+        None => builder,
+    }
+}
+
+/// How a serial walk ended.
+enum Walk {
+    /// The tree is exhausted, or `max_permutations` was reached.
+    Done(Stats),
+
+    /// `max_duration` passed first.
+    TimedOut(Stats),
+
+    /// An execution failed.
+    Failed(Failure),
+
+    /// The probe passed first: the walk so far, and the tree still to walk.
+    Handover(Stats, rt::Path),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Limit {
+    Permutations,
+    Duration,
 }
 
 fn cpus() -> usize {
@@ -711,6 +833,9 @@ struct Shared {
     queued: AtomicUsize,
 
     stop: std::sync::atomic::AtomicBool,
+
+    /// Set when the run stopped at `max_duration`.
+    timed_out: std::sync::atomic::AtomicBool,
 }
 
 struct QueueState {
@@ -723,8 +848,8 @@ struct QueueState {
     /// Set when the tree is exhausted, a ceiling was hit, or a model failed.
     done: bool,
 
-    /// The first model panic seen, re-raised on the calling thread.
-    failure: Option<Box<dyn Any + Send>>,
+    /// The first failed execution's failure, raised on the calling thread.
+    failure: Option<Failure>,
 }
 
 impl Shared {
@@ -743,6 +868,7 @@ impl Shared {
             idle: AtomicUsize::new(0),
             queued: AtomicUsize::new(1),
             stop: std::sync::atomic::AtomicBool::new(false),
+            timed_out: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -835,20 +961,20 @@ impl Shared {
         self.stop.load(Relaxed)
     }
 
-    fn fail(&self, payload: Box<dyn Any + Send>) {
+    fn fail(&self, failure: Failure) {
         self.stop.store(true, Relaxed);
 
         let mut state = self.state.lock().unwrap();
         state.done = true;
 
         if state.failure.is_none() {
-            state.failure = Some(payload);
+            state.failure = Some(failure);
         }
 
         self.wake.notify_all();
     }
 
-    fn into_failure(self) -> Option<Box<dyn Any + Send>> {
+    fn into_failure(self) -> Option<Failure> {
         self.state.into_inner().unwrap().failure
     }
 }

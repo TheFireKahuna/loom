@@ -195,6 +195,24 @@ objects! {
     Cell(rt::cell::State),
 }
 
+impl Store {
+    /// The kind of primitive `obj` refers to, as a failure report names it;
+    /// `None` for an object with no entry (a park object, S).
+    pub(super) fn kind(&self, obj: Ref) -> Option<&'static str> {
+        Some(match self.entries[..self.live].get(obj.index)? {
+            Entry::Alloc(_) => "allocation",
+            Entry::Arc(_) => "Arc",
+            Entry::Atomic(_) => "atomic",
+            Entry::Mutex(_) => "Mutex",
+            Entry::Condvar(_) => "Condvar",
+            Entry::Notify(_) => "Notify",
+            Entry::RwLock(_) => "RwLock",
+            Entry::Channel(_) => "channel",
+            Entry::Cell(_) => "UnsafeCell",
+        })
+    }
+}
+
 impl<T> Store<T> {
     /// Create a new, empty, object store
     pub(super) fn with_capacity(capacity: usize) -> Store<T> {

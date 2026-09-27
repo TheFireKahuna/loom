@@ -27,7 +27,7 @@ mod condvar;
 pub(crate) use self::condvar::Condvar;
 
 mod execution;
-pub(crate) use self::execution::Execution;
+pub(crate) use self::execution::{Execution, Failure};
 
 mod notify;
 pub(crate) use self::notify::Notify;
