@@ -48,9 +48,12 @@ impl Region {
 /// minimum is the least noise-contaminated estimator of the underlying cost.
 const TRIALS: usize = 3;
 
+/// A thread's clock lane holds 65,535 operations per execution, so a
+/// single-thread rig repeats short models (`reps`) rather than lengthening one.
 fn run(
     label: &str,
     branches: usize,
+    reps: usize,
     f: impl Fn() + Sync + Send + Clone + 'static,
 ) -> (usize, Duration) {
     let mut best = Duration::MAX;
@@ -61,11 +64,13 @@ fn run(
         builder.max_branches = branches;
 
         let start = Instant::now();
-        let stats = builder.check(f.clone());
+        executions = 0;
+        for _ in 0..reps {
+            executions += builder.check(f.clone()).executions;
+        }
         let elapsed = start.elapsed();
 
         best = best.min(elapsed);
-        executions = stats.executions;
     }
 
     assert!(
@@ -99,14 +104,14 @@ fn compare(title: &str, fat: (usize, Duration), thin: (usize, Duration)) {
 fn sequential(ops: usize) {
     println!("sequential, {ops} ops per execution");
 
-    let fat = run("constructed", ops * 8 + 1024, move || {
+    let fat = run("constructed", ops * 8 + 1024, 40, move || {
         let cell = Fat::new(0);
         for _ in 0..ops {
             cell.store(cell.load(Relaxed) + 1, Relaxed);
         }
     });
 
-    let thin = run("materialized", ops * 8 + 1024, move || {
+    let thin = run("materialized", ops * 8 + 1024, 40, move || {
         let region = Region::new(1);
         let cell = region.cell(0);
         for _ in 0..ops {
@@ -122,7 +127,7 @@ fn sequential(ops: usize) {
 fn contended(ops: usize) {
     println!("contended, 2 threads x {ops} rmw");
 
-    let fat = run("constructed", 100_000, move || {
+    let fat = run("constructed", 100_000, 1, move || {
         let cell = Arc::new(Fat::new(0));
         let peer = cell.clone();
 
@@ -139,7 +144,7 @@ fn contended(ops: usize) {
         t.join().unwrap();
     });
 
-    let thin = run("materialized", 100_000, move || {
+    let thin = run("materialized", 100_000, 1, move || {
         let region = Arc::new(Region::new(1));
         let peer = region.clone();
 
@@ -170,7 +175,7 @@ fn contended(ops: usize) {
 fn many_cells(cells: usize, rounds: usize) {
     println!("many cells, {cells} cells x {rounds} rounds");
 
-    let fat = run("constructed", cells * rounds * 8 + 1024, move || {
+    let fat = run("constructed", cells * rounds * 8 + 1024, 40, move || {
         let all: Vec<Fat> = (0..cells).map(|_| Fat::new(0)).collect();
         for _ in 0..rounds {
             for c in &all {
@@ -179,7 +184,7 @@ fn many_cells(cells: usize, rounds: usize) {
         }
     });
 
-    let thin = run("materialized", cells * rounds * 8 + 1024, move || {
+    let thin = run("materialized", cells * rounds * 8 + 1024, 40, move || {
         let region = Region::new(cells);
         for _ in 0..rounds {
             for i in 0..cells {
@@ -202,7 +207,7 @@ fn many_cells(cells: usize, rounds: usize) {
 fn churn(cells: usize, rounds: usize) {
     println!("churn, 2 threads x {rounds} passes over {cells} cells, opposite orders");
 
-    let thin = run("materialized", 200_000, move || {
+    let thin = run("materialized", 200_000, 1, move || {
         let region = Arc::new(Region::new(cells));
         let peer = region.clone();
 
@@ -243,13 +248,13 @@ fn main() {
     let want = |name: &str| run_all || args.iter().any(|a| a == name);
 
     if want("--sequential") {
-        sequential(50_000);
+        sequential(30_000);
     }
     if want("--contended") {
         contended(9);
     }
     if want("--many-cells") {
-        many_cells(4_000, 250);
+        many_cells(2_000, 15);
     }
     if want("--churn") {
         churn(3, 4);
