@@ -120,10 +120,10 @@ impl Condvar {
             rt::park(location);
         }
 
-        // A notification dequeues its target before waking it; any other
-        // wake (the timeout rescue, a stray `Thread::unpark`) leaves the
-        // entry behind. Dequeue ourselves so a later notification is not
-        // spent on a thread that already returned from its wait.
+        // A notification dequeues its target before waking it; the other
+        // wake (the timeout rescue) leaves the entry behind. Dequeue ourselves
+        // so a later notification is not spent on a thread that already
+        // returned from its wait.
         let timed_out = rt::execution(|execution| {
             let id = execution.threads.active_id();
             let state = self.state.get_mut(&mut execution.objects);
@@ -155,7 +155,7 @@ impl Condvar {
             trace!(state = ?self.state, ?thread, "Condvar::notify_one");
 
             if let Some(thread) = thread {
-                execution.threads.unpark(thread);
+                execution.threads.wake(thread);
             }
         })
     }
@@ -170,7 +170,7 @@ impl Condvar {
             trace!(state = ?self.state, threads = ?state.waiters, "Condvar::notify_all");
 
             for thread in state.waiters.drain(..) {
-                execution.threads.unpark(thread);
+                execution.threads.wake(thread);
             }
         })
     }

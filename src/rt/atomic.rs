@@ -137,13 +137,25 @@
 //!   needs no check: it reads an mo-maximal store, which is never mo-before any
 //!   other store to the region.
 //!
-//! `fence(SeqCst)` participates in two cooperating mechanisms. Its position in
-//! S (above) supplies the access↔fence interaction — promotion and the
-//! fence-read scope. A separate causality frontier
-//! (`thread::Set::seq_cst_fence`) supplies fence↔fence ordering (p6/p7 among
-//! fences) by propagating happens-before. The two are independent: the S rules
-//! are read restrictions that create no happens-before, while the frontier
-//! carries the happens-before that ordered fence pairs require.
+//! `fence(SeqCst)` participates in two cooperating mechanisms, neither of
+//! which creates happens-before — C++20 SC fences have none of their own, so
+//! a data race across two fences stays a race:
+//!
+//! - Its position in S supplies the fence↔access rules. Promotion (above)
+//!   ranks, at the fence's position, every store that happens before the
+//!   fence or that an operation happening before it read (p4.2). The fence's
+//!   position bounds the *scope* of every operation the fence happens before
+//!   — carried along synchronization in `ScView::fence_pos` — which may not be
+//!   coherence-ordered before an SC-ranked store within it (p4.3): a load may
+//!   not read under one, a store or RMW is placed modification-order-after
+//!   each.
+//! - A coherence frontier (`thread::Set::seq_cst_fence`, `ScView::frontier`)
+//!   supplies fence↔fence ordering (p4.4): whatever happens before a fence
+//!   earlier in S counts, for coherence alone, as happening before whatever
+//!   this fence happens before (`Thread::coherence_view`).
+//!
+//! A fence is an operation on S itself, DPOR-dependent with every other SC
+//! fence and SC access, so every order of them S could take is explored.
 //!
 //! - RMW/MO Consistency: Subsumed by Write-Write Coherence?
 //!
@@ -851,11 +863,9 @@ pub(super) struct State {
 
     /// Bitset (one bit per thread id) of threads that have *touched a store's
     /// `first_seen`* in this cell — i.e. loaded, stored, or rmw'd it, plus the
-    /// creating thread for the genesis store. A `fence(Acquire)` synchronizes
-    /// only with stores the active thread has touched, and a `fence(SeqCst)`
-    /// only promotes stores the active thread created; both are impossible in
-    /// a cell whose bit for the active thread is clear, so such cells are
-    /// skipped wholesale instead of scanning their stores. Maintained wherever
+    /// creating thread for the genesis store. A `fence(Acquire)` can only
+    /// have read a preserved lane of a cell whose bit for the active thread is
+    /// set, so it skips the others' guard check. Maintained wherever
     /// `first_seen.touch` runs (see `track_load`/`track_store`).
     touched_by: u32,
 
@@ -909,7 +919,7 @@ impl LoadView {
     /// The state as of the load, before any region is resolved.
     fn entry(threads: &thread::Set) -> LoadView {
         LoadView {
-            causality: threads.active().causality,
+            causality: threads.active().coherence_view(),
             touched: SmallVec::new(),
         }
     }
@@ -1132,6 +1142,13 @@ impl Store {
     fn tick(&self) -> u16 {
         self.happens_before.lane(self.creator)
     }
+
+    /// Whether this store is SC-ranked within `scope`, an operation's SC
+    /// scope (`thread::Set::active_sc_scope`): that operation may not be
+    /// coherence-ordered before it.
+    fn in_sc_scope(&self, scope: Option<u32>) -> bool {
+        matches!((self.sc_rank, scope), (Some(rank), Some(limit)) if rank <= limit)
+    }
 }
 
 /// True when store `a` is known modification-order-before store `b`.
@@ -1243,7 +1260,12 @@ enum OpPin {
 struct FirstSeen([u16; VersionVec::LANES]);
 
 /// Implements atomic fence behavior
+#[track_caller]
 pub(crate) fn fence(ordering: Ordering) {
+    if ordering == Ordering::SeqCst {
+        rt::branch_sc_fence(location!());
+    }
+
     rt::synchronize(|execution| match ordering {
         Ordering::Acquire => fence_acq(execution),
         Ordering::Release => fence_rel(execution),
@@ -1255,21 +1277,15 @@ pub(crate) fn fence(ordering: Ordering) {
 }
 
 fn fence_acq(execution: &mut Execution) {
-    // Find all stores for all atomic objects and, if they have been read by
-    // the current thread, establish an acquire synchronization.
-    //
-    // "Read by the current thread" is literal (C11 fence synchronization:
-    // some atomic operation *sequenced before this fence* must read the
-    // store) — a store that is merely in the thread's causality because some
-    // OTHER thread's relaxed read of it happens-before us does not qualify;
-    // syncing with those would over-approximate and hide real reorderings.
-    // A store this thread itself created also touches `first_seen`, which is
-    // harmless here: its release view is already contained in (or, for an
-    // RMW, legitimately acquired through) this thread's causality.
-    let active_bit = 1u32 << execution.threads.active_id().as_usize();
+    // Synchronize with the release of every store an atomic operation
+    // sequenced before this fence read ([atomics.fences] p4). Each read
+    // accumulated its store's release view into `acquirable` as it happened
+    // (`Synchronize::sync_load`), so a store since evicted from its cell's
+    // history still counts. Only this thread's own reads qualify: a store
+    // merely in its causality through another thread's relaxed read does not.
+    let active = execution.threads.active_id().as_usize();
+    let active_bit = 1u32 << active;
     for state in execution.objects.iter_mut::<State>() {
-        // No store in this cell was ever touched by the active thread, so
-        // `is_touched_by` below is false for all of them — skip the scan.
         if state.touched_by & active_bit == 0 {
             continue;
         }
@@ -1277,29 +1293,23 @@ fn fence_acq(execution: &mut Execution) {
         // sound where it stands; this fence is where it would have taken the
         // elided identity write's release, and cannot (`PreservedOp`).
         assert!(
-            !state.has_unrouted_reader(execution.threads.active_id().as_usize()),
+            !state.has_unrouted_reader(active),
             "fence(Acquire) over a cell this thread read only through a preserved lane.\n\
              `rmw_preserving` elides the identity write there, so the fence cannot draw the \
              preserving operation's release. Use `rmw_masked` for that operation, or read a \
              lane it writes."
         );
-        // Iterate every region's stores
-        for store in state.all_stores_mut() {
-            if !store.first_seen.is_touched_by(execution.threads.active_id()) {
-                continue;
-            }
-
-            store
-                .sync
-                .sync_load(&mut execution.threads, Ordering::Acquire);
-        }
     }
+
+    let active = execution.threads.active_mut();
+    let acquirable = active.acquirable;
+    active.acquire(&acquirable);
 }
 
 fn fence_rel(execution: &mut Execution) {
-    // take snapshot of cur view and record as rel view
+    // Every later store carries the thread's view as of this fence.
     let active = execution.threads.active_mut();
-    active.released = active.causality;
+    active.released = active.view();
 }
 
 fn fence_acqrel(execution: &mut Execution) {
@@ -1308,29 +1318,23 @@ fn fence_acqrel(execution: &mut Execution) {
 }
 
 fn fence_seqcst(execution: &mut Execution) {
-    fence_acqrel(execution);
-    execution.threads.seq_cst_fence();
+    fence_acq(execution);
 
-    // Join this fence into the single SC total order S. It takes the next
-    // position and promotes every store sequenced before it — i.e. every store
-    // this thread created — into S at that position (C++20 [atomics.order]
-    // p5/p7). This is what lets a fence in one thread order against an SC
-    // *access* in another: a promoted store is then an ordinary SC-ranked
-    // witness for the SC read rule, and the fence's position bounds the
-    // fence-read scope of later loads in this thread (p4/p6). Independent of
-    // the `seq_cst_fence` causality frontier above, which handles fence↔fence.
-    let pos = execution.threads.begin_sc_fence();
-    let creator = execution.threads.active_id().as_usize();
-    let creator_bit = 1u32 << creator;
+    // Commit the fence into S (its position, and the coherence frontier of the
+    // fences before it), then promote into S at its position every store that
+    // happens before it or that an operation happening before it read: an SC
+    // operation later in S may not be coherence-ordered before any of them
+    // (C++20 [atomics.order] p4.2). A store already SC-ranked keeps its
+    // earlier position.
+    let pos = execution.threads.seq_cst_fence();
+    let causality = execution.threads.active().causality;
     for state in execution.objects.iter_mut::<State>() {
-        // Promotion only affects stores whose `creator` is this thread, and
-        // every such store set this thread's `touched_by` bit — so a cell
-        // without the bit has nothing to promote.
-        if state.touched_by & creator_bit == 0 {
-            continue;
-        }
-        state.promote_sc_writes(creator, pos);
+        state.promote_sc_writes(&causality, pos);
     }
+
+    // The release half last, so the stores after the fence carry its S
+    // position and frontier to whoever synchronizes with them.
+    fence_rel(execution);
 }
 
 // `Numeric` is private and stays that way: the bound seals this impl even
@@ -1432,7 +1436,7 @@ impl<C: Resolve + ?Sized> ModelOps for C {
     fn load_masked(&self, location: Location, mask: u128, ordering: Ordering) -> u128 {
         let state_ref = self.resolve();
         ensure_partition(state_ref, mask);
-        branch(self, state_ref, Action::Load(mask), location);
+        branch(self, state_ref, Action::Load(mask), is_seq_cst(ordering), location);
 
         super::synchronize(|execution| {
             let state = state_ref.get_mut(&mut execution.objects);
@@ -1487,7 +1491,7 @@ impl<C: Resolve + ?Sized> ModelOps for C {
     fn load_coherent_lane(&self, location: Location, mask: u128, ordering: Ordering) -> u128 {
         let state_ref = self.resolve();
         ensure_partition(state_ref, mask);
-        branch(self, state_ref, Action::Load(mask), location);
+        branch(self, state_ref, Action::Load(mask), is_seq_cst(ordering), location);
 
         super::synchronize(|execution| {
             let state = state_ref.get_mut(&mut execution.objects);
@@ -1515,7 +1519,7 @@ impl<C: Resolve + ?Sized> ModelOps for C {
     fn store_masked(&self, location: Location, mask: u128, val: u128, ordering: Ordering) {
         let state_ref = self.resolve();
         ensure_partition(state_ref, mask);
-        branch(self, state_ref, Action::Store(mask), location);
+        branch(self, state_ref, Action::Store(mask), is_seq_cst(ordering), location);
 
         super::synchronize(|execution| {
             let state = state_ref.get_mut(&mut execution.objects);
@@ -1588,6 +1592,7 @@ impl<C: Resolve + ?Sized> ModelOps for C {
                 read: read_mask,
                 write: write_mask,
             },
+            is_seq_cst(success) || is_seq_cst(failure),
             location,
         );
 
@@ -1622,7 +1627,11 @@ impl<C: Resolve + ?Sized> ModelOps for C {
 
                 let index = execution.path.branch_load();
                 let mask_ri = state.regions[ri].mask;
-                let v = state.regions[ri].rmw_read(&mut execution.threads, index);
+                let v = state.regions[ri].rmw_read(
+                    &mut execution.threads,
+                    index,
+                    is_seq_cst(success) || is_seq_cst(failure),
+                );
                 current |= v & mask_ri;
                 reads.push((ri, index));
             }
@@ -1774,13 +1783,16 @@ impl<C: Resolve + ?Sized> ModelOps for C {
 
 /// Register the operation's DPOR branch, then check the algorithm under test
 /// has not written through an invalid pointer into the cell's own memory.
+/// `sc` is whether the operation takes a place in S (`SeqCst`), which makes
+/// it dependent with every SC fence.
 fn branch<C: Resolve + ?Sized>(
     cell: &C,
     state_ref: object::Ref<State>,
     action: Action,
+    sc: bool,
     location: Location,
 ) {
-    state_ref.branch_action(action, location);
+    state_ref.branch_ordered_action(action, sc, location);
     // Re-resolve rather than compare against the ref we were handed: the point
     // of the check is that the algorithm under test has not written through an
     // invalid pointer into *this cell's own memory*, so the second read must go
@@ -2458,17 +2470,12 @@ impl State {
         false
     }
 
-    /// Promote every live store this thread created into S at `pos`, across
-    /// every region (`Region::promote_sc_writes`).
-    pub(super) fn promote_sc_writes(&mut self, creator: usize, pos: u32) {
+    /// Promote every live store seen in `view` into S at `pos`, across every
+    /// region (`Region::promote_sc_writes`).
+    pub(super) fn promote_sc_writes(&mut self, view: &VersionVec, pos: u32) {
         for region in &mut self.regions {
-            region.promote_sc_writes(creator, pos);
+            region.promote_sc_writes(view, pos);
         }
-    }
-
-    /// Every store across every region (for `fence_acq`).
-    fn all_stores_mut(&mut self) -> impl Iterator<Item = &mut Store> {
-        self.regions.iter_mut().flat_map(|r| r.stores_mut())
     }
 
     /// Track an atomic load
@@ -2531,8 +2538,8 @@ impl State {
         assert!(!self.is_mutating, "atomic cell is in `with_mut` call");
 
         // This op creates a store whose `first_seen` is touched by the active
-        // thread; record it so seqcst fences can skip promoting cells this
-        // thread never wrote (and acquire fences can skip it entirely).
+        // thread; record it so acquire fences can skip this cell if no thread
+        // of theirs ever touched it.
         self.touched_by |= 1 << threads.active_id().as_usize();
 
         let current = &threads.active().causality;
@@ -2789,7 +2796,8 @@ impl Region {
     fn load(&mut self, threads: &mut thread::Set, index: usize, ordering: Ordering) -> u128 {
         debug_assert!(index < self.live_stores(), "load of dead slot");
         // Apply coherence rules
-        self.apply_load_coherence(threads, index);
+        let sc_scope = threads.active_sc_scope(is_seq_cst(ordering));
+        self.apply_load_coherence(threads, index, sc_scope);
 
         let store = &mut self.stores[index];
 
@@ -3007,13 +3015,16 @@ impl Region {
         // ordered before the store.
         let happens_before = threads.active().causality;
 
-        // Starting with the thread's causality covers WRITE-WRITE coherence
-        let mut modification_order = happens_before;
+        // Starting with the thread's coherence view covers WRITE-WRITE
+        // coherence, including against what `SeqCst` fences ordered before
+        // this store (`Thread::coherence_view`).
+        let mut modification_order = threads.active().coherence_view();
 
-        // Whether this store participates in the modelled SC total order S. The
-        // position is allocated once per op (shared across the regions a wide
-        // store spans) and handed in.
-        let sc = sc_rank.is_some();
+        // The SC scope this store is placed under: all of S for a store that
+        // participates in S (its position is allocated once per op, shared
+        // across the regions a wide store spans, and handed in), else the
+        // latest SC fence that happens before it.
+        let sc_scope = threads.active_sc_scope(sc_rank.is_some());
 
         // Apply coherence rules
         for i in 0..live {
@@ -3031,7 +3042,9 @@ impl Region {
             // SC/MO consistency: the SC-ranked stores to a region are totally
             // ordered by S, and mo must agree with S. Every SC-ranked store
             // already committed — whether an SC store or one a fence promoted
-            // (`promote_sc_writes`) — is therefore mo-before this SeqCst store.
+            // (`promote_sc_writes`) — is therefore mo-before this SeqCst store,
+            // and every one ranked within the scope of a fence happening before
+            // this store is mo-before it too (C++20 [atomics.order] p4.3).
             // This is a per-location, S-only mo edge — joined into
             // `modification_order`, never into causality (the S edge orders the
             // writes without manufacturing happens-before). Timing is exact:
@@ -3039,7 +3052,7 @@ impl Region {
             // matching that only they precede it in S.
             if store_i.first_seen.is_seen_by_current(threads)
                 || happens_before.lane(store_i.creator) >= store_i.tick()
-                || (sc && store_i.sc_rank.is_some())
+                || store_i.in_sc_scope(sc_scope)
             {
                 let mo = store_i.modification_order;
                 modification_order.join(&mo);
@@ -3079,10 +3092,11 @@ impl Region {
     /// The read half of an RMW: apply load coherence and return the read
     /// value. The caller composes it across regions; `rmw_commit` or
     /// `rmw_fail` follows.
-    fn rmw_read(&mut self, threads: &mut thread::Set, index: usize) -> u128 {
+    fn rmw_read(&mut self, threads: &mut thread::Set, index: usize, seq_cst: bool) -> u128 {
         debug_assert!(index < self.live_stores(), "rmw_read of dead slot");
         // Apply coherence rules.
-        self.apply_load_coherence(threads, index);
+        let sc_scope = threads.active_sc_scope(seq_cst);
+        self.apply_load_coherence(threads, index, sc_scope);
 
         self.stores[index].first_seen.touch(threads);
 
@@ -3131,11 +3145,27 @@ impl Region {
         self.stores[index].sync.sync_load(threads, failure);
     }
 
-    fn apply_load_coherence(&mut self, threads: &mut thread::Set, index: usize) {
+    /// `sc_scope` is the read's SC scope (`thread::Set::active_sc_scope`).
+    fn apply_load_coherence(
+        &mut self,
+        threads: &mut thread::Set,
+        index: usize,
+        sc_scope: Option<u32>,
+    ) {
         for i in 0..self.live_stores() {
             // Skip if the is current.
             if index == i {
                 continue;
+            }
+
+            // SC scope: the read may not be coherence-ordered before an
+            // SC-ranked store within its scope, so the store it reads is
+            // mo-after every such store (C++20 [atomics.order] p4.1-p4.3).
+            // The candidate filters kept only stores not already mo-before
+            // one; this fixes the order against those left incomparable.
+            if self.stores[i].in_sc_scope(sc_scope) {
+                let mo = self.stores[i].modification_order;
+                self.stores[index].modification_order.join(&mo);
             }
 
             // READ-READ coherence
@@ -3326,13 +3356,15 @@ impl Region {
         n
     }
 
-    /// Promote every live store this thread created (hence sequenced before an
-    /// executing `SeqCst` fence) into the SC total order S at the fence's
-    /// position `pos` (C++20 [atomics.order] p5/p7). A store already SC-ranked
-    /// keeps its own — necessarily earlier — position.
-    fn promote_sc_writes(&mut self, creator: usize, pos: u32) {
+    /// Promote into the SC total order S, at an executing `SeqCst` fence's
+    /// position `pos`, every live store seen in `view`, the fence's causality:
+    /// those that happen before the fence, and those an operation happening
+    /// before it read — `first_seen` holds both (C++20 [atomics.order] p4.2).
+    /// A store already SC-ranked keeps its own — necessarily earlier —
+    /// position.
+    fn promote_sc_writes(&mut self, view: &VersionVec, pos: u32) {
         for store in self.stores_mut() {
-            if store.creator == creator && store.sc_rank.is_none() {
+            if store.sc_rank.is_none() && store.first_seen.is_seen_in(view) {
                 store.sc_rank = Some(pos);
             }
         }
@@ -3428,14 +3460,9 @@ impl FirstSeen {
         }
     }
 
+    /// Seen in the active thread's coherence view (`Thread::coherence_view`).
     fn is_seen_by_current(&self, threads: &thread::Set) -> bool {
-        self.is_seen_in(&threads.active().causality)
-    }
-
-    /// True if the given thread has itself loaded from (or created) the
-    /// store, at any point.
-    fn is_touched_by(&self, thread_id: thread::Id) -> bool {
-        self.0[thread_id.as_usize()] != u16::MAX
+        self.is_seen_in(&threads.active().coherence_view())
     }
 
     /// True if some thread's first sight of the store is contained in `view`.

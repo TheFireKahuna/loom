@@ -67,7 +67,7 @@ impl Notify {
 
             state.notified = true;
 
-            let (active, inactive) = execution.threads.split_active();
+            let (_, inactive) = execution.threads.split_active();
 
             for thread in inactive {
                 let obj = thread
@@ -78,7 +78,7 @@ impl Notify {
                 if obj == Some(self.state.erase()) {
                     trace!(state = ?self.state, thread = ?thread.id, "Notify::notify");
 
-                    thread.unpark(active);
+                    thread.wake();
                 }
             }
         });

@@ -47,8 +47,9 @@ impl Thread {
     /// used as a more CPU-efficient implementation of a spinlock.
     ///
     /// See the [park documentation][park] for more details.
+    #[track_caller]
     pub fn unpark(&self) {
-        rt::execution(|execution| execution.threads.unpark(self.id.id));
+        rt::unpark_thread(self.id.id, location!());
     }
 }
 
@@ -170,7 +171,7 @@ where
 /// forever, and callers should be prepared for this possibility.
 #[track_caller]
 pub fn park() {
-    rt::park(location!());
+    rt::park_thread(location!());
 }
 
 fn spawn_internal<F, T>(

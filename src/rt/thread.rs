@@ -1,5 +1,6 @@
 use crate::rt::execution;
 use crate::rt::object::Operation;
+use crate::rt::synchronize::{ScView, Synchronize};
 use crate::rt::vv::VersionVec;
 
 use std::{any::Any, fmt, ops};
@@ -17,19 +18,44 @@ pub(crate) struct Thread {
     /// The operation the thread is about to take
     pub(super) operation: Option<Operation>,
 
-    /// Tracks observed causality
+    /// Tracks observed causality: happens-before, and nothing else. Every
+    /// data-race check reads it, so no `SeqCst` fence effect may enter it.
     pub causality: VersionVec,
 
-    /// Tracks the view of the lastest release fence
-    pub released: VersionVec,
+    /// The `SeqCst`-fence constraints on this thread's current operation
+    /// (`coherence_view`, `Set::active_sc_fence_pos`). Held fixed for the
+    /// length of one operation: what the operation itself acquires lands in
+    /// `sc_acquired` and takes effect from the next one, so every region of a
+    /// wide load is filtered against one scope.
+    pub(crate) sc: ScView,
 
-    /// S-position of this thread's most recent `SeqCst` fence, or `None` if it
-    /// has executed none. A load sequenced after such a fence is restricted
-    /// against the SC writes visible *as of that fence* (C++20 [atomics.order]
-    /// p4/p6): see `rt::atomic::State::match_load_to_stores`. The most recent
-    /// fence subsumes all earlier ones — its position is the largest, hence
-    /// its as-of view is the furthest along the SC order.
-    pub sc_fence_pos: Option<u32>,
+    /// `SeqCst`-fence constraints acquired since the current operation began;
+    /// folded into `sc` by `begin_op`. Published views include it.
+    sc_acquired: ScView,
+
+    /// The thread's view as of its latest release fence, which every later
+    /// store carries (C++20 [atomics.fences] p2).
+    pub(crate) released: Synchronize,
+
+    /// The release views of every store this thread has read without
+    /// acquiring: what its next acquire fence joins ([atomics.fences] p4).
+    /// Accumulated at the read, so it survives the store leaving its cell's
+    /// history.
+    pub(crate) acquirable: Synchronize,
+
+    /// `std::thread::park`'s token.
+    park_token: bool,
+
+    /// Join of the views of every `unpark` since the token was last consumed:
+    /// consuming it is the acquire half of their synchronization.
+    park_view: Synchronize,
+
+    /// Blocked in `park` waiting for the token; only `unpark` wakes it.
+    parked: bool,
+
+    /// Whether this thread's `park` has already returned spuriously this
+    /// execution. One spurious return per thread bounds every park loop.
+    park_spurred: bool,
 
     /// Tracks DPOR relations
     pub dpor_vv: VersionVec,
@@ -67,9 +93,10 @@ pub(crate) struct Set {
     /// `None` signifies that no thread is runnable.
     active: Option<usize>,
 
-    /// Sequential consistency causality. All sequentially consistent operations
-    /// synchronize with this causality.
-    pub seq_cst_causality: VersionVec,
+    /// Join of the causality of every `SeqCst` fence committed so far. A fence
+    /// takes it into its thread's `ScView::frontier` (never its causality):
+    /// the events it holds precede, in S, whatever that fence happens before.
+    sc_fence_frontier: VersionVec,
 
     /// Next position to hand out in the single total order S over `SeqCst`
     /// operations (C++20 [atomics.order]). Every SC store and every SC fence
@@ -107,9 +134,7 @@ impl Id {
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum State {
-    Runnable {
-        unparked: bool,
-    },
+    Runnable,
     Blocked {
         #[allow(dead_code)]
         location: Location,
@@ -140,12 +165,18 @@ impl Thread {
         Thread {
             id,
             span: tracing::info_span!(parent: parent_span.id(), "thread", id = id.id),
-            state: State::Runnable { unparked: false },
+            state: State::Runnable,
             critical: false,
             operation: None,
             causality: VersionVec::new(),
-            released: VersionVec::new(),
-            sc_fence_pos: None,
+            sc: ScView::new(),
+            sc_acquired: ScView::new(),
+            released: Synchronize::new(),
+            acquirable: Synchronize::new(),
+            park_token: false,
+            park_view: Synchronize::new(),
+            parked: false,
+            park_spurred: false,
             dpor_vv: VersionVec::new(),
             last_yield: None,
             yield_count: 0,
@@ -160,7 +191,7 @@ impl Thread {
     }
 
     pub(crate) fn set_runnable(&mut self) {
-        self.state = State::Runnable { unparked: false };
+        self.state = State::Runnable;
     }
 
     pub(crate) fn set_blocked(&mut self, location: Location, timed: bool) {
@@ -206,19 +237,62 @@ impl Thread {
             .find_map(|(_, local)| local.0.take())
     }
 
-    pub(crate) fn unpark(&mut self, unparker: &Thread) {
-        self.causality.join(&unparker.causality);
-        self.set_unparked();
+    /// Make a thread blocked on a modeled primitive runnable again. A wake
+    /// carries no synchronization: the primitive supplies its own.
+    pub(crate) fn wake(&mut self) {
+        if self.is_blocked() {
+            self.set_runnable();
+        }
     }
 
-    /// Unpark a thread's state. If it is already runnable, store the unpark for
-    /// a future call to `park`.
-    fn set_unparked(&mut self) {
-        if self.is_blocked() || self.is_yield() {
-            self.set_runnable();
-        } else if self.is_runnable() {
-            self.state = State::Runnable { unparked: true }
+    /// The thread's current view, as a release publishes it.
+    pub(crate) fn view(&self) -> Synchronize {
+        let mut sc = self.sc;
+        sc.join(&self.sc_acquired);
+        Synchronize::from_views(self.causality, sc)
+    }
+
+    /// Acquire `view`: its happens-before joins causality now; its `SeqCst`
+    /// part joins from the next operation (`sc`).
+    pub(crate) fn acquire(&mut self, view: &Synchronize) {
+        self.causality.join(view.happens_before());
+        self.sc_acquired.join(view.sc());
+    }
+
+    /// The view coherence is decided against: causality, plus every event the
+    /// `SeqCst` fences ordered before this point (C++20 [atomics.order] p4.4).
+    /// A superset of causality, never used for race detection.
+    pub(crate) fn coherence_view(&self) -> VersionVec {
+        let mut view = self.causality;
+        view.join(&self.sc.frontier);
+        view
+    }
+
+    /// Consume the park token if it is available, acquiring every `unpark`
+    /// that contributed to it. Returns whether it was.
+    pub(crate) fn take_park_token(&mut self) -> bool {
+        if !self.park_token {
+            return false;
         }
+        self.park_token = false;
+        let view = std::mem::replace(&mut self.park_view, Synchronize::new());
+        self.acquire(&view);
+        true
+    }
+
+    /// Block in `park` until `unpark` makes the token available.
+    pub(crate) fn set_parked(&mut self, location: Location) {
+        self.parked = true;
+        self.set_blocked(location, false);
+    }
+
+    /// Whether this execution's one spurious `park` return is still unspent.
+    pub(crate) fn may_spur_park(&self) -> bool {
+        !self.park_spurred
+    }
+
+    pub(crate) fn spend_park_spur(&mut self) {
+        self.park_spurred = true;
     }
 }
 
@@ -232,6 +306,7 @@ impl fmt::Debug for Thread {
             .field("critical", &self.critical)
             .field("operation", &self.operation)
             .field("causality", &self.causality)
+            .field("sc", &self.sc)
             .field("released", &self.released)
             .field("dpor_vv", &self.dpor_vv)
             .field("last_yield", &self.last_yield)
@@ -257,7 +332,7 @@ impl Set {
             execution_id,
             threads,
             active: Some(0),
-            seq_cst_causality: VersionVec::new(),
+            sc_fence_frontier: VersionVec::new(),
             sc_clock: 0,
             symmetry_spawned: 0,
             iteration_span,
@@ -271,11 +346,19 @@ impl Set {
         // Get the identifier for the thread about to be created
         let id = self.threads.len();
 
+        // Spawning synchronizes the spawner with the new thread; the caller
+        // joins causality, the `SeqCst` part travels with it here.
+        let spawner_sc = self.active.map(|active| *self.threads[active].view().sc());
+
         // Push the thread onto the stack
         self.threads.push(Thread::new(
             Id::new(self.execution_id, id),
             &self.iteration_span,
         ));
+
+        if let Some(sc) = spawner_sc {
+            self.threads[id].sc = sc;
+        }
 
         if symmetric {
             self.threads[id].symmetry_rank = Some(self.symmetry_spawned);
@@ -395,9 +478,15 @@ impl Set {
         }
     }
 
-    pub(crate) fn active_causality_inc(&mut self) {
+    /// Begin an operation of the active thread: advance its clock, and bring
+    /// the `SeqCst` constraints it acquired during its previous operation
+    /// into effect.
+    pub(crate) fn begin_op(&mut self) {
         let id = self.active_id();
-        self.active_mut().causality.inc(id);
+        let active = self.active_mut();
+        active.causality.inc(id);
+        let acquired = std::mem::replace(&mut active.sc_acquired, ScView::new());
+        active.sc.join(&acquired);
     }
 
     pub(crate) fn active_atomic_version(&self) -> u16 {
@@ -405,18 +494,26 @@ impl Set {
         self.active().causality[id]
     }
 
-    pub(crate) fn unpark(&mut self, id: Id) {
-        if id == self.active_id() {
-            // The thread is unparking itself. We don't have to join its
-            // causality with the unparker's causality in this case, since the
-            // thread *is* the unparker. Just unpark its state.
-            self.active_mut().set_unparked();
-            return;
-        }
+    /// Wake thread `id` from a block on a modeled primitive (`Thread::wake`).
+    pub(crate) fn wake(&mut self, id: Id) {
+        self.threads[id.id].wake();
+    }
 
-        // Synchronize memory
-        let (active, th) = self.active2_mut(id);
-        th.unpark(active);
+    /// `std::thread::Thread::unpark` by the active thread: make `id`'s park
+    /// token available, publishing the unparker's view into it — the release
+    /// half of unpark→park synchronization, which `take_park_token`
+    /// completes — and wake `id` if it is parked.
+    pub(crate) fn unpark(&mut self, id: Id) {
+        let view = self.active().view();
+        let th = &mut self.threads[id.id];
+
+        th.park_view.join(&view);
+        th.park_token = true;
+
+        if th.parked {
+            th.parked = false;
+            th.set_runnable();
+        }
     }
 
     /// Insert a point of sequential consistency
@@ -442,19 +539,31 @@ impl Set {
         // per-location SC/mo consistency (`State::store`) — a read restriction
         // only. Joining causality here would manufacture happens-before that
         // SC accesses do not have. `fence(SeqCst)` is handled separately, by
-        // the `seq_cst_fence` causality frontier together with the SC-order
-        // position it takes in `begin_sc_fence`. Callers reach this as a
+        // `seq_cst_fence`: an S position and a coherence frontier, neither of
+        // which creates happens-before either. Callers reach this as a
         // "sequential consistency point" for the lock primitives, whose
         // surrounding acquire/release edges already carry the ordering they
         // need.
     }
 
-    pub(crate) fn seq_cst_fence(&mut self) {
-        self.threads[self.active.unwrap()]
-            .causality
-            .join(&self.seq_cst_causality);
-        self.seq_cst_causality
-            .join(&self.threads[self.active.unwrap()].causality);
+    /// Commit the active thread's `SeqCst` fence into S and return its
+    /// position.
+    ///
+    /// Every fence already committed precedes it in S, so everything that
+    /// happens before any of them is, for coherence, ordered before whatever
+    /// this fence happens before (C++20 [atomics.order] p4.4): the frontier
+    /// joins the thread's `ScView`, never its causality — SC fences create no
+    /// happens-before. The fence then adds its own causality to the frontier
+    /// for the fences after it.
+    pub(crate) fn seq_cst_fence(&mut self) -> u32 {
+        let pos = self.next_sc_pos();
+        let active = &mut self.threads[self.active.unwrap()];
+
+        active.sc.frontier.join(&self.sc_fence_frontier);
+        active.sc.fence_pos = Some(pos);
+        self.sc_fence_frontier.join(&active.causality);
+
+        pos
     }
 
     /// Allocate the next position in the SC total order S and hand it to the
@@ -465,20 +574,22 @@ impl Set {
         pos
     }
 
-    /// Commit the active thread's `SeqCst` fence into S: allocate its position,
-    /// record it as the thread's most recent fence position (for the p4/p6
-    /// fence-read restriction), and return it so the caller can tag the stores
-    /// sequenced before the fence with it (promotion; p5/p7). Distinct from
-    /// `seq_cst_fence`, which drives the separate fence *causality* frontier.
-    pub(crate) fn begin_sc_fence(&mut self) -> u32 {
-        let pos = self.next_sc_pos();
-        self.threads[self.active.unwrap()].sc_fence_pos = Some(pos);
-        pos
+    /// S-position of the latest `SeqCst` fence that happens before the active
+    /// thread's current operation, if any: its scope under the fence rules
+    /// (C++20 [atomics.order] p4.3).
+    pub(crate) fn active_sc_fence_pos(&self) -> Option<u32> {
+        self.active().sc.fence_pos
     }
 
-    /// S-position of the active thread's most recent `SeqCst` fence, if any.
-    pub(crate) fn active_sc_fence_pos(&self) -> Option<u32> {
-        self.active().sc_fence_pos
+    /// How far into S the active thread's current operation is bound by the
+    /// SC rules: all of it for an operation in S (`seq_cst`), else the latest
+    /// SC fence happening before it, else not at all.
+    pub(crate) fn active_sc_scope(&self, seq_cst: bool) -> Option<u32> {
+        if seq_cst {
+            Some(u32::MAX)
+        } else {
+            self.active_sc_fence_pos()
+        }
     }
 
     pub(crate) fn clear(&mut self, execution_id: execution::Id) {
@@ -489,7 +600,7 @@ impl Set {
 
         self.execution_id = execution_id;
         self.active = Some(0);
-        self.seq_cst_causality = VersionVec::new();
+        self.sc_fence_frontier = VersionVec::new();
         self.sc_clock = 0;
         self.symmetry_spawned = 0;
     }

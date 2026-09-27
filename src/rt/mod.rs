@@ -91,37 +91,88 @@ where
     id
 }
 
-/// Marks the current thread as blocked
+/// Marks the current thread as blocked until a modeled primitive wakes it
+/// (`thread::Set::wake`). Independent of the `std::thread::park` token.
 pub(crate) fn park(location: Location) {
-    park_impl(location, false);
+    block(location, false);
 }
 
 /// Marks the current thread as blocked in a timed wait: the block can end
 /// on its own (the wait's timeout firing), which `Execution::schedule`
 /// models by waking the thread when nothing else can run.
 pub(crate) fn park_timed(location: Location) {
-    park_impl(location, true);
+    block(location, true);
 }
 
-fn park_impl(location: Location, timed: bool) {
+fn block(location: Location, timed: bool) {
     let switch = execution(|execution| {
-        use thread::State;
         let thread = execution.threads.active_id();
         let active = execution.threads.active_mut();
 
-        trace!(?thread, ?active.state, ?timed, "park");
+        trace!(?thread, ?timed, "block");
 
-        match active.state {
-            // The thread was previously unparked while it was active. Instead
-            // of parking, consume the unpark.
-            State::Runnable { unparked: true } => {
-                active.set_runnable();
-                return false;
-            }
-            // The thread doesn't have a saved unpark; set its state to blocked.
-            _ => active.set_blocked(location, timed),
-        };
+        active.set_blocked(location, timed);
+        active.operation = None;
+        execution.schedule()
+    });
 
+    if switch {
+        Scheduler::switch();
+    }
+}
+
+/// `std::thread::park`: return once the thread's token is available,
+/// consuming it — the acquire half of unpark→park synchronization — or
+/// spuriously, which `std` permits.
+///
+/// Both halves operate on the thread's park object, dependent with every
+/// `unpark` of it, so the search explores each unpark on either side of the
+/// token check. The spurious return is explored at most once per thread per
+/// execution: a caller's park loop then re-checks and parks for real, so every
+/// such loop terminates while every call site can still be the one that spurs.
+pub(crate) fn park_thread(location: Location) {
+    let id = execution(|execution| execution.threads.active_id());
+
+    branch_park(id, location);
+
+    let parked = execution(|execution| {
+        let active = execution.threads.active_mut();
+
+        if active.take_park_token() {
+            trace!(thread = ?id, "park: token");
+            return false;
+        }
+
+        if active.may_spur_park() && execution.path.branch_spurious() {
+            trace!(thread = ?id, "park: spurious");
+            execution.threads.active_mut().spend_park_spur();
+            return false;
+        }
+
+        trace!(thread = ?id, "park: blocked");
+        execution.threads.active_mut().set_parked(location);
+        true
+    });
+
+    if !parked {
+        return;
+    }
+
+    block_parked();
+
+    // Only `unpark` wakes a parked thread; re-check its token as a park-object
+    // operation of its own, ordered after the unpark that woke it.
+    branch_park(id, location);
+
+    execution(|execution| {
+        let taken = execution.threads.active_mut().take_park_token();
+        assert!(taken, "[loom internal bug] parked thread woken without a token");
+    });
+}
+
+/// Give up the processor after `set_parked`.
+fn block_parked() {
+    let switch = execution(|execution| {
         execution.threads.active_mut().operation = None;
         execution.schedule()
     });
@@ -129,6 +180,35 @@ fn park_impl(location: Location, timed: bool) {
     if switch {
         Scheduler::switch();
     }
+}
+
+fn branch_park(id: thread::Id, location: Location) {
+    branch(|execution| {
+        execution.threads.active_mut().operation = Some(object::Operation::park(id, location));
+    });
+}
+
+/// `std::thread::Thread::unpark` of `target`: make its token available
+/// (`thread::Set::unpark`). An operation on the target's park object.
+pub(crate) fn unpark_thread(target: thread::Id, location: Location) {
+    branch(|execution| {
+        execution.threads.active_mut().operation =
+            Some(object::Operation::unpark(target, location));
+    });
+
+    execution(|execution| {
+        trace!(?target, "unpark");
+        execution.threads.unpark(target);
+    });
+}
+
+/// A `SeqCst` fence's scheduling point: an operation on the SC total order S,
+/// dependent with every other SC fence and SC access, so the search explores
+/// the fence on either side of each.
+pub(crate) fn branch_sc_fence(location: Location) {
+    branch(|execution| {
+        execution.threads.active_mut().operation = Some(object::Operation::sc_fence(location));
+    });
 }
 
 /// Add an execution branch point.
@@ -157,7 +237,7 @@ where
     F: FnOnce(&mut Execution) -> R,
 {
     execution(|execution| {
-        execution.threads.active_causality_inc();
+        execution.threads.begin_op();
         trace!("synchronize");
         f(execution)
     })

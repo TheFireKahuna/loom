@@ -60,10 +60,10 @@ pub(crate) struct Execution {
     /// thread numbering.
     pub(super) published_regions: Vec<super::atomic::PublishedRegion>,
 
-    /// The object whose access records the previous `schedule()` call
+    /// The operation whose access records the previous `schedule()` call
     /// updated (via `set_last_access`), if any. This is what makes the
     /// DPOR backtrack scan event-driven — see `schedule()`.
-    dpor_update: Option<object::Ref>,
+    dpor_update: Option<object::Operation>,
 
     /// Capture locations for significant events
     pub(crate) location: bool,
@@ -213,8 +213,9 @@ impl Execution {
             // things change: the just-ran thread's pending operation (set
             // immediately before this call), its `dpor_vv` (grown when the
             // previous call activated it — and it is always `curr_thread`
-            // here), and the access records of the one object the previous
-            // call passed to `set_last_access` (`dirty`). Every other
+            // here), and the access records the previous call's operation
+            // updated through `set_last_access` (`dirty`: its object's, and
+            // S's when it is an SC operation — `Operation::may_affect`). Every other
             // pair's check is a pure function of unchanged inputs whose
             // marks were already inserted — `Path::backtrack` is
             // idempotent and time-invariant within an iteration — so
@@ -228,7 +229,7 @@ impl Execution {
                     None => continue,
                 };
 
-                if th_id != curr_thread && Some(operation.object()) != dirty {
+                if th_id != curr_thread && !dirty.is_some_and(|d| d.may_affect(&operation)) {
                     continue;
                 }
 
@@ -431,7 +432,7 @@ impl Execution {
             // This is the only place access records change; the next
             // `schedule()` call's backtrack scan re-examines exactly the
             // pending operations targeting this object.
-            self.dpor_update = Some(operation.object());
+            self.dpor_update = Some(operation);
         } else {
             self.dpor_update = None;
         }
