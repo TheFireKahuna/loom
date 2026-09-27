@@ -92,7 +92,7 @@ macro_rules! lane_type {
                 let mask = self.mask();
                 let prior = self
                     .cell
-                    .rmw_masked::<_, std::convert::Infallible>(mask, order, order, |cur| {
+                    .rmw_masked::<_, std::convert::Infallible>(mask, None, order, order, |cur| {
                         Ok((cur & !mask) | (self.to_cell(f(self.from_cell(cur))) & mask))
                     })
                     .unwrap();
@@ -136,7 +136,7 @@ macro_rules! lane_type {
             ) -> Result<$lane, $lane> {
                 let mask = self.mask();
                 self.cell
-                    .rmw_masked(mask, success, failure, |cur| {
+                    .rmw_masked(mask, Some(self.to_cell(current)), success, failure, |cur| {
                         if cur & mask == self.to_cell(current) {
                             Ok((cur & !mask) | (self.to_cell(new) & mask))
                         } else {
@@ -146,8 +146,8 @@ macro_rules! lane_type {
                     .map(|prior| self.from_cell(prior))
             }
 
-            /// [`Self::compare_exchange`] (loom models the weak form as the
-            /// strong one, like the full-width atomics).
+            /// [`Self::compare_exchange`] that may fail spuriously even when
+            /// the lane equals `current`.
             #[track_caller]
             pub fn compare_exchange_weak(
                 &self,
@@ -156,7 +156,17 @@ macro_rules! lane_type {
                 success: Ordering,
                 failure: Ordering,
             ) -> Result<$lane, $lane> {
-                self.compare_exchange(current, new, success, failure)
+                let mask = self.mask();
+                self.cell
+                    .compare_exchange_weak_masked(
+                        mask,
+                        self.to_cell(current),
+                        |cur| (cur & !mask) | (self.to_cell(new) & mask),
+                        success,
+                        failure,
+                    )
+                    .map(|prior| self.from_cell(prior))
+                    .map_err(|prior| self.from_cell(prior))
             }
 
             /// Adds to the lane (wrapping at the lane's width), returning the

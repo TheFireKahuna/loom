@@ -225,16 +225,19 @@ pub(crate) struct Schedule {
     yield_seam: bool,
 }
 
+const _: () = assert!(MAX_ATOMIC_HISTORY <= u32::BITS as usize);
+
 #[derive(Debug, Clone)]
 #[cfg_attr(feature = "checkpoint", derive(Serialize, Deserialize))]
 pub(crate) struct Load {
-    /// All possible values
-    values: [u8; MAX_ATOMIC_HISTORY],
+    /// The store slots this load may return, one bit each, explored in
+    /// ascending slot order.
+    values: u32,
 
-    /// Current value
+    /// Index of the current value among `values`' set bits.
     pos: u8,
 
-    /// Number of values in list
+    /// Number of values: `values`' set bits.
     len: u8,
 
     exploring: bool,
@@ -371,7 +374,7 @@ impl Path {
         assert_path_len!(self.branches);
 
         let load_ref = self.branches.insert(Load {
-            values: [0; MAX_ATOMIC_HISTORY],
+            values: 0,
             pos: 0,
             len: 0,
             exploring: self.exploring,
@@ -379,21 +382,16 @@ impl Path {
 
         let load = load_ref.get_mut(&mut self.branches);
 
-        for (i, &store) in seed.iter().enumerate() {
+        for &store in seed {
             assert!(
-                store < MAX_ATOMIC_HISTORY as u8,
-                "[loom internal bug] store = {}; max = {}",
-                store,
-                MAX_ATOMIC_HISTORY
-            );
-            assert!(
-                i < MAX_ATOMIC_HISTORY,
-                "[loom internal bug] i = {}; max = {}",
-                i,
-                MAX_ATOMIC_HISTORY
+                (store as usize) < MAX_ATOMIC_HISTORY && load.values >> store == 0,
+                "[loom internal bug] load candidates must be distinct ascending slots \
+                 below {}: {:?}",
+                MAX_ATOMIC_HISTORY,
+                seed
             );
 
-            load.values[i] = store;
+            load.values |= 1 << store;
             load.len += 1;
         }
     }
@@ -409,7 +407,11 @@ impl Path {
 
         self.pos += 1;
 
-        load.values[load.pos as usize] as usize
+        let mut values = load.values;
+        for _ in 0..load.pos {
+            values &= values - 1;
+        }
+        values.trailing_zeros() as usize
     }
 
     /// Branch on spurious notifications

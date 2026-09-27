@@ -79,7 +79,15 @@ fn lane_cas_semantics() {
         let v = x.lane_u32(VALUE_OFF);
         assert_eq!(v.compare_exchange(0, 7, SeqCst, Relaxed), Ok(0));
         assert_eq!(v.compare_exchange(0, 9, SeqCst, Relaxed), Err(7));
-        assert_eq!(v.compare_exchange_weak(7, 8, SeqCst, Relaxed), Ok(7));
+        // The weak form may fail spuriously, reporting the matching value.
+        let prior = loop {
+            match v.compare_exchange_weak(7, 8, SeqCst, Relaxed) {
+                Ok(prior) => break prior,
+                Err(seen) => assert_eq!(seen, 7),
+            }
+        };
+        assert_eq!(prior, 7);
+        assert_eq!(v.load(Relaxed), 8);
         assert_eq!(x.lane_u64(S_OFF).load(Relaxed), 0xDEAD, "sibling disturbed");
     });
 }

@@ -82,6 +82,8 @@ impl AtomicBool {
     }
 
     /// Stores a value into the atomic if the current value is the same as the current value.
+    ///
+    /// May fail spuriously even when the current value equals `current`.
     #[track_caller]
     pub fn compare_exchange_weak(
         &self,
@@ -90,7 +92,7 @@ impl AtomicBool {
         success: Ordering,
         failure: Ordering,
     ) -> Result<bool, bool> {
-        self.compare_exchange(current, new, success, failure)
+        self.0.compare_exchange_weak(current, new, success, failure)
     }
 
     /// Logical "and" with the current value.

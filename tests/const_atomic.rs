@@ -76,8 +76,7 @@ fn const_static_resets_between_executions() {
 }
 
 /// The same property for the other two `const` constructors, and for a cell
-/// mutated through `with_mut` (which writes the ring directly rather than
-/// appending a store).
+/// mutated through `with_mut`.
 #[test]
 fn const_bool_ptr_and_with_mut_reset_between_executions() {
     static B: AtomicBool = AtomicBool::const_new(false);

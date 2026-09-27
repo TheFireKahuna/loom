@@ -191,6 +191,8 @@ macro_rules! atomic_int {
             }
 
             /// Stores a value into the atomic if the current value is the same as the current value.
+            ///
+            /// May fail spuriously even when the current value equals `current`.
             #[track_caller]
             pub fn compare_exchange_weak(
                 &self,
@@ -199,7 +201,7 @@ macro_rules! atomic_int {
                 success: Ordering,
                 failure: Ordering,
             ) -> Result<$int_type, $int_type> {
-                self.compare_exchange(current, new, success, failure)
+                self.0.compare_exchange_weak(current, new, success, failure)
             }
 
             /// Adds to the current value, returning the previous value.
@@ -267,7 +269,7 @@ macro_rules! atomic_int {
                 F: FnOnce($int_type) -> $int_type,
             {
                 self.0
-                    .rmw_masked::<_, ()>(mask, order, order, |v| Ok(f(v)))
+                    .rmw_masked::<_, ()>(mask, None, order, order, |v| Ok(f(v)))
                     .unwrap()
             }
 
@@ -287,7 +289,7 @@ macro_rules! atomic_int {
                 success: Ordering,
                 failure: Ordering,
             ) -> Result<$int_type, $int_type> {
-                self.0.rmw_masked(mask, success, failure, |actual| {
+                self.0.rmw_masked(mask, Some(current), success, failure, |actual| {
                     if actual & mask == current & mask {
                         Ok((actual & !mask) | (new & mask))
                     } else {
@@ -318,7 +320,7 @@ macro_rules! atomic_int {
                 F: FnOnce($int_type) -> $int_type,
             {
                 self.0
-                    .rmw_preserving::<_, ()>(write_mask, order, order, |v| Ok(f(v)))
+                    .rmw_preserving::<_, ()>(write_mask, None, order, order, |v| Ok(f(v)))
                     .unwrap()
             }
 
@@ -350,7 +352,7 @@ macro_rules! atomic_int {
                 success: Ordering,
                 failure: Ordering,
             ) -> Result<$int_type, $int_type> {
-                self.0.rmw_preserving(!preserve, success, failure, |actual| {
+                self.0.rmw_preserving(!preserve, Some(current), success, failure, |actual| {
                     if actual == current {
                         Ok((actual & preserve) | (new & !preserve))
                     } else {

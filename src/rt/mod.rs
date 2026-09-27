@@ -69,8 +69,10 @@ use tracing::trace;
 /// Maximum number of threads that can be included in a model.
 pub const MAX_THREADS: usize = 5;
 
-/// Maximum number of atomic store history to track per-cell.
-pub(crate) const MAX_ATOMIC_HISTORY: usize = 7;
+/// Most stores one atomic cell (one region of a mixed-size cell) holds at
+/// once. A store leaves only once no thread can read it; a model that needs
+/// more live stores than this fails loudly rather than dropping one.
+pub(crate) const MAX_ATOMIC_HISTORY: usize = 32;
 
 pub(crate) fn spawn<F>(stack_size: Option<usize>, symmetric: bool, f: F) -> crate::rt::thread::Id
 where

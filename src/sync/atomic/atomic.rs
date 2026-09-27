@@ -240,18 +240,32 @@ where
     where
         F: FnOnce(T) -> T,
     {
-        self.try_rmw::<_, ()>(order, order, |v| Ok(f(v))).unwrap()
+        self.try_rmw::<_, ()>(order, order, None, |v| Ok(f(v)))
+            .unwrap()
     }
 
+    /// `f` succeeds exactly when the value equals `expected`, or always for
+    /// `None` (`rt::ModelOps::rmw_preserving`).
     #[track_caller]
-    fn try_rmw<F, E>(&self, success: Ordering, failure: Ordering, f: F) -> Result<T, E>
+    fn try_rmw<F, E>(
+        &self,
+        success: Ordering,
+        failure: Ordering,
+        expected: Option<T>,
+        f: F,
+    ) -> Result<T, E>
     where
         F: FnOnce(T) -> Result<T, E>,
     {
         self.state
-            .rmw_masked(location!(), rt::FULL_MASK, success, failure, |num| {
-                f(T::from_u128(num)).map(T::into_u128)
-            })
+            .rmw_masked(
+                location!(),
+                rt::FULL_MASK,
+                expected.map(T::into_u128),
+                success,
+                failure,
+                |num| f(T::from_u128(num)).map(T::into_u128),
+            )
             .map(T::from_u128)
     }
 
@@ -274,10 +288,14 @@ where
     /// only the masked bits are written. The modelling primitive for a
     /// *sub-word* RMW / masked CAS on a wider single-copy-atomic cell (spec
     /// carve-out #5): the masked lane is independently coherent from the rest.
+    ///
+    /// `f` succeeds exactly when the masked bits equal `expected`'s, or always
+    /// for `None` (`rt::ModelOps::rmw_preserving`).
     #[track_caller]
     pub(crate) fn rmw_masked<F, E>(
         &self,
         mask: T,
+        expected: Option<T>,
         success: Ordering,
         failure: Ordering,
         f: F,
@@ -286,9 +304,14 @@ where
         F: FnOnce(T) -> Result<T, E>,
     {
         self.state
-            .rmw_masked(location!(), mask.into_u128(), success, failure, |cur| {
-                f(T::from_u128(cur)).map(T::into_u128)
-            })
+            .rmw_masked(
+                location!(),
+                mask.into_u128(),
+                expected.map(T::into_u128),
+                success,
+                failure,
+                |cur| f(T::from_u128(cur)).map(T::into_u128),
+            )
             .map(T::from_u128)
     }
 
@@ -306,10 +329,14 @@ where
     /// Nothing may acquire through a preserved lane — see
     /// `rt::ModelOps::rmw_preserving`, which traps rather than let the lost
     /// edge pass unnoticed.
+    ///
+    /// `f` succeeds exactly when the whole value equals `expected`, or always
+    /// for `None`.
     #[track_caller]
     pub(crate) fn rmw_preserving<F, E>(
         &self,
         write_mask: T,
+        expected: Option<T>,
         success: Ordering,
         failure: Ordering,
         f: F,
@@ -322,6 +349,7 @@ where
                 location!(),
                 rt::FULL_MASK,
                 write_mask.into_u128(),
+                expected.map(T::into_u128),
                 success,
                 failure,
                 |cur| f(T::from_u128(cur)).map(T::into_u128),
@@ -353,13 +381,60 @@ where
         success: Ordering,
         failure: Ordering,
     ) -> Result<T, T> {
-        self.try_rmw(success, failure, |actual| {
+        self.try_rmw(success, failure, Some(current), |actual| {
             if actual == current {
                 Ok(new)
             } else {
                 Err(actual)
             }
         })
+    }
+
+    /// May fail spuriously even when the value equals `current`
+    /// (`rt::ModelOps::compare_exchange_weak`).
+    #[track_caller]
+    pub(crate) fn compare_exchange_weak(
+        &self,
+        current: T,
+        new: T,
+        success: Ordering,
+        failure: Ordering,
+    ) -> Result<T, T> {
+        self.state
+            .compare_exchange_weak(
+                location!(),
+                rt::FULL_MASK,
+                current.into_u128(),
+                success,
+                failure,
+                |_| new.into_u128(),
+            )
+            .map(T::from_u128)
+            .map_err(T::from_u128)
+    }
+
+    /// [`Self::compare_exchange_weak`] over the bits under `mask`: they are
+    /// compared against `current`'s and replaced by `new` of the value read.
+    #[track_caller]
+    pub(crate) fn compare_exchange_weak_masked(
+        &self,
+        mask: T,
+        current: T,
+        new: impl FnOnce(T) -> T,
+        success: Ordering,
+        failure: Ordering,
+    ) -> Result<T, T> {
+        self.state
+            .compare_exchange_weak(
+                location!(),
+                mask.into_u128(),
+                current.into_u128(),
+                success,
+                failure,
+                |cur| new(T::from_u128(cur)).into_u128(),
+            )
+            .map(T::from_u128)
+            .map_err(T::from_u128)
     }
 
     #[track_caller]
@@ -374,7 +449,7 @@ where
     {
         let mut prev = self.load(fetch_order);
         while let Some(next) = f(prev) {
-            match self.compare_exchange(prev, next, set_order, fetch_order) {
+            match self.compare_exchange_weak(prev, next, set_order, fetch_order) {
                 Ok(x) => return Ok(x),
                 Err(next_prev) => prev = next_prev,
             }

@@ -2,8 +2,8 @@
 //!
 //! C11 requires an atomic RMW's write to sit *immediately* after the store
 //! it read in the cell's modification order — no other store may split the
-//! pair. `rt::atomic` enforces this with the `close_rmw_atomicity` closure
-//! and the single-lane `mo_before` marker; these tests pin the fix from both
+//! pair. `rt::atomic` keeps every edge it records atomic that way
+//! (`Region::order`); these tests pin it from both
 //! sides: the forbidden outcomes stay unreachable (soundness of the model's
 //! *checking*), and every legal weak outcome is still explored (no
 //! over-constraint — loom's cardinal rule is no false negatives).
