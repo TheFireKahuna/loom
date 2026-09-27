@@ -40,8 +40,15 @@ impl VersionVec {
         &self.versions
     }
 
+    /// Advance `id`'s lane. A lane never wraps: every happens-before and
+    /// modification-order marker test compares lanes numerically, so a wrap
+    /// would silently invert them.
     pub(crate) fn inc(&mut self, id: thread::Id) {
-        self.versions[id.as_usize()] += 1;
+        let lane = &mut self.versions[id.as_usize()];
+        match lane.checked_add(1) {
+            Some(next) => *lane = next,
+            None => lane_exhausted(id),
+        }
     }
 
     /// Read a single lane by raw index.
@@ -129,4 +136,15 @@ impl ops::IndexMut<thread::Id> for VersionVec {
     fn index_mut(&mut self, index: thread::Id) -> &mut u16 {
         self.versions.index_mut(index.as_usize())
     }
+}
+
+#[cold]
+#[inline(never)]
+fn lane_exhausted(id: thread::Id) -> ! {
+    panic!(
+        "thread {} performed more than {} synchronizing operations in one \
+         execution; loom's vector-clock lanes are u16 and cannot order more",
+        id.as_usize(),
+        u16::MAX
+    )
 }
