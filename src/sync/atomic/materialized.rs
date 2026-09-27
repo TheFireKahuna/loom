@@ -85,16 +85,18 @@ pub fn zero_exclusive(ptr: *mut u8, len: usize) {
     rt::zero_exclusive(ptr as usize, len, location!())
 }
 
-/// Model the `MEM_RESET` verb over `len` bytes at `ptr`: the contents are no
-/// longer of interest, but the mapping stays.
+/// Model the `MEM_RESET` verb over `len` bytes at `ptr`, rounded out to whole
+/// 4 KiB pages as the kernel rounds it: the contents are no longer of interest,
+/// but the mapping stays.
 ///
 /// A reset promises no zeros. It marks the pages clean, and until a page is
-/// written again the kernel may discard it at any moment, after which it reads
-/// zero; a write dirties the page and cancels the discard. So each 4 KiB page
-/// reads its old contents until a discard that may never come, and zero from
-/// then on — even to the thread that reset it. The checker explores every such
-/// point per page, so code that assumes a reset page reads zero is reported by
-/// the execution where it does not.
+/// written again the kernel may discard it at any moment, after which every
+/// byte of it reads zero; a write dirties the page and cancels the discard. So
+/// each page reads its old contents until a discard that may never come, and
+/// zero from then on — even to the thread that reset it — and a thread that has
+/// seen the discard through one cell sees it through every cell of the page.
+/// The checker explores every such point per page, so code that assumes a
+/// reset page reads zero is reported by the execution where it does not.
 ///
 /// Use this, not [`zero_exclusive`], whenever a reader may legally still be
 /// walking the span: a concurrent atomic access is admissible and sees old or

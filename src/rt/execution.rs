@@ -521,6 +521,12 @@ impl Execution {
         report
     }
 
+    /// Wake every sleeping thread: an operation whose dependence the sleep set
+    /// cannot see from `Operation::conflicts_with` ran.
+    pub(crate) fn wake_sleepers(&mut self) {
+        self.sleep.wake_all();
+    }
+
     /// Panics if any leaks were detected
     pub(crate) fn check_for_leaks(&self) {
         self.objects.check_for_leaks();

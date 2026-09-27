@@ -449,8 +449,11 @@ fn reset_racing_a_reader_is_admissible() {
     });
 }
 
+/// A reset promises no zeros: each cell of the reset pages reads its old value
+/// or zero. The kernel resets whole pages, so cells next to the range on the
+/// same page are covered too.
 #[test]
-fn reset_discards_only_its_own_range() {
+fn reset_reads_old_or_zero() {
     loom::model(|| {
         let region = Region::zeroed(4);
         let cells = region.cells();
@@ -461,12 +464,10 @@ fn reset_discards_only_its_own_range() {
 
         reset(cells.as_ptr() as *mut u8, 2 * std::mem::size_of::<u64>());
 
-        // Inside the range each cell reads its old value or zero — `MEM_RESET`
-        // does not promise zeros.
-        assert!(matches!(cells[0].load(Relaxed), 0 | 1));
-        assert!(matches!(cells[1].load(Relaxed), 0 | 2));
-        assert_eq!(cells[2].load(Relaxed), 3);
-        assert_eq!(cells[3].load(Relaxed), 4);
+        for (i, cell) in cells.iter().enumerate() {
+            let v = cell.load(Relaxed);
+            assert!(v == 0 || v == i as u64 + 1, "cell {i} read {v}");
+        }
     });
 }
 

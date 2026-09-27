@@ -300,6 +300,83 @@ fn reset_discards_a_whole_page_at_once() {
     assert!(seen.contains(&(5, 6)) && seen.contains(&(0, 0)), "{seen:?}");
 }
 
+/// The kernel resets whole pages: a cell beside the range on the same page is
+/// discarded with it, and a cell on the next page is untouched.
+#[test]
+fn reset_rounds_out_to_whole_pages() {
+    static SEEN: Outcomes<(u64, u64)> = Outcomes::new();
+    loom::model(|| {
+        let r = Region::committed(2);
+        r.cell(1).store(6, Relaxed);
+        r.cell(PAGE_CELLS).store(7, Relaxed);
+        reset(r.base as *mut u8, 8);
+        let beside = r.cell(1).load(Relaxed);
+        let next_page = r.cell(PAGE_CELLS).load(Relaxed);
+        SEEN.record((beside, next_page));
+    });
+    assert_eq!(SEEN.take(), BTreeSet::from([(0, 7), (6, 7)]));
+}
+
+/// Concurrent observers may see a page on either side of its discard, but an
+/// observer that has joined both never sees it half discarded: once it reads
+/// zero from one cell, the other reads zero too.
+#[test]
+fn a_joined_observer_sees_the_page_whole() {
+    static CONCURRENT: Outcomes<(u64, u64)> = Outcomes::new();
+    static JOINED: Outcomes<(u64, u64)> = Outcomes::new();
+    loom::model(|| {
+        let r = Arc::new(Region::committed(1));
+        r.cell(0).store(5, Relaxed);
+        r.cell(1).store(6, Relaxed);
+        r.reset();
+        let r1 = r.clone();
+        let t1 = thread::spawn(move || r1.cell(0).load(Relaxed));
+        let r2 = r.clone();
+        let t2 = thread::spawn(move || r2.cell(1).load(Relaxed));
+        let a = t1.join().unwrap();
+        let b = t2.join().unwrap();
+        CONCURRENT.record((a, b));
+        JOINED.record((r.cell(0).load(Relaxed), r.cell(1).load(Relaxed)));
+    });
+    let concurrent = CONCURRENT.take();
+    assert!(
+        concurrent.contains(&(0, 6)) && concurrent.contains(&(5, 0)),
+        "a read that preceded the discard went unexplored: {concurrent:?}"
+    );
+    // (5, 0): the discard landed between the observer's own two reads.
+    assert_eq!(JOINED.take(), BTreeSet::from([(0, 0), (5, 0), (5, 6)]));
+}
+
+/// A thread that saw the page's discard through one cell, and a thread
+/// ordered after it, read zero from every cell of the page — even when a third
+/// thread observed the discard first, through a different cell.
+#[test]
+fn a_discard_seen_through_one_cell_is_seen_through_all() {
+    loom::model(|| {
+        let r = Arc::new(Region::committed(1));
+        let flag = Arc::new(loom::sync::atomic::AtomicUsize::new(0));
+        r.cell(0).store(5, Relaxed);
+        r.cell(1).store(6, Relaxed);
+        r.reset();
+
+        let r1 = r.clone();
+        let first = thread::spawn(move || {
+            r1.cell(0).load(Relaxed);
+        });
+        let (r2, f2) = (r.clone(), flag.clone());
+        let second = thread::spawn(move || {
+            if r2.cell(1).load(Relaxed) == 0 {
+                f2.store(1, Release);
+            }
+        });
+        if flag.load(Acquire) == 1 {
+            assert_eq!(r.cell(0).load(Relaxed), 0, "the page read half discarded");
+        }
+        first.join().unwrap();
+        second.join().unwrap();
+    });
+}
+
 /// Pages decide independently.
 #[test]
 fn reset_pages_decide_independently() {

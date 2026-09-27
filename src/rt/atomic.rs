@@ -296,10 +296,12 @@ pub(super) trait Resolve {
     fn registered(&self, execution: &Execution) -> Result<object::Ref<State>, u128>;
 
     /// Resolve for the access about to run, settling any page state it depends
-    /// on. Called once the access is scheduled, with nothing between it and the
-    /// access; `write` marks an access that certainly writes.
+    /// on, with nothing between it and the access; `write` marks an access that
+    /// certainly writes. `unscheduled` is `None` for an access just past its
+    /// scheduling point, and the access's location for one that has none — it
+    /// takes one there if the page state needs it.
     #[inline]
-    fn resolve_for_access(&self, _write: bool) -> object::Ref<State> {
+    fn resolve_for_access(&self, _write: bool, _unscheduled: Option<Location>) -> object::Ref<State> {
         self.resolve()
     }
 }
@@ -394,9 +396,25 @@ macro_rules! materialized_cell {
                 })
             }
 
-            fn resolve_for_access(&self, write: bool) -> object::Ref<State> {
+            fn resolve_for_access(
+                &self,
+                write: bool,
+                unscheduled: Option<Location>,
+            ) -> object::Ref<State> {
+                let addr = self as *const $name as usize;
+                if let Some(location) = unscheduled {
+                    let (state, on_reset_page) = rt::execution(|execution| {
+                        let state = resolve_materialized(execution, addr);
+                        (state, execution.vm.reset_page(addr).is_some())
+                    });
+                    if on_reset_page {
+                        // An access to a reset page is a page event, and a page
+                        // event is a scheduling point.
+                        let action = if write { Action::Store(FULL_MASK) } else { Action::Load(FULL_MASK) };
+                        state.branch_action(action, location);
+                    }
+                }
                 rt::execution(|execution| {
-                    let addr = self as *const $name as usize;
                     let state = resolve_materialized(execution, addr);
                     fault_materialized(execution, addr, write);
                     state
@@ -474,8 +492,9 @@ pub(crate) struct Vm {
 struct VmCell {
     state: object::Ref<State>,
 
-    /// The cell's `op_clock` when its page was reset, while that reset may
-    /// still discard it: neither discarded nor written since.
+    /// The cell's `op_clock` when its page was reset — or 0, registered on a
+    /// page already reset — while the reset is pending. A store since is a
+    /// write to the page.
     reset: Option<u64>,
 
     /// Op id of the zero store the latest discard appended, or 0. A later write
@@ -497,26 +516,24 @@ struct Committed {
     location: Location,
 }
 
-/// A page under an outstanding reset. Discards and cancels are per page, but
-/// each cell resolves on its own access, so the page couples its cells only
-/// where happens-before fixes the order: a thread that happens-after a discard
-/// of the page reads zero from every cell of it, and one that happens-after a
-/// write to it reads what the page retained.
+/// A page under an outstanding reset — one location, for DPOR, for as long as
+/// the reset is pending: every access to it in that window is dependent with
+/// the reset and with every other, and an access after the window with all of
+/// them, whatever cell each touches. That is what lets the page decide its
+/// discard once, for all its cells together.
 #[derive(Debug)]
 struct ResetPage {
     base: usize,
-    discards: Epochs,
-    cancels: Epochs,
-}
 
-impl ResetPage {
-    fn new(base: usize) -> ResetPage {
-        ResetPage {
-            base,
-            discards: [0; MAX_THREADS],
-            cancels: [0; MAX_THREADS],
-        }
-    }
+    /// Neither discarded nor written since the reset.
+    pending: bool,
+
+    /// The pending window ended in a discard.
+    discarded: bool,
+
+    /// Each thread's last access to the page while it was pending; the reset
+    /// is the resetting thread's first.
+    accesses: [Option<Access>; MAX_THREADS],
 }
 
 impl Vm {
@@ -534,6 +551,12 @@ impl Vm {
     /// Positions in `order` of the registered cells inside `[lo, hi)`.
     fn cells_in(&self, lo: usize, hi: usize) -> std::ops::Range<usize> {
         self.order.partition_point(|&a| a < lo)..self.order.partition_point(|&a| a < hi)
+    }
+
+    fn reset_page(&self, addr: usize) -> Option<usize> {
+        self.reset_pages
+            .binary_search_by_key(&(addr & !(PAGE - 1)), |p| p.base)
+            .ok()
     }
 
     fn committed_at(&self, addr: usize) -> Option<&Committed> {
@@ -777,17 +800,30 @@ const _: () = {
 /// reported. Cells in the range that are not yet registered are already zero.
 /// Writing the bytes dirties their pages, cancelling any pending reset of them.
 pub(crate) fn zero_exclusive(base: usize, len: usize, location: Location) {
+    let (lo, hi) = (base, base + len);
+
+    // Writing a reset page is a page event, and a page event is a scheduling
+    // point.
+    let on_reset_page = rt::execution(|execution| reset_pages_in(&execution.vm, lo, hi).len() != 0);
+    if on_reset_page {
+        vm_token().branch_action(Action::Store(FULL_MASK), location);
+    }
+
     rt::execution(|execution| {
         trace!(base, len, "atomic::zero_exclusive");
 
-        let (lo, hi) = (base, base + len);
-        cancel_resets(execution, lo, hi);
+        for p in reset_pages_in(&execution.vm, lo, hi) {
+            let pending = execution.vm.reset_pages[p].pending;
+            page_dependence(execution, p, pending);
+            if pending {
+                let discard = execution.path.branch_spurious();
+                settle_page(execution, p, discard);
+            }
+        }
 
         let vm = &mut execution.vm;
         for addr in &vm.order[vm.cells_in(lo, hi)] {
-            let cell = vm.cells.get_mut(addr).expect("registered cell");
-            cell.reset = None;
-            let state = cell.state.get_mut(&mut execution.objects);
+            let state = vm.cells[addr].state.get_mut(&mut execution.objects);
 
             state
                 .unsync_mut_locations
@@ -808,99 +844,152 @@ pub(crate) fn zero_exclusive(base: usize, len: usize, location: Location) {
     })
 }
 
-/// A write by the active thread lands on every page of `[lo, hi)`: record it
-/// as cancelling each page's pending reset.
-fn cancel_resets(execution: &mut Execution, lo: usize, hi: usize) {
-    // Stamped past the thread's last release, so only a view that synchronized
-    // with a later one counts as having seen the write.
-    let id = execution.threads.active_id();
-    execution.threads.active_mut().causality.inc(id);
-    let lane = execution.threads.active_id().as_usize();
-    let tick = execution.threads.active().causality.lane(lane);
+/// Indices into `reset_pages` of the pages overlapping `[lo, hi)`.
+fn reset_pages_in(vm: &Vm, lo: usize, hi: usize) -> std::ops::Range<usize> {
+    vm.reset_pages.partition_point(|p| p.base + PAGE <= lo)
+        ..vm.reset_pages.partition_point(|p| p.base < hi)
+}
 
-    let first = execution.vm.reset_pages.partition_point(|p| p.base + PAGE <= lo);
-    for page in &mut execution.vm.reset_pages[first..] {
-        if page.base >= hi {
-            break;
+/// DPOR for a page event at the operation just scheduled: a backtrack point
+/// against every access of the page's pending window the event is concurrent
+/// with, and the event's clock past all of them. `record` enters the event into
+/// the window.
+fn page_dependence(execution: &mut Execution, p: usize, record: bool) {
+    let thread = execution.threads.active_id();
+    let page = &mut execution.vm.reset_pages[p];
+    let dpor_vv = &mut execution.threads.active_mut().dpor_vv;
+
+    for access in page.accesses.iter().flatten() {
+        if !access.happens_before(dpor_vv) {
+            execution.path.backtrack(access.path_id(), thread);
         }
-        epoch_add(&mut page.cancels, lane, tick);
+    }
+    for access in page.accesses.iter().flatten() {
+        dpor_vv.join(access.version());
+    }
+
+    if record {
+        // The operation was scheduled at the last path position.
+        let path_id = execution.path.pos() - 1;
+        Access::set_or_create(&mut page.accesses[thread.as_usize()], path_id, dpor_vv);
+        // Sleep sets see one object per operation; a page event conflicts
+        // with any sleeper's access to the page, whichever cell it names.
+        execution.wake_sleepers();
     }
 }
 
-/// Model the `MEM_RESET` verb over `[base, base + len)`: the contents are no
-/// longer of interest, but the mapping stays and a concurrent reader is
-/// *admissible* rather than a bug.
+/// End page `p`'s pending window: a write dirtied it, or the kernel discarded
+/// it (`discard`), which zeroes every cell the reset left on it at once.
+///
+/// A discard is a zero store per cell, modification-order-after every store the
+/// cell has, by the thread that observed it and releasing nothing: that thread
+/// and any that happens-after it read zero from the whole page, and a thread
+/// that has not seen the discard may still read the old contents, as a read
+/// that preceded it would.
+fn settle_page(execution: &mut Execution, p: usize, discard: bool) {
+    let lane = execution.threads.active_id().as_usize();
+    let vm = &mut execution.vm;
+    let page = &mut vm.reset_pages[p];
+    page.pending = false;
+    page.discarded = discard;
+    let base = page.base;
+
+    for addr in &vm.order[vm.cells_in(base, base + PAGE)] {
+        let cell = vm.cells.get_mut(addr).expect("registered cell");
+        if cell.reset.take().is_none() || !discard {
+            continue;
+        }
+        let state = cell.state.get_mut(&mut execution.objects);
+        let op_id = state.next_op_id();
+        state.touched_by |= 1 << lane;
+        for region in &mut state.regions {
+            region.store_mo_max(&mut execution.threads, 0, op_id);
+        }
+        cell.discard_op = op_id;
+    }
+}
+
+/// Model the `MEM_RESET` verb over `[base, base + len)`, rounded out to whole
+/// pages as the kernel rounds it: the contents are no longer of interest, but
+/// the mapping stays and a concurrent reader is *admissible* rather than a bug.
 ///
 /// `MEM_RESET` marks the pages clean without zeroing them. Until a page is
-/// written again the kernel may discard it at any moment, after which it reads
-/// zero; a write dirties it and cancels the discard. So each page reads its old
-/// contents until a discard that may never come, then zero for good — decided
-/// per page, not at the reset. The cells are marked reset here and resolve on
-/// their next access ([`fault_materialized`]); nothing is stored.
+/// written again the kernel may discard it at any moment, after which every
+/// byte of it reads zero; a write dirties it and cancels the discard. So each
+/// page reads its old contents until a discard that may never come, then zero
+/// for good. Nothing is stored here: the page resolves at its accesses
+/// ([`fault_materialized`]), each read branching between keeping the page and
+/// discarding it, each write between the two orders of discard and write.
 ///
 /// A reset of an atomic a peer is reading is benign: the peer reads old or
 /// zero. It races a non-atomic access like a store does, because the checker
 /// explores no order between a non-atomic access and anything else, and the
 /// caller claiming exclusivity over bytes a peer is resetting is the bug.
-///
-/// One DPOR step per registered cell, so each is dependent with every access
-/// to its cell; the page-verb step orders it against commits and decommits.
 pub(crate) fn reset(base: usize, len: usize, location: Location) {
     let (lo, hi) = (base, base + len);
+    let (page_lo, page_hi) = (lo & !(PAGE - 1), (hi + PAGE - 1) & !(PAGE - 1));
 
     vm_token().branch_action(Action::Store(FULL_MASK), location);
 
-    let targets: SmallVec<[(usize, object::Ref<State>); 8]> = rt::execution(|execution| {
+    rt::execution(|execution| {
         trace!(base, len, "atomic::reset");
 
-        let vm = &mut execution.vm;
         let mut at = lo;
         while at < hi {
-            match vm.committed_at(at) {
+            match execution.vm.committed_at(at) {
                 Some(r) => at = r.hi,
-                None => vm.uncommitted(at, "reset"),
+                None => execution.vm.uncommitted(at, "reset"),
             }
         }
 
-        vm.any_reset = true;
-        let mut page = lo & !(PAGE - 1);
-        while page < hi {
-            match vm.reset_pages.binary_search_by_key(&page, |p| p.base) {
-                Ok(i) => vm.reset_pages[i] = ResetPage::new(page),
-                Err(i) => vm.reset_pages.insert(i, ResetPage::new(page)),
-            }
-            page += PAGE;
-        }
+        // A write to every cell of the pages: dependent with every earlier
+        // access to one, and racing any non-atomic one it does not follow.
+        let thread = execution.threads.active_id();
+        let vm = &mut execution.vm;
+        for addr in &vm.order[vm.cells_in(page_lo, page_hi)] {
+            let cell = vm.cells.get_mut(addr).expect("registered cell");
+            let state = cell.state.get_mut(&mut execution.objects);
 
-        vm.order[vm.cells_in(lo, hi)]
-            .iter()
-            .map(|addr| (*addr, vm.cells[addr].state))
-            .collect()
-    });
-
-    for (addr, state_ref) in targets {
-        state_ref.branch_action(Action::Store(FULL_MASK), location);
-
-        super::synchronize(|execution| {
-            // Between the steps a peer may decommit the cell. Recommitted since,
-            // it is a fresh zero cell with nothing to discard.
-            let vm = &mut execution.vm;
-            let Some(cell) = vm.cells.get_mut(&addr) else {
-                if vm.committed_at(addr).is_none() {
-                    vm.uncommitted(addr, "reset");
+            let dpor_vv = &execution.threads.active().dpor_vv;
+            let mut joined = *dpor_vv;
+            state.for_each_dependent_access(Action::Store(FULL_MASK), |access| {
+                if !access.happens_before(dpor_vv) {
+                    execution.path.backtrack(access.path_id(), thread);
                 }
-                return;
-            };
-            if !cell.state.ref_eq(state_ref) {
-                return;
-            }
+                joined.join(access.version());
+            });
+            execution.threads.active_mut().dpor_vv = joined;
 
-            let state = state_ref.get_mut(&mut execution.objects);
             state.stored_locations.track(location, &execution.threads);
             state.track_store(&execution.threads);
             cell.reset = Some(state.op_clock);
-        });
-    }
+        }
+
+        execution.vm.any_reset = true;
+        let mut page = page_lo;
+        while page < page_hi {
+            let fresh = ResetPage {
+                base: page,
+                pending: true,
+                discarded: false,
+                accesses: Default::default(),
+            };
+            let p = match execution.vm.reset_pages.binary_search_by_key(&page, |p| p.base) {
+                Ok(p) => {
+                    // The previous reset's window closes here.
+                    page_dependence(execution, p, false);
+                    execution.vm.reset_pages[p] = fresh;
+                    p
+                }
+                Err(p) => {
+                    execution.vm.reset_pages.insert(p, fresh);
+                    p
+                }
+            };
+            page_dependence(execution, p, true);
+            page += PAGE;
+        }
+    })
 }
 
 /// Resolve — and on first access of this execution, create — the registration
@@ -926,13 +1015,15 @@ fn resolve_materialized(execution: &mut Execution, addr: usize) -> object::Ref<S
     state
         .get_mut(&mut execution.objects)
         .init_deferred(0, Some(genesis));
-    // Not reset even on a reset page: never written, it reads zero either
-    // way, and it has no stores for a discard to order.
+    let reset = vm
+        .reset_page(addr)
+        .filter(|&p| vm.reset_pages[p].pending)
+        .map(|_| 0);
     vm.cells.insert(
         addr,
         VmCell {
             state,
-            reset: None,
+            reset,
             discard_op: 0,
         },
     );
@@ -944,92 +1035,93 @@ fn resolve_materialized(execution: &mut Execution, addr: usize) -> object::Ref<S
     state
 }
 
-/// Settle what a reset left pending on the cell at `addr`, at the access about
-/// to run — after its scheduling point, so the page state is the state at the
-/// access. `write` marks an access that certainly writes (a store, `with_mut`);
-/// an RMW may fail, so its write is found by its store on the next access.
+/// Run the page event an access to the cell at `addr` is, at the access —
+/// after its scheduling point, so the page state is the state at the access.
+/// `write` marks an access that certainly writes (a store, `with_mut`); an RMW
+/// may fail, so its write is found by its store at the page's next event.
 fn fault_materialized(execution: &mut Execution, addr: usize, write: bool) {
-    let vm = &mut execution.vm;
-    if !vm.any_reset {
-        return;
-    }
-    let Some(cell) = vm.cells.get_mut(&addr) else {
-        return;
-    };
-    if cell.reset.is_none() && (!write || cell.discard_op == 0) {
+    if !execution.vm.any_reset {
         return;
     }
     std::hint::cold_path();
 
-    let state = cell.state.get_mut(&mut execution.objects);
+    if let Some(p) = execution.vm.reset_page(addr) {
+        let pending = execution.vm.reset_pages[p].pending;
+        page_dependence(execution, p, pending);
 
-    let Some(reset_clock) = cell.reset else {
-        // A write onto the zero page a discard left: ordered after the
-        // discard's store, which the writer may not have seen.
-        for region in &mut state.regions {
-            let live = region.live_stores();
-            if let Some(z) = region.stores[..live]
-                .iter_mut()
-                .find(|s| s.op_id == cell.discard_op)
-            {
-                z.first_seen.touch(&execution.threads);
-            }
-        }
-        return;
-    };
+        if pending {
+            let vm = &execution.vm;
+            let base = vm.reset_pages[p].base;
+            let written = vm.order[vm.cells_in(base, base + PAGE)].iter().any(|a| {
+                let cell = &vm.cells[a];
+                cell.reset
+                    .is_some_and(|at| cell.state.get(&execution.objects).op_clock > at)
+            });
 
-    let Ok(p) = vm
-        .reset_pages
-        .binary_search_by_key(&(addr & !(PAGE - 1)), |p| p.base)
-    else {
-        // The page record went with a decommit of part of the page.
-        cell.reset = None;
-        return;
-    };
-    let page = &mut vm.reset_pages[p];
-
-    // A store since the reset dirtied the page.
-    if state.op_clock > reset_clock {
-        for region in &state.regions {
-            for s in &region.stores[..region.live_stores()] {
-                if s.op_id > reset_clock {
-                    epoch_add(&mut page.cancels, s.creator, s.tick());
+            if written {
+                settle_page(execution, p, false);
+            } else {
+                let discard = execution.path.branch_spurious();
+                if discard || write {
+                    settle_page(execution, p, discard);
                 }
             }
         }
-        cell.reset = None;
-        return;
     }
 
-    let id = execution.threads.active_id();
-    execution.threads.active_mut().causality.inc(id);
-    let lane = execution.threads.active_id().as_usize();
-    let view = execution.threads.active().causality;
-    let tick = view.lane(lane);
-
-    let cancelled = epoch_reached(&page.cancels, &view);
-    let discard = if epoch_reached(&page.discards, &view) {
-        true
-    } else if cancelled {
-        false
-    } else {
-        execution.path.branch_spurious()
-    };
-
-    if discard {
-        epoch_add(&mut page.discards, lane, tick);
-        let op_id = state.next_op_id();
-        state.touched_by |= 1 << lane;
-        for region in &mut state.regions {
-            region.store_mo_max(&mut execution.threads, 0, op_id);
+    // A discard is one event for the whole page: a thread that has seen it
+    // through any cell, or writes onto the zero page it left, has seen it
+    // through every cell, and a write lands modification-order-after it.
+    let threads = &execution.threads;
+    if let Some(p) = execution.vm.reset_page(addr) {
+        if execution.vm.reset_pages[p].discarded {
+            let base = execution.vm.reset_pages[p].base;
+            let cells = &execution.vm.order[execution.vm.cells_in(base, base + PAGE)];
+            let mut seen = write;
+            for a in cells {
+                for_each_discard_store(&execution.vm, &mut execution.objects, a, |z| {
+                    seen |= z.first_seen.is_seen_by_current(threads);
+                });
+            }
+            if seen {
+                for a in cells {
+                    for_each_discard_store(&execution.vm, &mut execution.objects, a, |z| {
+                        z.first_seen.touch(threads);
+                    });
+                }
+            }
+            return;
         }
-        cell.discard_op = op_id;
     }
     if write {
-        epoch_add(&mut page.cancels, lane, tick);
+        for_each_discard_store(&execution.vm, &mut execution.objects, &addr, |z| {
+            z.first_seen.touch(threads);
+        });
     }
-    if discard || write || cancelled {
-        cell.reset = None;
+}
+
+/// The zero stores the latest discard appended to the cell at `addr`, one per
+/// region, while the rings still hold them.
+fn for_each_discard_store(
+    vm: &Vm,
+    objects: &mut object::Store,
+    addr: &usize,
+    mut f: impl FnMut(&mut Store),
+) {
+    let Some(cell) = vm.cells.get(addr) else {
+        return;
+    };
+    if cell.discard_op == 0 {
+        return;
+    }
+    for region in &mut cell.state.get_mut(objects).regions {
+        let live = region.live_stores();
+        if let Some(z) = region.stores[..live]
+            .iter_mut()
+            .find(|s| s.op_id == cell.discard_op)
+        {
+            f(z);
+        }
     }
 }
 
@@ -2125,7 +2217,7 @@ impl<C: Resolve + ?Sized> ModelOps for C {
     }
 
     fn unsync_load(&self, location: Location) -> u128 {
-        let state_ref = self.resolve_for_access(false);
+        let state_ref = self.resolve_for_access(false, Some(location));
         rt::execution(|execution| {
             let state = state_ref.get_mut(&mut execution.objects);
 
@@ -2144,7 +2236,7 @@ impl<C: Resolve + ?Sized> ModelOps for C {
     }
 
     fn with_mut<R>(&mut self, location: Location, f: impl FnOnce(&mut u128) -> R) -> R {
-        let state_ref = self.resolve_for_access(true);
+        let state_ref = self.resolve_for_access(true, Some(location));
         let value = super::execution(|execution| {
             let state = state_ref.get_mut(&mut execution.objects);
 
@@ -2219,7 +2311,7 @@ fn branch<C: Resolve + ?Sized>(
     // corrupted identity resolves to a different registration and trips the
     // same assert.
     assert!(
-        state_ref.ref_eq(cell.resolve_for_access(matches!(action, Action::Store(_)))),
+        state_ref.ref_eq(cell.resolve_for_access(matches!(action, Action::Store(_)), None)),
         "Internal state mutated during branch. This is \
             usually due to a bug in the algorithm being tested writing in \
             an invalid memory location."
