@@ -170,7 +170,9 @@ macro_rules! atomic_ptr {
             /// Stores a value into the atomic if the current value is the same as
             /// the current value.
             ///
-            /// May fail spuriously even when the current value equals `current`.
+            /// May fail spuriously even when the current value equals `current`, as the
+            /// target's does: only where it lowers to a single LL/SC attempt, or everywhere
+            /// with `LOOM_SPURIOUS_WEAK_CAS=1` set.
             #[track_caller]
             pub fn compare_exchange_weak(
                 &self,

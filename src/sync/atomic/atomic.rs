@@ -390,8 +390,8 @@ where
         })
     }
 
-    /// May fail spuriously even when the value equals `current`
-    /// (`rt::ModelOps::compare_exchange_weak`).
+    /// May fail spuriously even when the value equals `current`, where the
+    /// target's does (`rt::ModelOps::compare_exchange_weak`).
     #[track_caller]
     pub(crate) fn compare_exchange_weak(
         &self,
@@ -404,6 +404,7 @@ where
             .compare_exchange_weak(
                 location!(),
                 rt::FULL_MASK,
+                (std::mem::size_of::<T>() * 8) as u32,
                 current.into_u128(),
                 success,
                 failure,
@@ -428,6 +429,7 @@ where
             .compare_exchange_weak(
                 location!(),
                 mask.into_u128(),
+                mask.into_u128().count_ones(),
                 current.into_u128(),
                 success,
                 failure,

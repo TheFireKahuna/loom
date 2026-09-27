@@ -147,7 +147,9 @@ macro_rules! lane_type {
             }
 
             /// [`Self::compare_exchange`] that may fail spuriously even when
-            /// the lane equals `current`.
+            /// the lane equals `current`, as the target's does: only where it
+            /// lowers to a single LL/SC attempt, or everywhere with
+            /// `LOOM_SPURIOUS_WEAK_CAS=1` set.
             #[track_caller]
             pub fn compare_exchange_weak(
                 &self,

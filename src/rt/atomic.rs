@@ -173,7 +173,8 @@
 //!   value passes, the failure arm is a load at the failure ordering and may
 //!   read any store a load could whose value fails, and a weak
 //!   compare-exchange adds a spurious arm — that load taking a value that
-//!   passes.
+//!   passes — where the target's weak compare-exchange can fail spuriously
+//!   (`weak_cas_spurs`).
 //!
 //! # History
 //!
@@ -1232,9 +1233,11 @@ pub(crate) trait ModelOps {
         self.rmw_preserving(location, mask, mask, expected, success, failure, f)
     }
 
-    /// Weak compare-exchange over the bits under `mask`: succeeds only when
-    /// they equal `expected`'s, writing `new(current)`, and may fail
-    /// spuriously even then. Either failure returns the value read.
+    /// Weak compare-exchange over the bits under `mask` of a `bits`-bit
+    /// access: succeeds only when they equal `expected`'s, writing
+    /// `new(current)`, and on a target whose weak compare-exchange of that
+    /// width can fail spuriously (`weak_cas_spurs`) may fail even then. Either
+    /// failure returns the value read.
     ///
     /// A spurious failure is the failure-ordering load of a real one, taking a
     /// value that passes the compare. It is explored as its own branch, and a
@@ -1242,10 +1245,12 @@ pub(crate) trait ModelOps {
     /// the same cell does not fail spuriously: a retry loop takes at most one
     /// spurious failure per genuine attempt, so it terminates, while every
     /// weak compare-exchange site still has its spurious arm explored.
+    #[allow(clippy::too_many_arguments)]
     fn compare_exchange_weak(
         &self,
         location: Location,
         mask: u128,
+        bits: u32,
         expected: u128,
         success: Ordering,
         failure: Ordering,
@@ -2211,6 +2216,7 @@ impl<C: Resolve + ?Sized> ModelOps for C {
         &self,
         location: Location,
         mask: u128,
+        bits: u32,
         expected: u128,
         success: Ordering,
         failure: Ordering,
@@ -2221,7 +2227,7 @@ impl<C: Resolve + ?Sized> ModelOps for C {
             read_mask: mask,
             write_mask: mask,
             expected: Some(expected),
-            weak: true,
+            weak: weak_cas_spurs(bits),
             success,
             failure,
         };
@@ -4814,6 +4820,51 @@ impl FirstSeen {
             v => v <= last_yield,
         }
     }
+}
+
+/// Whether a weak compare-exchange of `bits` bits can fail spuriously on the
+/// target loom is built for — the target the model stands in for. Only one
+/// lowered to a single load-exclusive/store-exclusive attempt can; a locked
+/// `cmpxchg`, an LSE `CAS`, a `CASP`, or an LL/SC pair LLVM wraps in its own
+/// retry loop cannot (LLVM 22: x86-64 `lock cmpxchg`/`cmpxchg16b`; AArch64
+/// `+lse` `casal`/`caspal`, `+outline-atomics` `__aarch64_cas*` helpers, and
+/// without either a one-shot `ldaxr`/`stlxr` up to 64 bits but a looping
+/// `ldaxp`/`stlxp` at 128; ARM one-shot `ldrex`/`strex` wherever the width is
+/// native; RISC-V `lr`/`sc` looping, or `amocas` with `zacas`). Targets not
+/// listed are assumed to spur. `LOOM_SPURIOUS_WEAK_CAS=1` explores the
+/// Rust contract's spurious failures on every target, as a portability check.
+fn weak_cas_spurs(bits: u32) -> bool {
+    const TARGET_SPURS: [bool; 5] = {
+        let mut spurs = [false; 5];
+        let mut i = 0;
+        while i < 5 {
+            let bits = 8u32 << i;
+            spurs[i] = cfg_select! {
+                any(target_arch = "x86", target_arch = "x86_64") => false,
+                target_arch = "aarch64" => {
+                    !cfg!(any(target_feature = "lse", target_feature = "outline-atomics"))
+                        && bits <= 64
+                }
+                target_arch = "arm" => match bits {
+                    8 | 16 | 32 => true,
+                    64 => cfg!(target_has_atomic = "64"),
+                    _ => false,
+                },
+                any(target_arch = "riscv32", target_arch = "riscv64") => false,
+                _ => true,
+            };
+            i += 1;
+        }
+        spurs
+    };
+
+    static FORCED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let forced = *FORCED.get_or_init(|| {
+        std::env::var_os("LOOM_SPURIOUS_WEAK_CAS").is_some_and(|v| v == "1")
+    });
+
+    let width = bits.max(8).next_power_of_two().trailing_zeros() as usize - 3;
+    forced || TARGET_SPURS[width.min(4)]
 }
 
 fn is_seq_cst(order: Ordering) -> bool {
