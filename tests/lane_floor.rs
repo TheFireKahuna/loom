@@ -6,35 +6,37 @@
 //! single-copy-atomic event. The active thread observes `W` through lane B —
 //! by reading it, or by writing lane B coherence-after it — and then loads
 //! lane A. Reading lane A from before `W` closes the cycle
-//! `W →co/rf observation →po L →fr W`, and whether a target forbids that cycle
-//! depends only on whether it orders the observation before `L`. ntlib runs on
-//! x86-64 and AArch64, so the model forbids the outcome exactly where *both*
-//! do, and explores it everywhere either allows it.
+//! `W →co/rf observation →po L →fr W`, and whether the target forbids that
+//! cycle depends only on whether it orders the observation before `L`. loom
+//! models the target it is built for, so each outcome's expectation is that
+//! target's verdict: AArch64 (and every target loom has no stronger rule for)
+//! from herd7, x86 from TSO.
 //!
-//! Each test names the AArch64 litmus it models. The verdicts are herd7 7.58
-//! (`aarch64.cat`, `-variant mixed`) on a 64-bit cell with 32-bit lanes; the
-//! shape carries to the 16-byte cell unchanged, since no rule involved depends
-//! on the access size. The x86-64 verdict follows from TSO: loads are ordered
-//! with loads and locked RMWs are full barriers, but a store may pass a later
-//! load unless `mfence`/`xchg` intervenes.
+//! The AArch64 verdicts are herd7 7.58 (`aarch64.cat`, `-variant mixed`) on a
+//! 64-bit cell with 32-bit lanes; the shape carries to the 16-byte cell
+//! unchanged, since no rule involved depends on the access size. The x86
+//! verdicts follow from TSO: loads are ordered with loads and locked RMWs are
+//! full barriers, but a store may pass a later load unless `mfence`, `xchg`
+//! or another locked instruction intervenes.
 //!
-//! | Observation, then lane-A load                   | AArch64 | x86-64 | model  |
-//! |--------------------------------------------------|---------|--------|--------|
-//! | relaxed read of B                                | allowed | forbid | allow  |
-//! | relaxed read of B, acquire load of A             | allowed | forbid | allow  |
-//! | acquire read of B                                | forbid  | forbid | forbid |
-//! | relaxed read of B, `fence(Acquire)`              | forbid  | forbid | forbid |
-//! | relaxed RMW on B reading `W`'s half              | allowed | forbid | allow  |
-//! | acquire RMW on B reading `W`'s half              | forbid  | forbid | forbid |
-//! | a peer read B, released; we acquired             | forbid  | forbid | forbid |
-//! | relaxed read of B, own relaxed store to B        | allowed | allowed| allow  |
-//! | ... own release store, acquire load of A         | allowed | allowed| allow  |
-//! | ... own store, `fence(SeqCst)`                   | forbid  | forbid | forbid |
-//! | ... own `SeqCst` store, `SeqCst` load of A       | forbid  | forbid | forbid |
+//! | Observation, then lane-A load                   | AArch64 | x86    |
+//! |--------------------------------------------------|---------|--------|
+//! | relaxed read of B                                | allowed | forbid |
+//! | relaxed read of B, acquire load of A             | allowed | forbid |
+//! | acquire read of B                                | forbid  | forbid |
+//! | relaxed read of B, `fence(Acquire)`              | forbid  | forbid |
+//! | relaxed RMW on B reading `W`'s half              | allowed | forbid |
+//! | acquire RMW on B reading `W`'s half              | forbid  | forbid |
+//! | a peer read B, released; we acquired             | forbid  | forbid |
+//! | relaxed read of B, own relaxed store to B        | allowed | forbid |
+//! | ... own release store, acquire load of A         | allowed | forbid |
+//! | ... own store, `fence(SeqCst)`                   | forbid  | forbid |
+//! | ... own `SeqCst` store, `SeqCst` load of A       | forbid  | forbid |
+//! | uncommunicating `SeqCst` fences                  | allowed | allowed|
 //!
 //! The own-store rows read lane B first: that read is what makes the store
 //! coherence-after the wide op in the model, which fixes modification order
-//! only from what the writer has seen.
+//! only from what the writer has seen. On x86 that read alone floors.
 
 use loom::sync::atomic::{fence, AtomicU128, AtomicU32, Ordering, Ordering::*};
 use loom::thread;
@@ -109,23 +111,33 @@ fn write_route(
 
 const TRAVELLED: (u64, u64) = (1, 0);
 
-// AArch64 RR-rlx: `LDR W0,[x+4]; LDR W2,[x]` — Sometimes.
-#[test]
-fn relaxed_sibling_read_does_not_floor() {
-    let seen = read_route(Relaxed, false, Relaxed);
-    assert!(
-        seen.contains(&TRAVELLED),
-        "two relaxed lane loads are unordered on AArch64; lane A must be able to \
-         read from before a wide op seen through lane B: {seen:?}"
+/// Whether loom stands in for x86 (TSO) here; otherwise the AArch64 rules.
+const X86: bool = cfg!(any(target_arch = "x86", target_arch = "x86_64"));
+
+/// `outcome` is reachable exactly when the target allows it.
+fn assert_target(seen: &BTreeSet<(u64, u64)>, outcome: (u64, u64), allowed: bool) {
+    assert_eq!(
+        seen.contains(&outcome),
+        allowed,
+        "{outcome:?} must be {} on this target: {seen:?}",
+        if allowed { "reachable" } else { "unreachable" }
     );
+}
+
+// AArch64 RR-rlx: `LDR W0,[x+4]; LDR W2,[x]` — Sometimes. x86: loads stay in
+// order — forbidden.
+#[test]
+fn relaxed_sibling_read_floors_only_on_x86() {
+    let seen = read_route(Relaxed, false, Relaxed);
+    assert_target(&seen, TRAVELLED, !X86);
 }
 
 // AArch64 RR-rlx-acqL: `LDR W0,[x+4]; LDAR W2,[x]` — Sometimes. An acquire on
 // the floored load orders what follows it, not what precedes it.
 #[test]
-fn acquire_on_the_floored_load_alone_does_not_floor() {
+fn acquire_on_the_floored_load_alone_floors_only_on_x86() {
     let seen = read_route(Relaxed, false, Acquire);
-    assert!(seen.contains(&TRAVELLED), "{seen:?}");
+    assert_target(&seen, TRAVELLED, !X86);
 }
 
 // AArch64 RR-acq: `LDAR W0,[x+4]; LDR W2,[x]` — Never.
@@ -143,15 +155,16 @@ fn acquire_fence_after_sibling_read_floors() {
     assert!(!seen.contains(&TRAVELLED), "{seen:?}");
 }
 
-// AArch64 RMW-rlx: `SWP W4,W0,[x+4]; LDR W2,[x]` — Sometimes.
+// AArch64 RMW-rlx: `SWP W4,W0,[x+4]; LDR W2,[x]` — Sometimes. x86: a locked
+// RMW — forbidden.
 #[test]
-fn relaxed_sibling_rmw_does_not_floor() {
+fn relaxed_sibling_rmw_floors_only_on_x86() {
     let seen = explore(|x| {
         let b = x.lane_u64(8).swap(2, Relaxed);
         let a = x.lane_u64(0).load(Relaxed);
         Some((b, a))
     });
-    assert!(seen.contains(&TRAVELLED), "{seen:?}");
+    assert_target(&seen, TRAVELLED, !X86);
 }
 
 // AArch64 RMW-acq: `SWPA W4,W0,[x+4]; LDR W2,[x]` — Never.
@@ -202,19 +215,20 @@ fn a_peer_observation_reached_through_synchronization_floors() {
     assert!(seen.contains(&(1, 1)), "{seen:?}");
 }
 
-// AArch64 RWR-rlx: `LDR W0,[x+4]; STR W4,[x+4]; LDR W2,[x]` — Sometimes (and
-// on x86: the store may still sit in the store buffer).
+// AArch64 RWR-rlx: `LDR W0,[x+4]; STR W4,[x+4]; LDR W2,[x]` — Sometimes. x86:
+// the store may sit in the store buffer, but the lane-B read before it is
+// ordered — forbidden.
 #[test]
-fn own_sibling_store_does_not_floor() {
+fn own_sibling_store_after_relaxed_read_floors_only_on_x86() {
     let seen = write_route(Relaxed, None, Relaxed);
-    assert!(seen.contains(&TRAVELLED), "{seen:?}");
+    assert_target(&seen, TRAVELLED, !X86);
 }
 
 // AArch64 RWR-rel-apr: `LDR; STLR W4,[x+4]; LDAPR W2,[x]` — Sometimes.
 #[test]
-fn own_release_store_then_acquire_load_does_not_floor() {
+fn own_release_store_then_acquire_load_floors_only_on_x86() {
     let seen = write_route(Release, None, Acquire);
-    assert!(seen.contains(&TRAVELLED), "{seen:?}");
+    assert_target(&seen, TRAVELLED, !X86);
 }
 
 // AArch64 RWR-dmbsy: `LDR; STR W4,[x+4]; DMB ISH; LDR W2,[x]` — Never.
@@ -235,9 +249,9 @@ fn own_seq_cst_store_then_seq_cst_load_floors() {
 
 // The same rule through a preserving wide CAS, which floors the lane it
 // carried through the store it read there: a relaxed read of the lane it
-// wrote orders nothing, so the carried lane may still read older.
+// wrote orders nothing on AArch64, so the carried lane may still read older.
 #[test]
-fn relaxed_read_of_a_preserving_op_does_not_floor_the_carried_lane() {
+fn relaxed_read_of_a_preserving_op_floors_the_carried_lane_only_on_x86() {
     const O_MASK: u128 = (u32::MAX as u128) << 64;
     const OWNER: u128 = 0xABCD << 64;
 
@@ -260,7 +274,7 @@ fn relaxed_read_of_a_preserving_op_does_not_floor_the_carried_lane() {
         seen_.lock().unwrap().insert((u64::from(v), u64::from(o)));
     });
     let seen = seen.lock().unwrap().clone();
-    assert!(seen.contains(&(1, 0)), "{seen:?}");
+    assert_target(&seen, (1, 0), !X86);
 }
 
 // AArch64 SCF-noc: a peer reads lane B then runs `DMB ISH`; this thread runs
@@ -303,5 +317,39 @@ fn seq_cst_fences_without_communication_do_not_floor() {
         }
     });
     let seen = seen.lock().unwrap().clone();
-    assert!(seen.contains(&TRAVELLED), "{seen:?}");
+    assert_target(&seen, TRAVELLED, true);
+}
+
+// The futex value↔presence Dekker. A waiter's whole-cell CAS (lane V == 2,
+// install the queue in lane S) races a waker's release-only swap of lane V
+// followed by an acquire load of lane S. AArch64 FUTEX-swpl-ldapr: `CASAL` |
+// `SWPL W4,W0,[x]; LDAPR W6,[x+4]` — Sometimes: the swap reads the CAS's
+// lane V yet the lane-S load misses its push (Rust `Release` swap then
+// `Acquire` load under `+rcpc`). x86: the swap is `xchg`, a full barrier —
+// forbidden.
+#[test]
+fn release_swap_then_acquire_presence_load_misses_push_only_on_aarch64() {
+    const V: u128 = u64::MAX as u128;
+    let seen: Outcomes = Default::default();
+    let seen_ = seen.clone();
+    loom::model(move || {
+        let x = Arc::new(AtomicU128::new(2));
+        // Split the cell into lane V (low qword) / lane S (high qword).
+        x.store_masked(V, 2, Relaxed);
+
+        let waiter = {
+            let x = x.clone();
+            thread::spawn(move || x.compare_exchange(2, 2 | (1 << 64), AcqRel, Relaxed).is_ok())
+        };
+        let v = x.lane_u64(0).swap(0, Release);
+        let s = x.lane_u64(8).load(Acquire);
+        let pushed = waiter.join().unwrap();
+        if pushed {
+            seen_.lock().unwrap().insert((v, s));
+        }
+    });
+    let seen = seen.lock().unwrap().clone();
+    // The swap read the waiter's lane V (2) yet the presence load saw no push.
+    assert_target(&seen, (2, 0), !X86);
+    assert!(seen.contains(&(2, 1)), "{seen:?}");
 }

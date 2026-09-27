@@ -1571,6 +1571,41 @@ impl Snapshot {
 /// seen-marks a prefix of choices implies. Carrying it makes the forward
 /// lookahead (`has_consistent_completion`) predict exactly the readable sets
 /// the walk will go on to compute, which is what makes the walk total.
+/// Which of a thread's own earlier accesses the target orders before a later
+/// load of *another* lane of the same cell, beyond what every target orders
+/// (an acquiring read, a later acquire fence for reads, a later `SeqCst`
+/// fence, a `SeqCst` store before a `SeqCst` load). `LoadView::is_seen` reads
+/// it; a lane observation floors a sibling lane only when it is ordered.
+#[derive(Clone, Copy)]
+struct LaneFloor {
+    /// Every read is ordered before every later load, whatever its ordering.
+    loads_in_order: bool,
+    /// An RMW, at any ordering, orders every earlier own store before every
+    /// later access.
+    rmw_is_full_barrier: bool,
+    /// A `SeqCst` store orders itself before every later access.
+    seq_cst_store_is_full_barrier: bool,
+}
+
+/// The lane floor of the target loom is built for — the target the model
+/// stands in for. x86 is TSO (Intel SDM Vol. 3A §10.2.2): loads are not
+/// reordered with loads, a store may pass a later load through the store
+/// buffer, and locked instructions (every RMW, and `xchg` for a `SeqCst`
+/// store) drain it. AArch64 (herd7 `aarch64.cat -variant mixed`) orders none
+/// of these by itself. Every other target gets that, the weaker rule set.
+const LANE_FLOOR: LaneFloor = cfg_select! {
+    any(target_arch = "x86", target_arch = "x86_64") => LaneFloor {
+        loads_in_order: true,
+        rmw_is_full_barrier: true,
+        seq_cst_store_is_full_barrier: true,
+    },
+    _ => LaneFloor {
+        loads_in_order: false,
+        rmw_is_full_barrier: false,
+        seq_cst_store_is_full_barrier: false,
+    },
+};
+
 #[derive(Clone)]
 struct LoadView {
     /// The reader's causality, projected forward over the prefix.
@@ -1596,6 +1631,9 @@ struct LoadView {
     /// latest `SeqCst` fence (`Thread::acq_fence_version`, `sc_fence_version`).
     acq_fence: u16,
     own_sc_fence: u16,
+
+    /// Own-clock version of the reader's latest RMW (`Thread::rmw_version`).
+    own_rmw: u16,
 }
 
 impl LoadView {
@@ -1610,6 +1648,7 @@ impl LoadView {
             seq_cst: is_seq_cst(ordering),
             acq_fence: threads.active().acq_fence_version,
             own_sc_fence: threads.active().sc_fence_version,
+            own_rmw: threads.active().rmw_version,
         }
     }
 
@@ -1632,10 +1671,11 @@ impl LoadView {
     /// - Another thread's observation reached this one through a release/acquire
     ///   edge, which orders it (bob on AArch64, TSO on x86).
     /// - An own read of a peer's store is ordered once it acquired or an acquire
-    ///   fence followed it; a relaxed read is not (AArch64 reorders loads).
-    /// - An own store is ordered only by a later `SeqCst` fence of this thread,
-    ///   or when it was a `SeqCst` store and this load is `SeqCst`: both targets
-    ///   otherwise let a load pass an earlier store to other bytes.
+    ///   fence followed it, or always where the target keeps loads in order.
+    /// - An own store is ordered by a later `SeqCst` fence of this thread, or
+    ///   when it was a `SeqCst` store and this load is `SeqCst`, or where the
+    ///   target's RMWs and `SeqCst` stores are full barriers, by those.
+    ///   Otherwise a load may pass an earlier store to other bytes.
     /// - A peer's store this same load already committed to reading is one
     ///   single-copy-atomic event with it. An own store read here may have been
     ///   forwarded, which AArch64 permits to split the snapshot.
@@ -1646,9 +1686,12 @@ impl LoadView {
             return true;
         }
         if store.creator == self.me {
-            return self.own_sc_fence > store.tick() || (store.seq_cst && self.seq_cst);
+            return self.own_sc_fence > store.tick()
+                || (store.seq_cst && (self.seq_cst || LANE_FLOOR.seq_cst_store_is_full_barrier))
+                || (LANE_FLOOR.rmw_is_full_barrier && (store.rmw || self.own_rmw > store.tick()));
         }
-        let ordered_read = store.first_seen.1 & me_bit != 0
+        let ordered_read = LANE_FLOOR.loads_in_order
+            || store.first_seen.1 & me_bit != 0
             || store.first_seen.0[self.me] < self.acq_fence;
         (seen & me_bit != 0 && ordered_read) || self.touched.contains(&(rj, gi))
     }
@@ -1915,9 +1958,12 @@ struct Store {
     sc_rank: Option<u32>,
 
     /// Whether the store was itself a `SeqCst` store (or RMW write half) —
-    /// unlike `sc_rank`, never set by promotion. A `SeqCst` load after it in
-    /// the same thread is ordered after it on both targets.
+    /// unlike `sc_rank`, never set by promotion. What decides whether a later
+    /// load of the same thread is ordered after it (`LANE_FLOOR`).
     seq_cst: bool,
+
+    /// Whether the store is the write half of an RMW (`LANE_FLOOR`).
+    rmw: bool,
 }
 
 /// The store a preserving op read — its pin in this region's modification
@@ -2662,6 +2708,10 @@ where
         // Track the load is happening in order to ensure correct
         // synchronization to the underlying cell (cell-wide).
         state.track_load(&execution.threads);
+        // lanes: an RMW is a full barrier where `LANE_FLOOR` says so.
+        let version = execution.threads.active_atomic_version();
+        execution.threads.active_mut().rmw_version = version;
+
         // Either arm's ordering may acquire, and which one runs is decided
         // with the read below.
         state.check_preserved_scope(
@@ -4502,6 +4552,7 @@ impl Region {
             first_seen: FirstSeen::new(),
             sc_rank: None,
             seq_cst: false,
+            rmw: false,
         });
         self.cnt = 1;
     }
@@ -4571,6 +4622,7 @@ impl Region {
             first_seen,
             sc_rank,
             seq_cst: is_seq_cst(ordering),
+            rmw: rmw_read.is_some(),
         });
         if let Some(r) = rmw_read {
             self.stores[r].rmw_write = Some(slot as u8);
@@ -4637,6 +4689,7 @@ impl Region {
             first_seen,
             sc_rank: None,
             seq_cst: false,
+            rmw: false,
         });
         self.cnt += 1;
 

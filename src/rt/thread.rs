@@ -50,6 +50,10 @@ pub(crate) struct Thread {
     pub(crate) acq_fence_version: u16,
     pub(crate) sc_fence_version: u16,
 
+    /// lanes: own-clock version of this thread's latest atomic RMW, `0` for
+    /// none — a full barrier on some targets (`rt::atomic::LANE_FLOOR`).
+    pub(crate) rmw_version: u16,
+
     /// `std::thread::park`'s token.
     park_token: bool,
 
@@ -188,6 +192,7 @@ impl Thread {
             acquirable: Synchronize::new(),
             acq_fence_version: 0,
             sc_fence_version: 0,
+            rmw_version: 0,
             park_token: false,
             park_view: Synchronize::new(),
             parked: false,
