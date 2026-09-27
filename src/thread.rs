@@ -7,8 +7,12 @@ use crate::rt::{self, Execution, Location};
 #[doc(no_inline)]
 pub use std::thread::panicking;
 
+mod scoped;
+pub use self::scoped::{scope, Scope, ScopedJoinHandle};
+
 use std::marker::PhantomData;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use std::{fmt, io};
 
 use tracing::trace;
@@ -119,6 +123,17 @@ pub fn current() -> Thread {
     })
 }
 
+/// Mock implementation of `std::thread::current_id`.
+///
+/// Gets the id of the current thread, without initializing its [`Thread`]
+/// handle.
+#[must_use]
+pub fn current_id() -> ThreadId {
+    rt::execution(|execution| ThreadId {
+        id: execution.threads.active_id(),
+    })
+}
+
 /// Mock implementation of `std::thread::spawn`.
 ///
 /// Note that you may only have [`MAX_THREADS`](crate::MAX_THREADS) threads in a given loom tests
@@ -173,6 +188,27 @@ where
 pub fn park() {
     rt::park_thread(location!());
 }
+
+/// Mock implementation of `std::thread::park_timeout`.
+///
+/// Blocks unless or until the current thread's token is made available or
+/// the timeout elapses. Loom has no clock: `_dur` is ignored and the timeout
+/// is the timed block the model resolves itself, as for
+/// [`Condvar::wait_timeout`](crate::sync::Condvar::wait_timeout).
+#[track_caller]
+pub fn park_timeout(_dur: Duration) {
+    rt::park_timed(location!());
+}
+
+/// Mock implementation of `std::thread::sleep`.
+///
+/// Loom has no clock, and a sleep touches no shared state, so it is no
+/// modelled operation at all: every interleaving of the sleeping thread's
+/// surrounding operations is explored regardless. A loop that polls between
+/// sleeps therefore is not bounded by them; make it spin through
+/// [`yield_now`] or [`hint::spin_loop`](crate::hint::spin_loop), which loom
+/// schedules as a wait for another thread's progress.
+pub fn sleep(_dur: Duration) {}
 
 fn spawn_internal<F, T>(
     f: F,
