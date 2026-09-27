@@ -105,7 +105,7 @@ impl Mutex {
             // Set the lock to the current thread
             state.lock = Some(thread_id);
 
-            dbg!(state.synchronize.sync_load(&mut execution.threads, Acquire));
+            state.synchronize.sync_load(&mut execution.threads, Acquire);
 
             if state.seq_cst {
                 // Establish sequential consistency between locks

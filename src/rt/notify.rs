@@ -99,7 +99,7 @@ impl Notify {
             }
 
             trace!(state = ?self.state, notified = ?state.notified, ?spurious, "Notify::wait 1");
-            dbg!((state.notified, spurious))
+            (state.notified, spurious)
         });
 
         if spurious {
