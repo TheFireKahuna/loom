@@ -1606,6 +1606,21 @@ const LANE_FLOOR: LaneFloor = cfg_select! {
     },
 };
 
+/// The version of `g`'s creator from which its later accesses are ordered
+/// after `g` (its own clock at `g`, or at a later `SeqCst` fence or, where
+/// `LANE_FLOOR` makes RMWs barriers, a later RMW), or `None` if none is yet.
+fn ordered_after(g: &Store, threads: &thread::Set) -> Option<u16> {
+    if (LANE_FLOOR.rmw_is_full_barrier && g.rmw)
+        || (LANE_FLOOR.seq_cst_store_is_full_barrier && g.seq_cst)
+    {
+        return Some(g.tick());
+    }
+    let (_, t) = threads.iter().nth(g.creator)?;
+    let rmw = if LANE_FLOOR.rmw_is_full_barrier { t.rmw_version } else { 0 };
+    let barrier = t.sc_fence_version.max(rmw);
+    (barrier > g.tick()).then_some(barrier)
+}
+
 #[derive(Clone)]
 struct LoadView {
     /// The reader's causality, projected forward over the prefix.
@@ -1768,6 +1783,10 @@ struct Region {
     /// these are what let the op ask what has already read its carried lane.
     readers: u32,
     acquiring_readers: u32,
+
+    /// Per thread, its own clock version at its latest read of these bits and
+    /// the `Store::id` it read; `(0, _)` for none (`State::rmw_passes_barrier`).
+    last_read: [(u16, u16); MAX_THREADS],
 }
 
 #[derive(Debug, Copy, Clone, PartialEq)]
@@ -1883,6 +1902,10 @@ struct RmwAcc {
     /// While every read so far is one a load at the failure ordering could
     /// make, the whole-cell ops they fix.
     failure: Option<Snapshot>,
+    /// The bits a success writes.
+    writes: u128,
+    /// The `(region, slot)` reads so far.
+    chosen: SmallVec<[(usize, usize); 4]>,
 }
 
 /// How an RMW that did not write ended.
@@ -2735,6 +2758,7 @@ where
             &mut execution.path,
             &execution.threads,
             &covered,
+            write_mask,
             cmp,
             success,
             failure,
@@ -3388,6 +3412,7 @@ impl State {
         path: &mut Path,
         threads: &thread::Set,
         covered: &[usize],
+        writes: u128,
         cmp: Compare,
         success: Ordering,
         failure: Ordering,
@@ -3409,6 +3434,8 @@ impl State {
                 value: 0,
                 success: None,
                 failure: Some(base.clone()),
+                writes,
+                chosen: SmallVec::new(),
             };
             let possible =
                 self.rmw_completes(covered, threads, cmp, orders, true, &start, &entry, &entry);
@@ -3420,6 +3447,8 @@ impl State {
             success: (!spur).then(|| base.clone()),
             // An unconditional RMW cannot fail, so only its success is read.
             failure: (spur || !cmp.is_always()).then(|| base.clone()),
+            writes,
+            chosen: SmallVec::new(),
         };
         let mut view = entry.clone();
         let mut reads = SmallVec::new();
@@ -3585,10 +3614,16 @@ impl State {
             next.take(ri, region, ci, preds, None).then_some(next)
         };
 
+        let success = arm(&acc.success, writable, entry, success)
+            .filter(|_| !self.rmw_passes_barrier(ri, ci, acc, threads));
+        let mut chosen = acc.chosen.clone();
+        chosen.push((ri, ci));
         let next = RmwAcc {
             value: acc.value | (region.stores[ci].value & region.mask),
-            success: arm(&acc.success, writable, entry, success),
+            success,
             failure: arm(&acc.failure, readable, view, failure),
+            writes: acc.writes,
+            chosen,
         };
         if next.success.is_none() && next.failure.is_none() {
             return None;
@@ -3600,6 +3635,46 @@ impl State {
             view.clone()
         };
         Some((next, next_view))
+    }
+
+    /// The lane floor's dual: a successful RMW may not write before a peer's store `g` when the
+    /// peer, ordered after `g` (`LANE_FLOOR`), read a region this RMW writes at or before its read.
+    fn rmw_passes_barrier(&self, ri: usize, ci: usize, acc: &RmwAcc, threads: &thread::Set) -> bool {
+        acc.chosen.iter().any(|&(rj, cj)| {
+            self.passes_barrier(ri, ci, rj, cj, acc.writes, threads)
+                || self.passes_barrier(rj, cj, ri, ci, acc.writes, threads)
+        })
+    }
+
+    /// [`Self::rmw_passes_barrier`] for one ordered pair: the RMW reads slot
+    /// `c` of region `rv` and slot `r` of region `rs`, and writes `writes`.
+    fn passes_barrier(
+        &self,
+        rv: usize,
+        c: usize,
+        rs: usize,
+        r: usize,
+        writes: u128,
+        threads: &thread::Set,
+    ) -> bool {
+        let wr = &self.regions[rs];
+        if wr.mask & writes == 0 {
+            return false;
+        }
+        let me = threads.active_id().as_usize();
+        self.regions[rv].stores.iter().any(|g| {
+            if g.creator == me || g.before & bit(c) == 0 {
+                return false;
+            }
+            let Some(barrier) = ordered_after(g, threads) else {
+                return false;
+            };
+            let (at, id) = wr.last_read[g.creator];
+            at > barrier
+                && wr
+                    .slot_of_store(id)
+                    .is_some_and(|s| s == r || wr.stores[r].before & bit(s) != 0)
+        })
     }
 
     /// Can `rest` complete the prefix `acc` into a legal read — a success, a
@@ -4267,6 +4342,7 @@ impl Region {
             unrouted_readers: 0,
             readers: 0,
             acquiring_readers: 0,
+            last_read: [(0, 0); MAX_THREADS],
         }
     }
 
@@ -4283,6 +4359,7 @@ impl Region {
         self.unrouted_readers = 0;
         self.readers = 0;
         self.acquiring_readers = 0;
+        self.last_read = [(0, 0); MAX_THREADS];
     }
 
     /// Keep the `keep_mask` bits of this region in place; split the remaining
@@ -4315,6 +4392,7 @@ impl Region {
                 region.unrouted_readers = self.unrouted_readers;
                 region.readers = self.readers;
                 region.acquiring_readers = self.acquiring_readers;
+                region.last_read = self.last_read;
                 region
             }
             None => Region {
@@ -4329,6 +4407,7 @@ impl Region {
                 unrouted_readers: self.unrouted_readers,
                 readers: self.readers,
                 acquiring_readers: self.acquiring_readers,
+                last_read: self.last_read,
             },
         }
     }
@@ -4381,6 +4460,9 @@ impl Region {
     /// SC-ranked store within the read's SC scope (the SC read rule). The
     /// candidate filters guarantee `index` is mo-before none of them.
     fn observe(&mut self, threads: &thread::Set, index: usize, ordering: Ordering) {
+        self.last_read[threads.active_id().as_usize()] =
+            (threads.active_atomic_version(), self.stores[index].id);
+
         // Only a store not already mo-before `index` can gain an edge.
         let open = self.all_slots() & !self.stores[index].before & !bit(index);
         if open == 0 {

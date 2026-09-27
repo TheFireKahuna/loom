@@ -353,3 +353,39 @@ fn release_swap_then_acquire_presence_load_misses_push_only_on_aarch64() {
     assert_target(&seen, (2, 0), !X86);
     assert!(seen.contains(&(2, 1)), "{seen:?}");
 }
+
+// The same Dekker with a `SeqCst` store as the publish and the push CAS
+// running after the presence load, from a snapshot the waiter took before
+// the store (as the futex push does). AArch64 FUTEX-stlr-ldapr: `CASAL` |
+// `STLR W4,[x]; LDAPR W6,[x+4]` — Sometimes: the CAS may read lane V from
+// before the store even though it lands after the presence load. x86: the
+// store is `xchg`, so the presence load follows it, and the later-landing CAS
+// follows it too and reads it — forbidden. This is the lane floor's dual:
+// it restricts the RMW's read, not the load.
+#[test]
+fn seq_cst_store_then_presence_load_orders_a_later_push_only_on_x86() {
+    const V: u128 = u64::MAX as u128;
+    let seen: Outcomes = Default::default();
+    let seen_ = seen.clone();
+    loom::model(move || {
+        let x = Arc::new(AtomicU128::new(0));
+        x.store_masked(V, 0, Relaxed);
+
+        let waiter = {
+            let x = x.clone();
+            thread::spawn(move || {
+                let snap = x.load(Acquire);
+                snap & V == 0 && x.compare_exchange(snap, snap | (1 << 64), AcqRel, Relaxed).is_ok()
+            })
+        };
+        x.lane_u64(0).store(1, SeqCst);
+        let s = x.lane_u64(8).load(Acquire);
+        let pushed = waiter.join().unwrap();
+        seen_.lock().unwrap().insert((u64::from(pushed), s));
+    });
+    let seen = seen.lock().unwrap().clone();
+    // The push succeeded (it read lane V from before the store) yet the
+    // presence load missed it.
+    assert_target(&seen, (1, 0), !X86);
+    assert!(seen.contains(&(1, 1)) && seen.contains(&(0, 0)), "{seen:?}");
+}
