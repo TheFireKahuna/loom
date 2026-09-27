@@ -90,14 +90,18 @@
 //! explored. The rules below key on the region (per-location) and never create
 //! happens-before between SeqCst operations.
 //!
-//! A store is *SC-ranked* (`Store::sc_rank` is `Some`) when it participates in
-//! S as a write. That is so in two ways:
+//! A store is *SC-ranked* (`Store::sc_rank` is `Some`) when an operation in S
+//! bars every later one from being coherence-ordered before it. That is so in
+//! three ways:
 //!
-//! - it was itself a `SeqCst` store, ranked at its own commit; or
+//! - it was itself a `SeqCst` store, ranked at its own commit;
 //! - it was sequenced before a `SeqCst` fence that has since executed, which
 //!   promotes it into S at the fence's position (`promote_sc_writes`; C++20
 //!   [atomics.order] p5/p7). Promotion is what lets a `fence(SeqCst)` in one
-//!   thread order against an SC *access* in another.
+//!   thread order against an SC *access* in another; or
+//! - a `SeqCst` read returned it, ranking it at the read's position
+//!   (`Region::rank_sc_read`): an operation coherence-ordered before the store
+//!   is coherence-ordered before the read (p4.1, p4.3).
 //!
 //! A full-width SeqCst store spans every region at **one** S position (the op
 //! allocates a single `sc_rank` and hands it to each region), matching that the
@@ -159,8 +163,10 @@
 //!
 //!   An RMW's write is *immediately* after the store it read in modification
 //!   order (C++20 [atomics.order] p10) — no other store may sit between them.
-//!   A successful RMW reads a modification-order-maximal store and its write is
-//!   appended right after it. `Region::order` then keeps the pair adjacent for
+//!   A successful RMW may read any store a load could whose known successors
+//!   can all follow its write (`Region::rmw_writable`) — mo-maximal or not —
+//!   and its write is placed right after it. `Region::order` then keeps the
+//!   pair adjacent for
 //!   good: an edge out of the read store to anything but its write becomes an
 //!   edge out of the write, and an edge into the write from anything but its
 //!   read store becomes an edge into the read store. Without the first, a plain
@@ -169,7 +175,7 @@
 //!   ordered before the write could still be read after the read store.
 //!
 //!   A compare-exchange decides its arm from the value before reading it
-//!   (`State::choose_rmw_reads`): the success arm reads a maximal store whose
+//!   (`State::choose_rmw_reads`): the success arm reads such a store whose
 //!   value passes, the failure arm is a load at the failure ordering and may
 //!   read any store a load could whose value fails, and a weak
 //!   compare-exchange adds a spurious arm — that load taking a value that
@@ -181,10 +187,10 @@
 //! A region keeps a store for as long as a read could still return it or
 //! still be constrained by it. Once every live thread has seen a store
 //! mo-after it, no load can return it and no RMW can read it, and neither can
-//! anything mo-before it; `State::reclaim` then drops it, unless an acquire
-//! fence still owes its release to a thread that read it, a preserving op's
-//! record measures from it, or it belongs to a whole-cell op some sibling lane
-//! has not yet passed. A region holding `MAX_ATOMIC_HISTORY` stores no thread
+//! anything mo-before it; `State::reclaim` then drops it, unless a preserving
+//! op's record measures from it or it belongs to a whole-cell op some sibling
+//! lane has not yet passed. A preserving op's record likewise leaves once the
+//! op can bind no read. A region holding `MAX_ATOMIC_HISTORY` stores no thread
 //! has passed fails loudly: each is a value a pending load may return.
 
 use crate::rt::execution::Execution;
@@ -196,7 +202,6 @@ use crate::rt::{
 
 use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
-use std::cmp;
 use std::marker::PhantomData;
 use std::sync::atomic::Ordering;
 use std::u16;
@@ -1198,8 +1203,8 @@ pub(crate) trait ModelOps {
     ///
     /// `expected` says when `f` succeeds, before anything is read: exactly
     /// when the bits under `read_mask` equal those of `expected`, or always
-    /// for `None`. The read is chosen by it — a success reads a
-    /// modification-order-maximal store, a failure is a load at `failure` and
+    /// for `None`. The read is chosen by it — a success reads a store its
+    /// write can go immediately after, a failure is a load at `failure` and
     /// may return any store a load could — and `f` must agree, which the
     /// model asserts.
     #[allow(clippy::too_many_arguments)]
@@ -1350,15 +1355,204 @@ pub(super) struct State {
     spares: Vec<Region>,
 }
 
-/// The wide-op visibility a multi-region load has fixed so far: one
-/// `(op_id, seen)` per op the regions already resolved speak for.
+/// What a multi-region read has fixed about the whole-cell ops it spans.
 ///
-/// The walk carries a single buffer and treats it as a stack — a candidate
-/// pushes what it implies, is tested, and winds back — so a rejected prefix
-/// costs no copy. Sized inline for one entry per store of every region of a
-/// 32-bit-laned 128-bit cell at the reclaim threshold, so push/truncate
-/// reaches the allocator only once a history has outgrown it.
-type Resolved = SmallVec<[(u64, bool); INLINE_HISTORY * 4]>;
+/// Single-copy atomicity: every region of one read sees a whole-cell op X, or
+/// none does. Region `r`'s chosen store `c` *sees* X there when X's pin in `r`
+/// — X's store, or for a preserving op the store it read and carried — is `c`
+/// or mo-before it, including through a store the read itself puts before
+/// `c`; it *misses* X when `c` is mo-before the pin. A store unordered with
+/// the pin decides nothing: the read may place it on either side, and the
+/// side it takes is then fixed by an edge (`State::settle`). What one region
+/// leaves open another may decide.
+///
+/// Placements interact within a region: seeing X puts X's pin before `c`,
+/// missing Y puts `c` before Y's pin, and the two close a cycle when Y's pin
+/// is at or before X's (RMW pairs counted as the atomicity rewrite moves
+/// them). Each such pair is a clause "seeing X means seeing Y". Every clause
+/// has that shape, so fixed placements are consistent exactly when
+/// propagating the clauses from them meets no contradiction; the ops left
+/// free can then all be missed.
+///
+/// Reading exactly a preserving op's carried store fits either placement: it
+/// holds the bits of the elided identity write. A plain load of its own store
+/// may have taken it by store forwarding, which AArch64 lets split a
+/// single-copy-atomic snapshot: missing X beside it constrains nothing, and
+/// only X seen elsewhere puts X's pin before it.
+#[derive(Clone, Debug, Default)]
+struct Snapshot {
+    /// The ops pinned in two or more of the read's regions, sorted.
+    ops: SmallVec<[u64; 8]>,
+
+    /// Per op, whether the read sees it, once decided.
+    seen: SmallVec<[Option<bool>; 8]>,
+
+    /// `(a, b)`: seeing op `a` means seeing op `b`.
+    implies: SmallVec<[(u8, u8); 8]>,
+
+    /// Chosen stores unordered with an op's pin.
+    open: SmallVec<[OpenPin; 8]>,
+}
+
+/// A region's chosen store left unordered with a whole-cell op's pin.
+#[derive(Clone, Copy, Debug)]
+struct OpenPin {
+    region: u8,
+    pin: u8,
+    chosen: u8,
+    op: u8,
+    /// The chosen store is the loading thread's own, possibly forwarded.
+    forwarded: bool,
+}
+
+impl Snapshot {
+    /// The whole-cell ops a read over `covered` spans.
+    fn spanning(regions: &[Region], covered: &[usize]) -> Snapshot {
+        let mut all: SmallVec<[u64; 16]> = SmallVec::new();
+        for &ri in covered {
+            let region = &regions[ri];
+            all.extend(region.stores.iter().map(|s| s.op_id));
+            all.extend(region.preserved_ops().map(|p| p.op_id));
+        }
+        all.sort_unstable();
+
+        let mut snapshot = Snapshot::default();
+        for run in all.chunk_by(|a, b| a == b) {
+            if run.len() > 1 {
+                snapshot.ops.push(run[0]);
+                snapshot.seen.push(None);
+            }
+        }
+        snapshot
+    }
+
+    /// Take slot `c` of region `ri` as that region's read, `preds` being the
+    /// stores the read orders before `c` (`Region::read_preds`). `forwarding`
+    /// is the loading thread when the read is a plain load. False when the
+    /// choice contradicts what is fixed.
+    fn take(
+        &mut self,
+        ri: usize,
+        region: &Region,
+        c: usize,
+        preds: Slots,
+        forwarding: Option<usize>,
+    ) -> bool {
+        if self.ops.is_empty() {
+            return true;
+        }
+
+        let cs = &region.stores[c];
+        let forwarded = forwarding.is_some_and(|me| cs.creator == me);
+
+        // Observed before `c`: the read's own predecessors and everything
+        // before them. A forwarded store's own history is no observation.
+        let observed_from = if forwarded {
+            preds & !region.created_by(cs.creator)
+        } else {
+            preds
+        };
+        let mut observed = observed_from;
+        for p in slots(observed_from) {
+            observed |= region.stores[p].before;
+        }
+        let below = if forwarded {
+            observed
+        } else {
+            observed | cs.before
+        };
+
+        let pins = region
+            .stores
+            .iter()
+            .map(|d| (d.op_id, Some(d.slot as usize), false))
+            .chain(
+                region
+                    .preserved_ops()
+                    .map(|p| (p.op_id, region.slot_of_store(p.read.read_id), true)),
+            );
+
+        let mut local: SmallVec<[(u8, usize); 8]> = SmallVec::new();
+        for (op_id, d, preserved) in pins {
+            let (Ok(k), Some(d)) = (self.ops.binary_search(&op_id), d) else {
+                continue;
+            };
+
+            let placed = if d == c {
+                (!preserved).then_some(true)
+            } else if below & bit(d) != 0 {
+                Some(true)
+            } else if cs.after & bit(d) != 0 {
+                Some(false)
+            } else if forwarded && cs.before & bit(d) != 0 {
+                None
+            } else {
+                self.open.push(OpenPin {
+                    region: ri as u8,
+                    pin: d as u8,
+                    chosen: c as u8,
+                    op: k as u8,
+                    forwarded,
+                });
+                if !forwarded {
+                    local.push((k as u8, d));
+                }
+                None
+            };
+
+            if let Some(v) = placed {
+                if !self.fix(k, v) {
+                    return false;
+                }
+            }
+        }
+
+        for &(x, dx) in &local {
+            for &(y, dy) in &local {
+                if x != y && region.at_or_before(region.chain_start(dy, c), region.chain_end(dx, c)) {
+                    self.implies.push((x, y));
+                }
+            }
+        }
+
+        self.propagate()
+    }
+
+    fn fix(&mut self, k: usize, v: bool) -> bool {
+        match self.seen[k] {
+            Some(w) => w == v,
+            None => {
+                self.seen[k] = Some(v);
+                true
+            }
+        }
+    }
+
+    /// Close the fixed placements under the clauses; false on a contradiction.
+    fn propagate(&mut self) -> bool {
+        loop {
+            let mut changed = false;
+            for &(a, b) in &self.implies {
+                let (a, b) = (a as usize, b as usize);
+                match (self.seen[a], self.seen[b]) {
+                    (Some(true), Some(false)) => return false,
+                    (Some(true), None) => {
+                        self.seen[b] = Some(true);
+                        changed = true;
+                    }
+                    (None, Some(false)) => {
+                        self.seen[a] = Some(false);
+                        changed = true;
+                    }
+                    _ => {}
+                }
+            }
+            if !changed {
+                return true;
+            }
+        }
+    }
+}
 
 /// The reader-side state a multi-region load filters its candidates against.
 ///
@@ -1505,8 +1699,9 @@ struct Region {
 
     /// Wide ops that compared these bits and wrote them back verbatim
     /// ([`PreservedOp`]) — the store-less stand-ins for the identity writes
-    /// they replace. A ring of the newest `PRESERVED_HISTORY`.
-    preserved: [PreservedOp; PRESERVED_HISTORY],
+    /// they replace. A record stays while it can still bind a read
+    /// (`State::reclaim`), at most `MAX_ATOMIC_HISTORY` at once.
+    preserved: Vec<PreservedOp>,
 
     /// Total number of preserving ops over this region. Non-zero is what
     /// makes the region *elision-tainted* — the state
@@ -1625,7 +1820,7 @@ impl Compare {
 /// Which way an RMW went (`State::choose_rmw_reads`).
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 enum Arm {
-    /// Read maximal stores, wrote.
+    /// Read stores its write could follow, wrote.
     Success,
     /// A load at the failure ordering whose value failed the compare.
     Failure,
@@ -1635,16 +1830,16 @@ enum Arm {
 }
 
 /// A prefix of an RMW's per-region reads, and which arms it still admits.
-#[derive(Debug, Copy, Clone)]
+#[derive(Debug, Clone)]
 struct RmwAcc {
     /// The composed value read so far.
     value: u128,
-    /// Every read so far is modification-order-maximal: the success arm is
-    /// open.
-    maximal: bool,
-    /// Every read so far is one a load at the failure ordering could make,
-    /// consistently across whole-cell ops: a failing read is open.
-    readable: bool,
+    /// While every read so far is one a success could make, the whole-cell
+    /// ops they fix.
+    success: Option<Snapshot>,
+    /// While every read so far is one a load at the failure ordering could
+    /// make, the whole-cell ops they fix.
+    failure: Option<Snapshot>,
 }
 
 /// How an RMW that did not write ended.
@@ -1708,9 +1903,10 @@ struct Store {
     /// `SeqCst` store (ranked at its own commit) or because it was sequenced
     /// before a `SeqCst` fence that has since executed and promoted it (ranked
     /// at the fence's position, `promote_sc_writes`; C++20 [atomics.order]
-    /// p5/p7). The SC read rule excludes whatever is mo-before an in-scope
-    /// ranked store, and a read within scope orders every such store before
-    /// the one it returns (`Region::observe`).
+    /// p5/p7), or because an SC read returned it (ranked at the read's
+    /// position, `Region::rank_sc_read`). The SC read rule excludes whatever
+    /// is mo-before an in-scope ranked store, and a read within scope orders
+    /// every such store before the one it returns (`Region::observe`).
     sc_rank: Option<u32>,
 
     /// Whether the store was itself a `SeqCst` store (or RMW write half) —
@@ -1754,30 +1950,118 @@ fn mo_before(a: &Store, b: &Store) -> bool {
 /// A set of a region's store slots, one bit per slot.
 type Slots = u32;
 
+const MO_CYCLE: &str =
+    "[loom internal bug] modification-order cycle: the model chose a read no execution can make";
+
+/// A region's modification order as a graph over slots: each node's known
+/// successors and predecessors, transitively closed, and its RMW pairing.
+/// Implemented by a region's stores and by a scratch copy of them, so a
+/// placement can be tried before it is made (`Region::rmw_writable`).
+trait MoGraph {
+    fn node(&self, i: usize) -> MoNode;
+    fn set_order(&mut self, i: usize, after: Slots, before: Slots);
+
+    fn after(&self, i: usize) -> Slots {
+        self.node(i).after
+    }
+
+    /// Record `a` mo-before `b` and restore both invariants: transitive
+    /// closure, and RMW atomicity — an RMW write is *immediately* mo-after the
+    /// store it read (C++20 [atomics.order] p10). Nothing may sit between the
+    /// pair, so an edge out of the read store to anything but its write is an
+    /// edge out of the write, and an edge into the write from anything but its
+    /// read store is an edge into the read store. Rewriting the direct edge
+    /// that way keeps every edge the closure derives from it atomic too. False
+    /// on a cycle.
+    fn order(&mut self, a: usize, b: usize) -> bool {
+        match self.atomic_edge(a, b) {
+            Some((a, b)) => self.close(bit(a), b),
+            None => false,
+        }
+    }
+
+    /// The edge `a` -> `b` becomes once no RMW pair may be split by it.
+    fn atomic_edge(&self, mut a: usize, mut b: usize) -> Option<(usize, usize)> {
+        for _ in 0..=2 * MAX_ATOMIC_HISTORY {
+            match (self.node(a).rmw_write, self.node(b).rmw_read) {
+                (Some(w), _) if w as usize != b => a = w as usize,
+                (_, Some(r)) if r as usize != a => b = r as usize,
+                _ => return Some((a, b)),
+            }
+        }
+        None
+    }
+
+    /// Put `sources`, and everything mo-before them, mo-before `t` and
+    /// everything mo-after it. False on a cycle, changing nothing.
+    fn close(&mut self, sources: Slots, t: usize) -> bool {
+        let mut below = sources;
+        for i in slots(sources) {
+            below |= self.node(i).before;
+        }
+        let above = bit(t) | self.node(t).after;
+        if below & above != 0 {
+            return false;
+        }
+
+        for i in slots(below | above) {
+            let n = self.node(i);
+            let after = if below & bit(i) != 0 { n.after | above } else { n.after };
+            let before = if above & bit(i) != 0 { n.before | below } else { n.before };
+            self.set_order(i, after, before);
+        }
+        true
+    }
+}
+
+/// One slot's part of a [`MoGraph`].
+#[derive(Debug, Copy, Clone)]
+struct MoNode {
+    after: Slots,
+    before: Slots,
+    rmw_read: Option<u8>,
+    rmw_write: Option<u8>,
+}
+
+impl MoNode {
+    fn of(store: &Store) -> MoNode {
+        MoNode {
+            after: store.after,
+            before: store.before,
+            rmw_read: store.rmw_read,
+            rmw_write: store.rmw_write,
+        }
+    }
+}
+
+impl MoGraph for [Store] {
+    fn node(&self, i: usize) -> MoNode {
+        MoNode::of(&self[i])
+    }
+
+    fn set_order(&mut self, i: usize, after: Slots, before: Slots) {
+        self[i].after = after;
+        self[i].before = before;
+    }
+}
+
+impl MoGraph for [MoNode] {
+    fn node(&self, i: usize) -> MoNode {
+        self[i]
+    }
+
+    fn set_order(&mut self, i: usize, after: Slots, before: Slots) {
+        self[i].after = after;
+        self[i].before = before;
+    }
+}
+
 const _: () = assert!(MAX_ATOMIC_HISTORY <= Slots::BITS as usize);
 
 /// How many stores a region holds before each append first reclaims the ones
 /// no thread can read any more (`State::reclaim`); also the inline sizing of
 /// per-load scratch.
 const INLINE_HISTORY: usize = 8;
-
-/// Depth of a region's ring of preserving-op records.
-const PRESERVED_HISTORY: usize = 8;
-
-/// How one read of a region places a whole-cell op, as far as the order known
-/// so far decides it (`Region::sight`).
-#[derive(Debug, Copy, Clone, PartialEq, Eq)]
-enum Sight {
-    /// The read is the op's store or mo-after it.
-    Seen,
-    /// The read is mo-before the op's store.
-    Unseen,
-    /// The read is the store a preserving op read, which carries the bits of
-    /// the op's elided identity write: before and after the op at once.
-    Either,
-    /// The read is unordered with the op's store.
-    Open,
-}
 
 /// A wide op that **compared** this region's bits and wrote them back
 /// verbatim, recorded without a store of its own
@@ -1797,7 +2081,7 @@ enum Sight {
 /// the residual below, not a difference in what can be read.
 ///
 /// **All-or-none visibility binds this lane through `s`**
-/// ([`Region::try_resolve`]). The op compared these bits against `s`, so a
+/// ([`Snapshot`]). The op compared these bits against `s`, so a
 /// snapshot that sees the op through a written region reads `s` or later
 /// here, and one that does not see it reads nothing strictly later than `s`.
 /// `s` itself satisfies both, carrying the same bits as `s'`.
@@ -2392,11 +2676,12 @@ where
         let thread = 1u32 << execution.threads.active_id().as_usize();
         let may_spur = weak && state.spurious_last & thread == 0;
 
-        let (reads, current, arm) = state.choose_rmw_reads(
+        let (reads, current, arm, snapshot) = state.choose_rmw_reads(
             &mut execution.path,
             &execution.threads,
             &covered,
             cmp,
+            success,
             failure,
             may_spur,
         );
@@ -2413,12 +2698,12 @@ where
             // A failing compare-exchange is a load at `failure`: each region's
             // read is fixed and synchronized in turn, as `choose_rmw_reads`
             // projected it.
+            let sc_pos = is_seq_cst(failure).then(|| execution.threads.next_sc_pos());
             for &(ri, index) in &reads {
                 state.regions[ri].load(&mut execution.threads, index, failure);
+                state.regions[ri].rank_sc_read(index, sc_pos);
             }
-            if reads.len() > 1 {
-                state.firm(&reads);
-            }
+            state.settle(&mut execution.path, snapshot);
 
             if arm == Arm::Spurious {
                 return Err(RmwFail::Spurious(current));
@@ -2435,9 +2720,7 @@ where
         for &(ri, index) in &reads {
             state.regions[ri].rmw_observe(&execution.threads, index, success);
         }
-        if reads.len() > 1 {
-            state.firm(&reads);
-        }
+        state.settle(&mut execution.path, snapshot);
 
         let Ok(next) = f(current) else {
             panic!(
@@ -2900,10 +3183,15 @@ impl State {
     ///
     /// A region offers its passed, unpinned stores (`Region::reclaimable`).
     /// On a mixed-size cell a whole-cell op's store also floors its sibling
-    /// lanes (`filter_seen_op_floors`) and binds its snapshot all-or-none
-    /// (`try_resolve`) until every lane has passed it, so its stores leave
+    /// lanes (`filter_seen_op_floors`) and binds a read's snapshot all-or-none
+    /// (`Snapshot`) until every lane has passed it, so its stores leave
     /// together, and not while a lane it preserved still has a reader behind
     /// the store it read there.
+    ///
+    /// A preserving op's record leaves once the op has no store left in any
+    /// lane and every live thread has passed the store it carried: no read can
+    /// then place the op, return what it carried, or fall behind it. Its
+    /// carried store is unpinned, and goes at a later reclaim.
     fn reclaim(&mut self, threads: &thread::Set) {
         if self.regions.iter().all(|r| r.stores.len() < INLINE_HISTORY) {
             return;
@@ -2950,6 +3238,23 @@ impl State {
             }
         }
 
+        for rj in 0..self.regions.len() {
+            let spent: SmallVec<[u64; 4]> = self.regions[rj]
+                .preserved_ops()
+                .filter(|p| {
+                    let carried = self.regions[rj].slot_of_store(p.read.read_id);
+                    carried.is_some_and(|s| passed[rj] & bit(s) != 0)
+                        && self.regions.iter().zip(&gone).all(|(other, &g)| {
+                            other.slot_of_op(p.op_id).is_none_or(|s| g & bit(s) != 0)
+                        })
+                })
+                .map(|p| p.op_id)
+                .collect();
+            if !spent.is_empty() {
+                self.regions[rj].preserved.retain(|p| !spent.contains(&p.op_id));
+            }
+        }
+
         for (region, gone) in self.regions.iter_mut().zip(gone) {
             if gone != 0 {
                 region.evict(gone);
@@ -2957,77 +3262,50 @@ impl State {
         }
     }
 
-    /// Fix the modification-order placement a multi-region read committed to.
+    /// Fix the modification-order placement of every whole-cell op a
+    /// multi-region read left open (`Snapshot`), once all its regions are read.
     ///
-    /// A single-copy-atomic read sees each whole-cell op all-or-none. Where one
-    /// region's chosen store is unordered with that op's store there, the
-    /// choice leaves the order open, and a later read could close it the other
-    /// way — observing half the op after all. Once another region of this read
-    /// decides the op, the open region is ordered to agree: its store after
-    /// the op's (seen) or before it (not seen). Repeats until nothing open is
-    /// decided, since each edge can decide more.
-    fn firm(&mut self, reads: &[(usize, usize)]) {
-        // Nothing is open unless some read is unordered with a store of its
-        // region, or reads a region a preserving op carried.
-        let open = reads.iter().any(|&(ri, ci)| {
-            let region = &self.regions[ri];
-            let c = &region.stores[ci];
-            region.all_slots() & !bit(ci) & !c.after & !c.before != 0 || region.live_preserved() > 0
-        });
-        if !open {
-            return;
+    /// An op no region decided, and some region left unordered, may go either
+    /// way where both are consistent: the read branches over the two, since
+    /// each is a different future — a later read could otherwise close the
+    /// order the other way and see half the op after all. Then every open pin
+    /// gets the edge its placement implies.
+    fn settle(&mut self, path: &mut Path, mut snapshot: Snapshot) {
+        for k in 0..snapshot.ops.len() {
+            // An op open only beside forwarded stores constrains nothing
+            // missed, which covers every future seeing it would allow.
+            let binding = snapshot
+                .open
+                .iter()
+                .any(|o| o.op as usize == k && !o.forwarded);
+            if snapshot.seen[k].is_some() || !binding {
+                continue;
+            }
+
+            let can = |v: bool| {
+                let mut trial = snapshot.clone();
+                trial.seen[k] = Some(v);
+                trial.propagate()
+            };
+            let (see, miss) = (can(true), can(false));
+            assert!(
+                see || miss,
+                "[loom internal bug] a wide read's snapshot has no consistent placement"
+            );
+
+            let v = if see && miss { path.branch_spurious() } else { see };
+            snapshot.seen[k] = Some(v);
+            let consistent = snapshot.propagate();
+            debug_assert!(consistent);
         }
 
-        // The ops this read reaches in two or more regions, each with its pin
-        // per region: `(op, read, pinned slot, preserved)`. Pins stay valid
-        // throughout — nothing is evicted here.
-        let mut all: SmallVec<[(u64, usize, usize, bool); 16]> = SmallVec::new();
-        for (k, &(ri, _)) in reads.iter().enumerate() {
-            let region = &self.regions[ri];
-            for d in &region.stores {
-                all.push((d.op_id, k, d.slot as usize, false));
-            }
-            for p in region.preserved_ops() {
-                if let Some(slot) = region.slot_of_store(p.read.read_id) {
-                    all.push((p.op_id, k, slot, true));
-                }
-            }
-        }
-        all.sort_unstable_by_key(|&(op_id, k, ..)| (op_id, k));
-
-        let mut pins: SmallVec<[(u64, usize, usize, bool); 16]> = SmallVec::new();
-        for run in all.chunk_by(|a, b| a.0 == b.0) {
-            if run.len() > 1 {
-                pins.extend_from_slice(run);
-            }
-        }
-
-        loop {
-            let mut edge = None;
-
-            for run in pins.chunk_by(|a, b| a.0 == b.0) {
-                let mut decided = None;
-                let mut open = None;
-
-                for &(_, k, d, preserved) in run {
-                    let (ri, ci) = reads[k];
-                    match self.regions[ri].sight(d, preserved, ci) {
-                        Sight::Seen => decided = Some(true),
-                        Sight::Unseen => decided = Some(false),
-                        Sight::Open => open = open.or(Some((ri, d, ci))),
-                        Sight::Either => {}
-                    }
-                }
-
-                if let (Some(seen), Some((ri, d, c))) = (decided, open) {
-                    edge = Some(if seen { (ri, d, c) } else { (ri, c, d) });
-                    break;
-                }
-            }
-
-            match edge {
-                Some((ri, a, b)) => self.regions[ri].order(a, b),
-                None => return,
+        for o in &snapshot.open {
+            let region = &mut self.regions[o.region as usize];
+            let (pin, chosen) = (o.pin as usize, o.chosen as usize);
+            match snapshot.seen[o.op as usize] {
+                Some(true) => region.order(pin, chosen),
+                Some(false) if !o.forwarded => region.order(chosen, pin),
+                _ => {}
             }
         }
     }
@@ -3036,98 +3314,77 @@ impl State {
     /// with them its arm. `cmp` decides the arm from the composed value
     /// before anything is read, which is what lets each arm read what it may:
     ///
-    /// - **success** reads a modification-order-maximal store in every region
-    ///   (its write goes immediately after), and the value passes `cmp`;
+    /// - **success** reads, in every region, a store its write can go
+    ///   immediately after (`Region::rmw_writable`), and the value passes
+    ///   `cmp`;
     /// - **failure** is an atomic load at the `failure` ordering: any store a
-    ///   load could return, all-or-none across whole-cell ops exactly as
-    ///   `compose_load` resolves them, whose value fails `cmp`;
+    ///   load could return, whose value fails `cmp`;
     /// - **spurious** (a weak compare-exchange, when `may_spur`) is that same
     ///   load taking a value that *passes* `cmp`. It is its own path branch,
     ///   offered only where such a read exists.
     ///
-    /// Each region's branch offers exactly the candidates some completion of
-    /// the remaining regions makes legal, so the walk never dead-ends.
+    /// Every arm sees whole-cell ops all-or-none (`Snapshot`); the one taken is
+    /// returned for `settle`. Each region's branch offers exactly the
+    /// candidates some completion of the remaining regions makes legal, so the
+    /// walk never dead-ends.
+    #[allow(clippy::too_many_arguments)]
     fn choose_rmw_reads(
         &self,
         path: &mut Path,
         threads: &thread::Set,
         covered: &[usize],
         cmp: Compare,
+        success: Ordering,
         failure: Ordering,
         may_spur: bool,
-    ) -> (SmallVec<[(usize, usize); 4]>, u128, Arm) {
+    ) -> (SmallVec<[(usize, usize); 4]>, u128, Arm, Snapshot) {
         if let [ri] = *covered {
-            return self.choose_rmw_read(path, threads, ri, cmp, failure, may_spur);
+            let (reads, value, arm) =
+                self.choose_rmw_read(path, threads, ri, cmp, success, failure, may_spur);
+            return (reads, value, arm, Snapshot::default());
         }
 
         let entry = LoadView::entry(threads, failure, &[]);
+        let base = Snapshot::spanning(&self.regions, covered);
+        let orders = (success, failure);
 
         let mut spur = false;
         if may_spur {
             let start = RmwAcc {
                 value: 0,
-                maximal: false,
-                readable: true,
+                success: None,
+                failure: Some(base.clone()),
             };
-            let possible = self.rmw_completes(
-                covered,
-                threads,
-                cmp,
-                failure,
-                true,
-                start,
-                &mut Resolved::new(),
-                &entry,
-            );
+            let possible =
+                self.rmw_completes(covered, threads, cmp, orders, true, &start, &entry, &entry);
             spur = possible && path.branch_spurious();
         }
 
-        let multi = covered.len() > 1;
         let mut acc = RmwAcc {
             value: 0,
-            maximal: !spur,
-            // An unconditional RMW cannot fail, so it reads maximal stores only.
-            readable: spur || !cmp.is_always(),
+            success: (!spur).then(|| base.clone()),
+            // An unconditional RMW cannot fail, so only its success is read.
+            failure: (spur || !cmp.is_always()).then(|| base.clone()),
         };
-        let mut resolved = Resolved::new();
-        let mut view = entry;
+        let mut view = entry.clone();
         let mut reads = SmallVec::new();
 
         for (k, &ri) in covered.iter().enumerate() {
-            let (maximal, readable) = self.rmw_candidates(ri, threads, failure, acc, &view);
+            let (writable, readable) = self.rmw_candidates(ri, threads, orders, &acc, &entry, &view);
 
             if path.is_traversed() {
                 let rest = &covered[k + 1..];
                 let mut seed = [0; MAX_ATOMIC_HISTORY];
                 let mut n = 0;
 
-                for ci in slots(maximal | readable) {
-                    let mark = resolved.len();
+                for ci in slots(writable | readable) {
                     let legal = self
-                        .rmw_step(
-                            ri,
-                            ci,
-                            maximal,
-                            readable,
-                            acc,
-                            multi,
-                            failure,
-                            &mut resolved,
-                            &view,
-                        )
+                        .rmw_step(ri, ci, (writable, readable), threads, orders, &acc, &entry, &view)
                         .is_some_and(|(next, next_view)| {
                             self.rmw_completes(
-                                rest,
-                                threads,
-                                cmp,
-                                failure,
-                                spur,
-                                next,
-                                &mut resolved,
-                                &next_view,
+                                rest, threads, cmp, orders, spur, &next, &entry, &next_view,
                             )
                         });
-                    resolved.truncate(mark);
 
                     if legal {
                         seed[n] = ci as u8;
@@ -3141,42 +3398,34 @@ impl State {
 
             let ci = path.branch_load();
             let (next, next_view) = self
-                .rmw_step(
-                    ri,
-                    ci,
-                    maximal,
-                    readable,
-                    acc,
-                    multi,
-                    failure,
-                    &mut resolved,
-                    &view,
-                )
+                .rmw_step(ri, ci, (writable, readable), threads, orders, &acc, &entry, &view)
                 .expect("[loom internal bug] RMW committed to an illegal read");
             acc = next;
             view = next_view;
             reads.push((ri, ci));
         }
 
-        let arm = if spur {
-            Arm::Spurious
-        } else if acc.maximal && cmp.succeeds(acc.value) {
-            Arm::Success
-        } else {
-            Arm::Failure
+        let passes = cmp.succeeds(acc.value);
+        let (arm, snapshot) = match (spur, acc.success, acc.failure) {
+            (true, _, Some(f)) => (Arm::Spurious, f),
+            (false, Some(s), _) if passes => (Arm::Success, s),
+            (false, _, Some(f)) if !passes => (Arm::Failure, f),
+            _ => unreachable!("[loom internal bug] RMW read with no arm"),
         };
 
-        (reads, acc.value, arm)
+        (reads, acc.value, arm, snapshot)
     }
 
     /// [`Self::choose_rmw_reads`] over a single region, where nothing can
     /// tear and each candidate's arm follows from its own value.
+    #[allow(clippy::too_many_arguments)]
     fn choose_rmw_read(
         &self,
         path: &mut Path,
         threads: &thread::Set,
         ri: usize,
         cmp: Compare,
+        success: Ordering,
         failure: Ordering,
         may_spur: bool,
     ) -> (SmallVec<[(usize, usize); 4]>, u128, Arm) {
@@ -3191,17 +3440,18 @@ impl State {
             out
         };
 
+        let view = threads.active().coherence_view();
         let readable = if cmp.is_always() && !may_spur {
             0
         } else {
-            region.readable_mask(threads, &threads.active().coherence_view(), failure)
+            region.readable_mask(threads, &view, failure)
         };
 
         let spur = may_spur && passing(readable, true) != 0 && path.branch_spurious();
         let candidates = if spur {
             passing(readable, true)
         } else {
-            passing(region.maximal_mask(), true) | passing(readable, false)
+            passing(region.rmw_writable(threads, &view, success), true) | passing(readable, false)
         };
 
         if path.is_traversed() {
@@ -3230,63 +3480,66 @@ impl State {
         (reads, value, arm)
     }
 
-    /// The candidates region `ri` offers an RMW whose prefix is `acc`: its
-    /// maximal stores while the success arm is still open, and the stores a
-    /// load at `failure` could return while a failing read is.
+    /// The candidates region `ri` offers an RMW whose prefix is `acc`: the
+    /// stores its write can follow while the success arm is open, and the
+    /// stores a load at the failure ordering could return while a failing
+    /// read is. A success reads at `entry`, a failure at the projected `view`.
     fn rmw_candidates(
         &self,
         ri: usize,
         threads: &thread::Set,
-        failure: Ordering,
-        acc: RmwAcc,
+        (success, failure): (Ordering, Ordering),
+        acc: &RmwAcc,
+        entry: &LoadView,
         view: &LoadView,
     ) -> (Slots, Slots) {
         let region = &self.regions[ri];
-        let maximal = if acc.maximal {
-            region.maximal_mask()
+        let writable = if acc.success.is_some() {
+            region.rmw_writable(threads, &entry.causality, success)
         } else {
             0
         };
-        let readable = if acc.readable {
+        let readable = if acc.failure.is_some() {
             region.readable_mask(threads, &view.causality, failure)
         } else {
             0
         };
-        (maximal, readable)
+        (writable, readable)
     }
 
     /// Extend the prefix `acc` with slot `ci` of region `ri`, or `None` when no
-    /// arm survives it. A failing read resolves whole-cell ops against
-    /// `resolved` (extended on success, untouched otherwise) and projects the
-    /// reader's view forward as `compose_load` does.
+    /// arm survives it. Each arm fixes the whole-cell ops its read implies
+    /// (`Snapshot::take`); a failing read projects the reader's view forward
+    /// as `compose_load` does.
     #[allow(clippy::too_many_arguments)]
     fn rmw_step(
         &self,
         ri: usize,
         ci: usize,
-        maximal: Slots,
-        readable: Slots,
-        acc: RmwAcc,
-        multi: bool,
-        failure: Ordering,
-        resolved: &mut Resolved,
+        (writable, readable): (Slots, Slots),
+        threads: &thread::Set,
+        (success, failure): (Ordering, Ordering),
+        acc: &RmwAcc,
+        entry: &LoadView,
         view: &LoadView,
     ) -> Option<(RmwAcc, LoadView)> {
         let region = &self.regions[ri];
-        let mut next = RmwAcc {
-            value: acc.value | (region.stores[ci].value & region.mask),
-            maximal: maximal & bit(ci) != 0,
-            readable: readable & bit(ci) != 0,
+        let arm = |snapshot: &Option<Snapshot>, allowed: Slots, at: &LoadView, ordering| {
+            let mut next = snapshot.as_ref().filter(|_| allowed & bit(ci) != 0)?.clone();
+            let preds = region.read_preds(threads, &at.causality, ordering) & !bit(ci);
+            next.take(ri, region, ci, preds, None).then_some(next)
         };
 
-        if next.readable && multi && !region.try_resolve(ci, resolved) {
-            next.readable = false;
-        }
-        if !next.maximal && !next.readable {
+        let next = RmwAcc {
+            value: acc.value | (region.stores[ci].value & region.mask),
+            success: arm(&acc.success, writable, entry, success),
+            failure: arm(&acc.failure, readable, view, failure),
+        };
+        if next.success.is_none() && next.failure.is_none() {
             return None;
         }
 
-        let next_view = if next.readable {
+        let next_view = if next.failure.is_some() {
             view.extend(region, ri, ci, failure)
         } else {
             view.clone()
@@ -3302,41 +3555,28 @@ impl State {
         rest: &[usize],
         threads: &thread::Set,
         cmp: Compare,
-        failure: Ordering,
+        orders: (Ordering, Ordering),
         spur: bool,
-        acc: RmwAcc,
-        resolved: &mut Resolved,
+        acc: &RmwAcc,
+        entry: &LoadView,
         view: &LoadView,
     ) -> bool {
         let Some((&rj, tail)) = rest.split_first() else {
             let passes = cmp.succeeds(acc.value);
             return if spur {
-                acc.readable && passes
+                acc.failure.is_some() && passes
             } else {
-                (acc.maximal && passes) || (acc.readable && !passes)
+                (acc.success.is_some() && passes) || (acc.failure.is_some() && !passes)
             };
         };
 
-        let (maximal, readable) = self.rmw_candidates(rj, threads, failure, acc, view);
-        for ci in slots(maximal | readable) {
-            let mark = resolved.len();
-            let legal = self
-                .rmw_step(
-                    rj, ci, maximal, readable, acc, true, failure, resolved, view,
-                )
+        let (writable, readable) = self.rmw_candidates(rj, threads, orders, acc, entry, view);
+        slots(writable | readable).any(|ci| {
+            self.rmw_step(rj, ci, (writable, readable), threads, orders, acc, entry, view)
                 .is_some_and(|(next, next_view)| {
-                    self.rmw_completes(
-                        tail, threads, cmp, failure, spur, next, resolved, &next_view,
-                    )
-                });
-            resolved.truncate(mark);
-
-            if legal {
-                return true;
-            }
-        }
-
-        false
+                    self.rmw_completes(tail, threads, cmp, orders, spur, &next, entry, &next_view)
+                })
+        })
     }
 
     /// Compose the value an atomic load returns across the regions the mask
@@ -3345,12 +3585,11 @@ impl State {
     /// `branch(Action::Load(mask))`. Shared by `load_masked` (`apply_floor =
     /// false`) and `load_coherent_lane` (`apply_floor = true`).
     ///
-    /// A multi-region load must return a single consistent snapshot: wide
-    /// (multi-region) ops are seen all-or-none so a load never tears one.
-    /// `resolved` carries the wide-op visibility fixed by the regions already
-    /// read; each region's readable set is filtered to agree with it. Two
-    /// *separate* masked ops to different lanes share no `op_id`, so this never
-    /// couples independent lanes — they stay free to be read in either order.
+    /// A multi-region load returns a single consistent snapshot: whole-cell
+    /// ops are seen all-or-none (`Snapshot`), and each region's readable set
+    /// is filtered to the stores some completion of the rest agrees with.
+    /// Two *separate* masked ops to different lanes share no `op_id`, so this
+    /// never couples independent lanes.
     ///
     /// With `apply_floor`, each region's readable set is additionally narrowed
     /// by `filter_seen_op_floors` to the whole-cell-coherent projection the
@@ -3364,12 +3603,31 @@ impl State {
         apply_floor: bool,
     ) -> u128 {
         let multi = covered.len() > 1;
-        let mut resolved = Resolved::new();
+        let mut snapshot = if multi {
+            Snapshot::spanning(&self.regions, covered)
+        } else {
+            Snapshot::default()
+        };
+        let me = Some(threads.active_id().as_usize());
+        // One place in S for the whole read, however many regions it spans.
+        let sc_pos = is_seq_cst(ordering).then(|| threads.next_sc_pos());
         let mut result = 0u128;
         // The `(region, slot)` pairs this load has read so far.
         let mut read: SmallVec<[(usize, usize); 4]> = SmallVec::new();
 
         for (k, &ri) in covered.iter().enumerate() {
+            // The regions before this one have already been read, so the live
+            // state *is* the projection for this step: their causality joins
+            // and `first_seen` touches are already recorded. A touch does not
+            // say it came from this load, so `touched` still names what the
+            // load read, exactly as the lookahead does.
+            let view = LoadView::entry(threads, ordering, &read);
+            let preds = if multi {
+                self.regions[ri].read_preds(threads, &view.causality, ordering)
+            } else {
+                0
+            };
+
             // If necessary, generate the list of stores to permute through for
             // this region.
             //
@@ -3377,13 +3635,6 @@ impl State {
             // a `SeqCst` fence is bounded by the fence's position. The readable
             // set is restricted inside `match_load_to_stores`.
             if path.is_traversed() {
-                // The regions before this one have already been read, so the
-                // live state *is* the projection for this step: their causality
-                // joins and `first_seen` touches are already recorded. A touch
-                // does not say it came from this load, so `touched` still
-                // names what the load read, exactly as the lookahead does.
-                let view = LoadView::entry(threads, ordering, &read);
-
                 let mut seed = [0; MAX_ATOMIC_HISTORY];
                 let mut n = self.regions[ri].match_load_to_stores(
                     threads,
@@ -3400,30 +3651,18 @@ impl State {
                 }
 
                 if multi {
-                    // Keep only candidates consistent with the wide-op
-                    // visibility earlier regions committed to *and* completable
-                    // by the regions still to come. The forward half is what
-                    // makes the walk total: regions resolve in `covered` order,
-                    // but a later region's readable set can be pinned by plain
-                    // coherence to a store that sees wide op X, which forces
-                    // *every* region of this one single-copy-atomic load to see
-                    // X. Filtering on `resolved` alone lets an earlier region
-                    // commit to not-seeing-X, and the pinned region then has
-                    // nothing left — a dead end the walk cannot back out of,
-                    // reported as an internal bug. Offering only completable
-                    // prefixes prunes exactly those; every whole-cell snapshot
-                    // that some assignment realizes stays reachable.
+                    // Keep only candidates consistent with what earlier
+                    // regions fixed *and* completable by the regions still to
+                    // come: a later region can be pinned by plain coherence to
+                    // a store that decides a whole-cell op, and an earlier
+                    // choice that contradicts it would leave the walk nothing.
                     let rest = &covered[k + 1..];
                     let mut w = 0;
                     for r in 0..n {
                         let ci = seed[r] as usize;
 
-                        // The prefix is a stack: extend it for this candidate,
-                        // test, wind back. Nothing is committed here — the walk
-                        // extends `resolved` for real only once `branch_load`
-                        // has chosen.
-                        let mark = resolved.len();
-                        if !self.regions[ri].try_resolve(ci, &mut resolved) {
+                        let mut next = snapshot.clone();
+                        if !next.take(ri, &self.regions[ri], ci, preds & !bit(ci), me) {
                             continue;
                         }
                         let complete = rest.is_empty() || {
@@ -3433,17 +3672,15 @@ impl State {
                                 threads,
                                 ordering,
                                 apply_floor,
-                                &mut resolved,
+                                &next,
                                 &next_view,
                             )
                         };
-                        resolved.truncate(mark);
 
-                        if !complete {
-                            continue;
+                        if complete {
+                            seed[w] = seed[r];
+                            w += 1;
                         }
-                        seed[w] = seed[r];
-                        w += 1;
                     }
                     // Now a genuine claim about the cell, not about walk order:
                     // no assignment of stores to `covered` forms a consistent
@@ -3464,12 +3701,13 @@ impl State {
                 // replayed path replays a seed that same filter recorded — so
                 // it agrees with the prefix by construction.
                 assert!(
-                    self.regions[ri].try_resolve(index, &mut resolved),
+                    snapshot.take(ri, &self.regions[ri], index, preds & !bit(index), me),
                     "[loom internal bug] wide load committed to an inconsistent store"
                 );
             }
             let mask_ri = self.regions[ri].mask;
             let v = self.regions[ri].load(threads, index, ordering);
+            self.regions[ri].rank_sc_read(index, sc_pos);
             result |= v & mask_ri;
             if multi {
                 read.push((ri, index));
@@ -3477,14 +3715,14 @@ impl State {
         }
 
         if multi {
-            self.firm(&read);
+            self.settle(path, snapshot);
         }
 
         result
     }
 
     /// Can `rest` — the regions of a multi-region load not yet resolved — be
-    /// assigned stores consistent with `resolved`? Depth-first over the
+    /// assigned stores consistent with `snapshot`? Depth-first over the
     /// regions in order, so a prefix is rejected only when *no* completion
     /// exists. Exact rather than per-region approximate: a conflict can span
     /// two later regions, and both sets are bounded (regions per cell, and
@@ -3499,7 +3737,7 @@ impl State {
         threads: &thread::Set,
         ordering: Ordering,
         apply_floor: bool,
-        resolved: &mut Resolved,
+        snapshot: &Snapshot,
         view: &LoadView,
     ) -> bool {
         let Some((&rj, tail)) = rest.split_first() else {
@@ -3517,34 +3755,25 @@ impl State {
             n = self.filter_seen_op_floors(rj, view, &mut seed[..], n);
         }
 
-        for r in 0..n {
-            let ci = seed[r] as usize;
+        let preds = self.regions[rj].read_preds(threads, &view.causality, ordering);
+        let me = Some(threads.active_id().as_usize());
 
-            let mark = resolved.len();
-            if !self.regions[rj].try_resolve(ci, resolved) {
-                continue;
-            }
-            if tail.is_empty() {
-                resolved.truncate(mark);
-                return true;
-            }
-            let next_view = view.extend(&self.regions[rj], rj, ci, ordering);
-            let complete = self.has_consistent_completion(
-                tail,
-                threads,
-                ordering,
-                apply_floor,
-                resolved,
-                &next_view,
-            );
-            resolved.truncate(mark);
-
-            if complete {
-                return true;
-            }
-        }
-
-        false
+        seed[..n].iter().any(|&ci| {
+            let ci = ci as usize;
+            let mut next = snapshot.clone();
+            next.take(rj, &self.regions[rj], ci, preds & !bit(ci), me)
+                && (tail.is_empty() || {
+                    let next_view = view.extend(&self.regions[rj], rj, ci, ordering);
+                    self.has_consistent_completion(
+                        tail,
+                        threads,
+                        ordering,
+                        apply_floor,
+                        &next,
+                        &next_view,
+                    )
+                })
+        })
     }
 
     /// Whole-cell coherence for a typed lane load (module docs, "Typed lane
@@ -3978,7 +4207,7 @@ impl Region {
             cnt: 0,
             last_access: Default::default(),
             last_non_load_access: Default::default(),
-            preserved: Default::default(),
+            preserved: Vec::new(),
             preserved_cnt: 0,
             unrouted_readers: 0,
             readers: 0,
@@ -3994,6 +4223,7 @@ impl Region {
         self.cnt = 0;
         *self.last_access = Default::default();
         *self.last_non_load_access = Default::default();
+        self.preserved.clear();
         self.preserved_cnt = 0;
         self.unrouted_readers = 0;
         self.readers = 0;
@@ -4025,7 +4255,7 @@ impl Region {
                 region
                     .last_non_load_access
                     .clone_from(&self.last_non_load_access);
-                region.preserved = self.preserved;
+                region.preserved.clone_from(&self.preserved);
                 region.preserved_cnt = self.preserved_cnt;
                 region.unrouted_readers = self.unrouted_readers;
                 region.readers = self.readers;
@@ -4039,7 +4269,7 @@ impl Region {
                 cnt: self.cnt,
                 last_access: self.last_access.clone(),
                 last_non_load_access: self.last_non_load_access.clone(),
-                preserved: self.preserved,
+                preserved: self.preserved.clone(),
                 preserved_cnt: self.preserved_cnt,
                 unrouted_readers: self.unrouted_readers,
                 readers: self.readers,
@@ -4109,6 +4339,19 @@ impl Region {
         self.order_all(preds, index);
     }
 
+    /// Rank the store an SC read at S position `pos` returned, if it is not
+    /// ranked earlier. Every later SC operation, and every operation in the
+    /// scope of a later SC fence, is then barred from being coherence-ordered
+    /// before it, as before any SC-ranked store: an op coherence-ordered
+    /// before the store is coherence-ordered before the read, which precedes
+    /// it in S (C++20 [atomics.order] p4.1, p4.3).
+    fn rank_sc_read(&mut self, index: usize, pos: Option<u32>) {
+        if let Some(pos) = pos {
+            let rank = &mut self.stores[index].sc_rank;
+            *rank = Some(rank.map_or(pos, |r| r.min(pos)));
+        }
+    }
+
     /// The read half of a successful RMW: fix its order like any read and mark
     /// the store seen. `rmw_commit` follows.
     fn rmw_observe(&mut self, threads: &thread::Set, index: usize, ordering: Ordering) {
@@ -4164,44 +4407,20 @@ impl Region {
         }
     }
 
-    /// How the read of slot `c` places an op pinned at slot `d` — its own
-    /// store there, or with `preserved` the store it read and carried — as far
-    /// as the order known so far decides it.
-    fn sight(&self, d: usize, preserved: bool, c: usize) -> Sight {
-        let (ds, cs) = (&self.stores[d], &self.stores[c]);
-
-        if d == c {
-            // The store a preserving op read is also what a reader before the
-            // op sees: its identity write carried the same bits.
-            if preserved {
-                Sight::Either
-            } else {
-                Sight::Seen
-            }
-        } else if mo_before(ds, cs) {
-            Sight::Seen
-        } else if mo_before(cs, ds) {
-            Sight::Unseen
-        } else {
-            Sight::Open
-        }
-    }
-
     /// The live slot holding the store with `id`, if the history still has it.
     fn slot_of_store(&self, id: u16) -> Option<usize> {
         self.stores.iter().position(|s| s.id == id)
     }
 
-    /// Number of `preserved` slots holding a real record — a ring of the
-    /// newest `PRESERVED_HISTORY` preserving ops over these bits.
+    /// Number of live preserving-op records over these bits.
     fn live_preserved(&self) -> usize {
-        cmp::min(self.preserved_cnt as usize, PRESERVED_HISTORY)
+        self.preserved.len()
     }
 
-    /// The live preserving-op records over these bits, in slot order: every
-    /// consumer asks each record an independent question.
+    /// The live preserving-op records over these bits: every consumer asks
+    /// each record an independent question.
     fn preserved_ops(&self) -> impl Iterator<Item = &PreservedOp> {
-        self.preserved[..self.live_preserved()].iter()
+        self.preserved.iter()
     }
 
     /// Record a wide op that compared these bits and wrote them back verbatim.
@@ -4229,69 +4448,22 @@ impl Region {
             read_id: self.stores[index].id,
         };
 
-        self.preserved[self.preserved_cnt as usize % PRESERVED_HISTORY] = PreservedOp {
+        if self.preserved.len() == MAX_ATOMIC_HISTORY {
+            core::hint::cold_path();
+            panic!(
+                "a lane holds {} preserving-op records that can still bind a read, the \
+                 most the model tracks. Have the lagging threads observe the cell before \
+                 the preserving operations go further, or use `rmw_masked` for some.",
+                MAX_ATOMIC_HISTORY
+            );
+        }
+        self.preserved.push(PreservedOp {
             op_id,
             read,
             write_mask,
             creator: threads.active_id().as_usize(),
-        };
-        self.preserved_cnt += 1;
-    }
-
-    /// Check candidate `c_index` against the wide-op visibility `resolved`
-    /// already fixes and, if they agree, extend `resolved` with the visibility
-    /// this region's read newly implies.
-    ///
-    /// The rule is single-copy atomicity: a wide op is seen all-or-none, so
-    /// every region of one load must agree on whether it sees op X. Reading
-    /// store `c` sees op X here iff `c` *is* X's store in this region or is
-    /// modification-order after it. Ops only this region holds are
-    /// unconstrained and simply join `resolved` for the regions still to come.
-    ///
-    /// A **preserving** op binds this region through the store it read, `s`:
-    /// its elided identity write sat immediately after `s` with `s`'s bits.
-    /// Reading a store strictly mo-after `s` sees the op; reading one
-    /// mo-before `s` or unordered with it does not; reading `s` itself is
-    /// either, because `s` and the identity write hold the same bits. So a
-    /// snapshot that sees the op elsewhere may not read this lane from before
-    /// `s` — the op compared those bits against `s`, and an older value here
-    /// beside its write elsewhere is a torn read of one atomic step.
-    ///
-    /// On disagreement `resolved` is restored to its entry length, so a
-    /// rejected candidate leaves nothing behind and the caller may try the next
-    /// one against the same prefix.
-    fn try_resolve(&self, c_index: usize, resolved: &mut Resolved) -> bool {
-        let mark = resolved.len();
-        let c = &self.stores[c_index];
-
-        let stores = self
-            .stores
-            .iter()
-            .map(|d| (d.op_id, Some(c.id == d.id || mo_before(d, c))));
-        let preserved = self.preserved_ops().filter_map(|p| {
-            let s = self.slot_of_store(p.read.read_id)?;
-            let seen = (s != c_index).then(|| mo_before(&self.stores[s], c));
-            Some((p.op_id, seen))
         });
-
-        for (op_id, seen) in stores.chain(preserved) {
-            // Copied out, so the search's borrow ends before the push.
-            let fixed = resolved
-                .iter()
-                .find(|(o, _)| *o == op_id)
-                .map(|&(_, s)| s);
-
-            match (fixed, seen) {
-                (Some(s), Some(seen)) if s != seen => {
-                    resolved.truncate(mark);
-                    return false;
-                }
-                (None, Some(seen)) => resolved.push((op_id, seen)),
-                _ => {}
-            }
-        }
-
-        true
+        self.preserved_cnt += 1;
     }
 
     /// Plant the genesis store of a `const`-constructed cell: an
@@ -4348,8 +4520,8 @@ impl Region {
     /// happening before it (C++20 [atomics.order] p4.3). That last edge is
     /// per-location and never enters causality.
     ///
-    /// `rmw_read` is the slot an RMW's write read; `order` keeps the pair
-    /// adjacent from here on.
+    /// `rmw_read` is the slot an RMW's write read; the write goes right after
+    /// it, and `order` keeps the pair adjacent from here on.
     #[allow(clippy::too_many_arguments)]
     fn append(
         &mut self,
@@ -4400,6 +4572,14 @@ impl Region {
         self.cnt += 1;
 
         self.order_all(preds, slot);
+
+        // An RMW's write goes immediately after the store it read, so ahead of
+        // everything already after that store (`Region::rmw_writable`).
+        if let Some(r) = rmw_read {
+            for x in slots(self.stores[r].after & !bit(slot)) {
+                self.order(slot, x);
+            }
+        }
     }
 
     /// The write half of a successful RMW: synchronize with the read store and
@@ -4475,20 +4655,12 @@ impl Region {
         slot
     }
 
-    /// Record `a` modification-order-before `b` and restore the two invariants
-    /// every `after` set keeps: transitive closure, and RMW atomicity — an RMW
-    /// write is *immediately* mo-after the store it read (C++20
-    /// [atomics.order] p10). Nothing may sit between the pair, so an edge out
-    /// of the read store to anything but its write is an edge out of the
-    /// write, and an edge into the write from anything but its read store is
-    /// an edge into the read store. Rewriting the direct edge that way keeps
-    /// every edge the closure derives from it atomic too.
-    ///
-    /// A cycle means the search chose a read no execution can make, which is a
-    /// model bug, not a property of the program under test.
+    /// Record `a` modification-order-before `b` (`MoGraph::order`). A cycle
+    /// means the search chose a read no execution can make, which is a model
+    /// bug, not a property of the program under test.
     fn order(&mut self, a: usize, b: usize) {
-        let (a, b) = self.atomic_edge(a, b);
-        self.close(bit(a), b);
+        let ok = self.stores.as_mut_slice().order(a, b);
+        assert!(ok, "{MO_CYCLE}");
     }
 
     /// [`Self::order`] for every slot of `preds` before `b`, closing once when
@@ -4499,49 +4671,110 @@ impl Region {
             return;
         }
 
-        if (preds | bit(b)) & self.paired == 0 {
-            self.close(preds, b);
-            return;
-        }
-
-        for a in slots(preds) {
-            self.order(a, b);
-        }
+        let ok = if (preds | bit(b)) & self.paired == 0 {
+            self.stores.as_mut_slice().close(preds, b)
+        } else {
+            slots(preds).all(|a| self.stores.as_mut_slice().order(a, b))
+        };
+        assert!(ok, "{MO_CYCLE}");
     }
 
-    /// The edge `a` -> `b` becomes once no RMW pair may be split by it.
-    fn atomic_edge(&self, mut a: usize, mut b: usize) -> (usize, usize) {
-        for _ in 0..=2 * self.stores.len() {
-            match (self.stores[a].rmw_write, self.stores[b].rmw_read) {
-                (Some(w), _) if w as usize != b => a = w as usize,
-                (_, Some(r)) if r as usize != a => b = r as usize,
-                _ => return (a, b),
+    /// The stores a successful RMW with ordering `success` may read, reading
+    /// with causality `view`: each one its write can go immediately after.
+    ///
+    /// Modification order need not put the read store last — C++ asks only
+    /// that nothing come between it and the write. So besides the maximal
+    /// stores, any store a load could return qualifies whose known successors
+    /// can all follow the write: no RMW write already sits right after it,
+    /// and adding the write there — after everything the RMW must follow,
+    /// before every successor of the store it read — closes no cycle
+    /// (`Region::rmw_edges`, run on a scratch copy of the order).
+    fn rmw_writable(&self, threads: &thread::Set, view: &VersionVec, success: Ordering) -> Slots {
+        let maximal = self.maximal_mask();
+        let inner = self.readable_mask(threads, view, success) & !maximal;
+        if inner == 0 {
+            return maximal;
+        }
+
+        let preds = self.write_preds(threads, view, success);
+        let mut writable = maximal;
+        for s in slots(inner) {
+            if self.stores[s].rmw_write.is_some() {
+                continue;
+            }
+
+            let mut scratch: SmallVec<[MoNode; 16]> =
+                self.stores.iter().map(MoNode::of).collect();
+            let w = scratch.len();
+            scratch.push(MoNode {
+                after: 0,
+                before: 0,
+                rmw_read: Some(s as u8),
+                rmw_write: None,
+            });
+            scratch[s].rmw_write = Some(w as u8);
+
+            if Region::rmw_edges(scratch.as_mut_slice(), preds | bit(s), s, w) {
+                writable |= bit(s);
             }
         }
-        panic!("[loom internal bug] modification-order cycle through an RMW pair");
+        writable
     }
 
-    /// Put `sources`, and everything mo-before them, mo-before `t` and
-    /// everything mo-after it.
-    fn close(&mut self, sources: Slots, t: usize) {
-        let mut below = sources;
-        for i in slots(sources) {
-            below |= self.stores[i].before;
-        }
-        let above = bit(t) | self.stores[t].after;
+    /// Place an RMW's write `w`, which read `s`: after `preds`, and before
+    /// everything already after `s`. False on a cycle.
+    fn rmw_edges(graph: &mut (impl MoGraph + ?Sized), preds: Slots, s: usize, w: usize) -> bool {
+        let succ = graph.after(s) & !bit(w);
+        slots(preds & !bit(w)).all(|a| graph.order(a, w))
+            && slots(succ).all(|x| graph.order(w, x))
+    }
 
-        assert!(
-            below & above == 0,
-            "[loom internal bug] modification-order cycle: the model chose a read \
-             no execution can make"
-        );
+    /// What a store appended now by the active thread must follow: each store
+    /// it has seen through its coherence view, the genesis, and every
+    /// SC-ranked store within its SC scope.
+    fn write_preds(&self, threads: &thread::Set, view: &VersionVec, ordering: Ordering) -> Slots {
+        self.seen_mask(view) | self.genesis_mask() | self.sc_mask(sc_scope(threads, ordering))
+    }
 
-        for i in slots(below) {
-            self.stores[i].after |= above;
+    /// What a read with causality `view` puts before the store it returns:
+    /// each store it has seen, and every SC-ranked store within its scope
+    /// (`Region::observe`).
+    fn read_preds(&self, threads: &thread::Set, view: &VersionVec, ordering: Ordering) -> Slots {
+        self.seen_mask(view) | self.sc_mask(sc_scope(threads, ordering))
+    }
+
+    /// The stores `creator` made.
+    fn created_by(&self, creator: usize) -> Slots {
+        let mut own = 0;
+        for (i, s) in self.stores.iter().enumerate() {
+            if s.creator == creator {
+                own |= bit(i);
+            }
         }
-        for i in slots(above) {
-            self.stores[i].before |= below;
+        own
+    }
+
+    /// `a` is `b` or modification-order-before it.
+    fn at_or_before(&self, a: usize, b: usize) -> bool {
+        a == b || self.stores[a].after & bit(b) != 0
+    }
+
+    /// Where an edge out of `d` towards `c` lands once RMW atomicity moves it:
+    /// the end of the RMW chain `d` starts, short of `c`.
+    fn chain_end(&self, mut d: usize, c: usize) -> usize {
+        while let Some(w) = self.stores[d].rmw_write.map(usize::from).filter(|&w| w != c) {
+            d = w;
         }
+        d
+    }
+
+    /// Where an edge from `c` into `d` lands once RMW atomicity moves it: the
+    /// start of the RMW chain `d` ends, short of `c`.
+    fn chain_start(&self, mut d: usize, c: usize) -> usize {
+        while let Some(r) = self.stores[d].rmw_read.map(usize::from).filter(|&r| r != c) {
+            d = r;
+        }
+        d
     }
 
     /// Every live slot.

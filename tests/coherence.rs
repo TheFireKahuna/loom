@@ -8,7 +8,7 @@
 #![deny(warnings, rust_2018_idioms)]
 
 use loom::cell::UnsafeCell;
-use loom::sync::atomic::{fence, AtomicU128, AtomicUsize};
+use loom::sync::atomic::{fence, AtomicU128, AtomicU64, AtomicUsize};
 use loom::thread;
 
 use std::collections::HashSet;
@@ -452,4 +452,217 @@ fn unsync_load_reads_the_mo_last_store() {
         "unsync_load disagreed: {out:?}"
     );
     assert!(out.contains(&(1, 1)) && out.contains(&(2, 2)));
+}
+
+/// A successful RMW may read a store that is not modification-order-last and
+/// go in immediately after it, ahead of the stores that follow. `T2`'s
+/// fetch_add, run after it saw `T1`'s relaxed flag, may still read the 0
+/// that `T1`'s store of 1 then overwrites: order 0, 10, 1.
+#[test]
+fn rmw_may_read_a_store_that_is_not_last() {
+    let out = outcomes(|| {
+        let x = Arc::new(AtomicUsize::new(0));
+        let flag = Arc::new(AtomicUsize::new(0));
+        let t1 = {
+            let (x, flag) = (x.clone(), flag.clone());
+            thread::spawn(move || {
+                x.store(1, Relaxed);
+                flag.store(1, Relaxed);
+            })
+        };
+        let r = (flag.load(Relaxed) == 1).then(|| x.fetch_add(10, Relaxed));
+        t1.join().unwrap();
+        (r, x.load(Relaxed))
+    });
+
+    assert!(
+        out.contains(&(Some(0), 1)),
+        "the RMW never went in ahead of the store of 1: {out:?}"
+    );
+    assert!(out.contains(&(Some(1), 11)));
+    assert!(!out.contains(&(Some(0), 10)), "the store of 1 was lost: {out:?}");
+}
+
+/// A masked store unordered with a wide store may land after it: once both
+/// happen before a full load, the load may see the lane store over the wide
+/// one.
+#[test]
+fn lane_store_may_land_after_a_wide_store() {
+    const LO: u64 = u32::MAX as u64;
+
+    let out = outcomes(|| {
+        let x = Arc::new(AtomicU64::new(0));
+        let t1 = {
+            let x = x.clone();
+            thread::spawn(move || x.store(0x1_0000_0001, Relaxed))
+        };
+        let t2 = {
+            let x = x.clone();
+            thread::spawn(move || x.store_masked(LO, 2, Relaxed))
+        };
+        t1.join().unwrap();
+        t2.join().unwrap();
+        x.load(Relaxed)
+    });
+
+    assert!(out.contains(&0x1_0000_0001));
+    assert!(
+        out.contains(&0x1_0000_0002),
+        "the lane store never landed after the wide store: {out:?}"
+    );
+}
+
+/// A wide load may forward its own lane store and read the other lane from
+/// before a peer's wide store the forwarded store follows (AArch64,
+/// herd7 `RR-wide-fwd`): final `0x2_0000_0001` with the load reading high 2,
+/// low 0.
+#[test]
+fn wide_load_may_forward_its_own_lane_store() {
+    const HI: u64 = !(u32::MAX as u64);
+
+    let out = outcomes(|| {
+        let x = Arc::new(AtomicU64::new(0));
+        let t = {
+            let x = x.clone();
+            thread::spawn(move || x.store(0x1_0000_0001, Relaxed))
+        };
+        x.store_masked(HI, 2 << 32, Relaxed);
+        let v = x.load(Relaxed);
+        t.join().unwrap();
+        (x.load(Relaxed), v)
+    });
+
+    assert!(
+        out.contains(&(0x2_0000_0001, 0x2_0000_0000)),
+        "the forwarding read was never explored: {out:?}"
+    );
+}
+
+/// A preserving op's record keeps binding the carried lane however many
+/// preserving ops follow it: after nine CASes carrying the high lane, a full
+/// load showing the first CAS's low lane still cannot show the high lane
+/// older than the store the CAS compared.
+#[test]
+fn preserving_records_outlive_later_preserving_ops() {
+    const HI: u128 = !0u128 << 64;
+
+    let out = Arc::new(Mutex::new(HashSet::new()));
+    let sink = out.clone();
+
+    let mut builder = loom::model::Builder::new();
+    builder.preemption_bound = Some(2);
+    builder.check(move || {
+        let x = Arc::new(AtomicU128::new(0));
+        let t1 = {
+            let x = x.clone();
+            thread::spawn(move || x.store_masked(HI, 1 << 64, Relaxed))
+        };
+        let t2 = {
+            let x = x.clone();
+            thread::spawn(move || {
+                let mut ok = 0;
+                for i in 0..9u128 {
+                    let cur = (1 << 64) | i;
+                    if x
+                        .compare_exchange_preserving(HI, cur, cur + 1, Relaxed, Relaxed)
+                        .is_ok()
+                    {
+                        ok += 1;
+                    }
+                }
+                ok
+            })
+        };
+        let t3 = {
+            let x = x.clone();
+            thread::spawn(move || x.load(Relaxed))
+        };
+        t1.join().unwrap();
+        let ok = t2.join().unwrap();
+        let v = t3.join().unwrap();
+        sink.lock().unwrap().insert((ok, v as u64, (v >> 64) as u64));
+    });
+
+    let out = out.lock().unwrap();
+    assert!(
+        !out.iter().any(|&(_, lo, hi)| lo > 0 && hi == 0),
+        "torn snapshot of a preserving CAS: {out:?}"
+    );
+    assert!(out.iter().any(|&(ok, lo, hi)| ok == 9 && lo == 1 && hi == 1));
+}
+
+/// An SC RMW goes into S after every SC operation that already ran, so it may
+/// not slot in ahead of a store an earlier SC load read: that load would be
+/// coherence-ordered after it yet before it in S. `T2`'s SC load reads 1 and
+/// precedes `T3`'s SC fetch_add in S (store buffering through y reading 0),
+/// so the fetch_add may not read the 0 that 1 overwrites.
+#[test]
+fn sc_rmw_may_not_slot_in_before_an_sc_read() {
+    let out = outcomes(|| {
+        let x = Arc::new(AtomicUsize::new(0));
+        let y = Arc::new(AtomicUsize::new(0));
+        let t1 = {
+            let x = x.clone();
+            thread::spawn(move || x.store(1, Relaxed))
+        };
+        let t2 = {
+            let (x, y) = (x.clone(), y.clone());
+            thread::spawn(move || (x.load(SeqCst), y.load(SeqCst)))
+        };
+        let t3 = {
+            let (x, y) = (x.clone(), y.clone());
+            thread::spawn(move || {
+                y.store(1, SeqCst);
+                x.fetch_add(10, SeqCst)
+            })
+        };
+        t1.join().unwrap();
+        let (r1, r2) = t2.join().unwrap();
+        let r3 = t3.join().unwrap();
+        (r1, r2, r3, x.load(Relaxed))
+    });
+
+    assert!(
+        !out.contains(&(1, 0, 0, 1)),
+        "the SC RMW went in ahead of a store an earlier SC load read: {out:?}"
+    );
+}
+
+/// An SC store goes after every store an earlier SC load read. `T2`'s SC load
+/// of 1 precedes `T3`'s SC store of 2 in S (store buffering through y), so 2
+/// cannot be modification-order-before 1: `T4` may not read 2 then 1.
+#[test]
+fn sc_store_follows_what_earlier_sc_loads_read() {
+    let out = outcomes(|| {
+        let x = Arc::new(AtomicUsize::new(0));
+        let y = Arc::new(AtomicUsize::new(0));
+        let t1 = {
+            let x = x.clone();
+            thread::spawn(move || x.store(1, Relaxed))
+        };
+        let t2 = {
+            let (x, y) = (x.clone(), y.clone());
+            thread::spawn(move || (x.load(SeqCst), y.load(SeqCst)))
+        };
+        let t3 = {
+            let (x, y) = (x.clone(), y.clone());
+            thread::spawn(move || {
+                y.store(1, SeqCst);
+                x.store(2, SeqCst);
+            })
+        };
+        let t4 = {
+            let x = x.clone();
+            thread::spawn(move || (x.load(Relaxed), x.load(Relaxed)))
+        };
+        t1.join().unwrap();
+        let (r1, r2) = t2.join().unwrap();
+        t3.join().unwrap();
+        (r1, r2, t4.join().unwrap())
+    });
+
+    assert!(
+        !out.contains(&(1, 0, (2, 1))),
+        "an SC store landed before a store an earlier SC load read: {out:?}"
+    );
 }
