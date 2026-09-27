@@ -117,6 +117,27 @@ impl<T> UnsafeCell<T> {
     pub fn into_inner(self) -> T {
         self.data.into_inner()
     }
+
+    /// Replaces the value of this cell, returning the old value. One tracked
+    /// write access.
+    ///
+    /// # Safety
+    ///
+    /// No reference to the contents may be live, as for `core`'s. Accesses
+    /// through loom's own guards ([`with`](Self::with), [`get`](Self::get),
+    /// ...) are checked; references derived from them and kept past the
+    /// guard are not.
+    ///
+    /// # Panics
+    ///
+    /// This function will panic if the access is not valid under the Rust memory
+    /// model.
+    #[track_caller]
+    pub unsafe fn replace(&self, value: T) -> T {
+        // SAFETY: the caller guarantees no reference to the contents is live,
+        // and the tracked write checks every guarded access.
+        self.with_mut(|ptr| unsafe { std::ptr::replace(ptr, value) })
+    }
 }
 
 impl<T: ?Sized> UnsafeCell<T> {

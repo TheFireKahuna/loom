@@ -10,11 +10,11 @@ mod notify;
 mod rwlock;
 
 pub use self::arc::Arc;
-pub use self::barrier::Barrier;
+pub use self::barrier::{Barrier, BarrierWaitResult};
 pub use self::condvar::{Condvar, WaitTimeoutResult};
 pub use self::mutex::{Mutex, MutexGuard};
 pub use self::notify::Notify;
 pub use self::rwlock::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 #[doc(no_inline)]
-pub use std::sync::{LockResult, TryLockResult};
+pub use std::sync::{LockResult, PoisonError, TryLockError, TryLockResult};

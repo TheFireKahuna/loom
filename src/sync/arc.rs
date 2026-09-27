@@ -54,6 +54,42 @@ impl<T> Arc<T> {
             Err(_) => unreachable!(),
         }
     }
+
+    /// Returns the inner value, if the `Arc` has exactly one strong reference,
+    /// and otherwise drops it.
+    ///
+    /// The decrement is the one `Drop` performs, so of any number of
+    /// concurrent calls on clones of one `Arc` exactly one returns the value,
+    /// and it acquires every other holder's release as `try_unwrap` does.
+    #[track_caller]
+    pub fn into_inner(this: Arc<T>) -> Option<T> {
+        let this = mem::ManuallyDrop::new(this);
+        let last = this.obj.ref_dec(location!());
+        if last {
+            this.unregister();
+        }
+
+        // SAFETY: `this` is never used again and its `Drop` does not run, so
+        // each field is moved out exactly once.
+        let (_obj, value) = unsafe { (ptr::read(&this.obj), ptr::read(&this.value)) };
+        if !last {
+            return None;
+        }
+        match std::sync::Arc::try_unwrap(value) {
+            Ok(value) => Some(value),
+            Err(_) => unreachable!("the model's last reference holds the only `std` one"),
+        }
+    }
+
+    /// If we have the only reference to `T` then unwrap it. Otherwise, clone
+    /// `T` and return the clone.
+    #[track_caller]
+    pub fn unwrap_or_clone(this: Arc<T>) -> T
+    where
+        T: Clone,
+    {
+        Arc::try_unwrap(this).unwrap_or_else(|arc| (*arc).clone())
+    }
 }
 
 impl<T: ?Sized> Arc<T> {
@@ -164,6 +200,14 @@ impl<T: ?Sized> Arc<T> {
         } else {
             None
         }
+    }
+
+    /// Determines whether this is the unique reference to the underlying data,
+    /// acquiring every other former holder's release when it is — the check
+    /// [`get_mut`](Self::get_mut) makes, without the borrow.
+    #[track_caller]
+    pub fn is_unique(this: &Self) -> bool {
+        this.obj.get_mut(location!())
     }
 
     /// Returns `true` if the two `Arc`s point to the same value (not

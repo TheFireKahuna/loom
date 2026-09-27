@@ -59,6 +59,17 @@ impl<T> Cell<T> {
         self.cell.with(|ptr| unsafe { *ptr })
     }
 
+    /// Updates the contained value using a function: a tracked read, then a
+    /// tracked write, as `core`'s `get` then `set`.
+    #[track_caller]
+    pub fn update(&self, f: impl FnOnce(T) -> T)
+    where
+        T: Copy,
+    {
+        let old = self.get();
+        self.set(f(old));
+    }
+
     /// Takes the value of the cell, leaving `Default::default()` in its place.
     #[track_caller]
     pub fn take(&self) -> T

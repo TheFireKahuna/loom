@@ -72,6 +72,56 @@ impl Condvar {
         Ok((guard, WaitTimeoutResult(timed_out)))
     }
 
+    /// Blocks the current thread until `condition` returns `false`, re-checking
+    /// it under the lock after every wakeup — spurious ones included, which
+    /// loom explores.
+    #[track_caller]
+    pub fn wait_while<'a, T, F>(
+        &self,
+        mut guard: MutexGuard<'a, T>,
+        mut condition: F,
+    ) -> LockResult<MutexGuard<'a, T>>
+    where
+        F: FnMut(&mut T) -> bool,
+    {
+        while condition(&mut *guard) {
+            guard = self.wait(guard)?;
+        }
+        Ok(guard)
+    }
+
+    /// Waits on this condition variable while `condition` returns `true`,
+    /// timing out after a specified duration.
+    ///
+    /// As `std`'s: `condition` is checked first and after every wakeup, and
+    /// the result reports a timeout only if the deadline passed with
+    /// `condition` still `true`. The deadline is the timeout
+    /// [`wait_timeout`](Self::wait_timeout) models: it passes when a wait's
+    /// timeout branch is taken, and a spurious wakeup leaves it pending.
+    #[track_caller]
+    pub fn wait_timeout_while<'a, T, F>(
+        &self,
+        mut guard: MutexGuard<'a, T>,
+        dur: Duration,
+        mut condition: F,
+    ) -> LockResult<(MutexGuard<'a, T>, WaitTimeoutResult)>
+    where
+        F: FnMut(&mut T) -> bool,
+    {
+        let mut deadline_passed = false;
+        loop {
+            if !condition(&mut *guard) {
+                return Ok((guard, WaitTimeoutResult(false)));
+            }
+            if deadline_passed {
+                return Ok((guard, WaitTimeoutResult(true)));
+            }
+            let (next, result) = self.wait_timeout(guard, dur)?;
+            guard = next;
+            deadline_passed = result.timed_out();
+        }
+    }
+
     /// Wakes up one blocked thread on this condvar.
     #[track_caller]
     pub fn notify_one(&self) {
