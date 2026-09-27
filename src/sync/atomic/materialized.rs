@@ -28,11 +28,11 @@
 //! `u8` and `u16` widths at all — an identity *word* needs bits the narrow
 //! widths do not have, and a minted id would accumulate without bound because a
 //! materialized cell re-registers every execution. Requiring the declaration is
-//! the price, and it buys a second thing: [`publish`] records the publishing
-//! thread's causality as the cells' genesis, so a reader that reaches a cell
-//! without synchronizing-with the publication is reported, exactly as
-//! [`AtomicU64::new`](crate::sync::atomic::AtomicU64::new) reports it for a
-//! constructed cell.
+//! the price, and it buys a second thing: [`publish`] records the commit as the
+//! cells' genesis, so a thread that reaches a cell without synchronizing-with
+//! any commit of its memory is reported, as
+//! [`AtomicU64::new`](crate::sync::atomic::AtomicU64::new) reports an
+//! unsynchronized access to a constructed cell.
 //!
 //! # Cost
 //!
@@ -46,26 +46,20 @@ use crate::rt;
 
 use std::sync::atomic::Ordering;
 
-/// Declare that the calling thread has published `len` bytes of zeroed memory
-/// at `ptr`.
+/// Model the `MEM_COMMIT` verb over `len` bytes at `ptr`: the calling thread
+/// has committed the range, and every byte of it reads zero until written.
 ///
-/// Cells materialized inside the range take this thread's causality as their
-/// genesis, so an access by a thread that has not synchronized-with the
-/// publication is reported as a causality violation — the check a constructed
-/// cell gets from [`AtomicU64::new`](crate::sync::atomic::AtomicU64::new), and
-/// the reason to call this rather than rely on the default.
+/// A materialized cell has no identity outside committed memory, so its first
+/// access panics unless a commit covers it. The commit is also the cells'
+/// genesis: an access must happen-after some commit of the cell's memory — the
+/// accessing thread's own, or one it synchronized with through the program's
+/// own release — or it is reported as a causality violation.
 ///
-/// Without a declaration, a materialized cell is modelled as having preceded
-/// the execution. That is accurate for a `static`, and a silent
-/// under-approximation for memory a thread handed out at runtime: no access to
-/// it can ever be reported as unsynchronized.
-///
-/// Declaring a range that is already live is a no-op for the overlapping part —
-/// that is what an idempotent commit looks like, and the cells already there
-/// keep their genesis — but it still orders the caller after whoever published
-/// it first, because mapping a range is serialized by the platform. To discard
-/// the contents of live memory, use [`reset`]. Declarations do not outlive an
-/// execution.
+/// A commit synchronizes with nothing. Committing a range that is already
+/// committed changes nothing in it — that is what an idempotent commit is — and
+/// lets the caller use the memory, without ordering it after whoever committed
+/// first. To discard the contents of live memory, use [`reset`]. Commits do not
+/// outlive an execution.
 ///
 /// This describes memory to the model; it neither reads nor writes it, and
 /// `ptr` need not be dereferenceable.
@@ -91,17 +85,21 @@ pub fn zero_exclusive(ptr: *mut u8, len: usize) {
     rt::zero_exclusive(ptr as usize, len, location!())
 }
 
-/// Model the `MEM_RESET` / `MADV_FREE` verb over `len` bytes at `ptr`: the
-/// content is discarded while the mapping stays.
+/// Model the `MEM_RESET` verb over `len` bytes at `ptr`: the contents are no
+/// longer of interest, but the mapping stays.
+///
+/// A reset promises no zeros. It marks the pages clean, and until a page is
+/// written again the kernel may discard it at any moment, after which it reads
+/// zero; a write dirties the page and cancels the discard. So each 4 KiB page
+/// reads its old contents until a discard that may never come, and zero from
+/// then on — even to the thread that reset it. The checker explores every such
+/// point per page, so code that assumes a reset page reads zero is reported by
+/// the execution where it does not.
 ///
 /// Use this, not [`zero_exclusive`], whenever a reader may legally still be
-/// walking the span. A reset is modelled as a release-ordered atomic store per
-/// cell, so a concurrent atomic load races it harmlessly and each cell is its
-/// own linearization point — a reader crossing the reset may see some cells
-/// discarded and others not, which is what the span really does.
-///
-/// The modelled outcome is the worst case: every cell in the range reads zero
-/// afterwards. Real `MEM_RESET` decides per page whether to discard.
+/// walking the span: a concurrent atomic access is admissible and sees old or
+/// zero. A concurrent non-atomic access is reported, as against a store. A
+/// discard synchronizes with nothing.
 #[track_caller]
 pub fn reset(ptr: *mut u8, len: usize) {
     rt::reset(ptr as usize, len, location!())
@@ -110,15 +108,18 @@ pub fn reset(ptr: *mut u8, len: usize) {
 /// Model the `MEM_DECOMMIT` verb over `len` bytes at `ptr`: the mapping itself
 /// goes, not merely its contents.
 ///
-/// The inverse of [`publish`]. Every cell in the range loses its registration
-/// and the range leaves the published set, so a **later access panics** —
-/// decommitted memory faults on real hardware, and a stale-but-plausible value
-/// here would pass exactly the executions the caller's unreachability argument
-/// exists to forbid.
+/// The inverse of [`publish`], and an assertion that no thread can still reach
+/// the range, checked from both sides. It is a non-atomic write to every cell
+/// in the range, so an earlier access by a thread the decommit does not
+/// happen-after is reported. And the cells lose their registrations and the
+/// range leaves the committed set, so a **later access panics** as a use after
+/// decommit — decommitted memory faults on real hardware, and a
+/// stale-but-plausible value here would pass exactly the executions the
+/// caller's unreachability argument exists to forbid.
 ///
 /// Use [`reset`] instead wherever a reader may legally still be in the span.
-/// This verb asserts there is none. A later [`publish`] re-registers the range's
-/// cells at zero, which is what re-committing decommitted pages hands back.
+/// A later [`publish`] re-registers the range's cells at zero, which is what
+/// re-committing decommitted pages hands back.
 ///
 /// This describes memory to the model; it neither reads nor writes it.
 #[track_caller]

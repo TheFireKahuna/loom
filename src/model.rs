@@ -231,6 +231,14 @@ pub struct Builder {
     /// Defaults to the presence of the `LOOM_STATS` environment variable,
     /// which also prints the stats line at the end of the run.
     pub stats: bool,
+
+    /// Report materialized memory still committed when an execution ends: a
+    /// `publish` with no matching `unpublish` never returns its commit charge.
+    ///
+    /// Off by default, because memory legitimately outliving one execution — a
+    /// region held by a `static` and committed afresh in each — is committed
+    /// at every execution's end by design.
+    pub check_committed_leaks: bool,
 }
 
 impl Builder {
@@ -310,6 +318,7 @@ impl Builder {
                 .map(|v| v != "0")
                 .unwrap_or(true),
             stats: env::var_os("LOOM_STATS").is_some(),
+            check_committed_leaks: false,
         }
     }
 
@@ -462,6 +471,7 @@ impl Builder {
         execution.log = self.log;
         execution.location = self.location;
         execution.reuse_objects = self.reuse_objects;
+        execution.check_committed_leaks = self.check_committed_leaks;
         execution.sleep_sets = self.sleep_sets && self.preemption_bound.is_none();
         execution
     }

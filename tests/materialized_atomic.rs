@@ -204,7 +204,7 @@ fn region_bytes(region: &[AtomicU64]) -> (*const u8, usize) {
 /// synchronizing-with whoever handed it out is reported, exactly as it would be
 /// for a constructed cell.
 #[test]
-#[should_panic(expected = "Concurrent load and mut accesses")]
+#[should_panic(expected = "without synchronizing-with its commit")]
 fn access_unsynchronized_with_the_publisher_is_reported() {
     loom::model(|| {
         // Declare only the *tail* up front, so no schedule can reach a cell
@@ -461,8 +461,10 @@ fn reset_discards_only_its_own_range() {
 
         reset(cells.as_ptr() as *mut u8, 2 * std::mem::size_of::<u64>());
 
-        assert_eq!(cells[0].load(Relaxed), 0);
-        assert_eq!(cells[1].load(Relaxed), 0);
+        // Inside the range each cell reads its old value or zero — `MEM_RESET`
+        // does not promise zeros.
+        assert!(matches!(cells[0].load(Relaxed), 0 | 1));
+        assert!(matches!(cells[1].load(Relaxed), 0 | 2));
         assert_eq!(cells[2].load(Relaxed), 3);
         assert_eq!(cells[3].load(Relaxed), 4);
     });

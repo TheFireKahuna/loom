@@ -202,6 +202,7 @@ use crate::rt::{
     self, thread, Access, Numeric, Path, Synchronize, VersionVec, MAX_ATOMIC_HISTORY, MAX_THREADS,
 };
 
+use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
 use std::cmp;
 use std::marker::PhantomData;
@@ -293,6 +294,14 @@ pub(super) trait Resolve {
     /// an unregistered cell holds. Never registers: an observer that must not
     /// perturb the execution looks the cell up through this.
     fn registered(&self, execution: &Execution) -> Result<object::Ref<State>, u128>;
+
+    /// Resolve for the access about to run, settling any page state it depends
+    /// on. Called once the access is scheduled, with nothing between it and the
+    /// access; `write` marks an access that certainly writes.
+    #[inline]
+    fn resolve_for_access(&self, _write: bool) -> object::Ref<State> {
+        self.resolve()
+    }
 }
 
 impl<T: Numeric> Resolve for Atomic<T> {
@@ -341,7 +350,7 @@ impl<T: Numeric> Resolve for Atomic<T> {
 ///
 /// # Cost
 ///
-/// Every operation resolves through `Execution::materialized`: there is nowhere
+/// Every operation resolves through `Execution::vm`: there is nowhere
 /// to cache a ref.
 macro_rules! materialized_cell {
     ($name:ident, $align:literal, $bytes:literal) => {
@@ -360,7 +369,7 @@ macro_rules! materialized_cell {
             // the execution's object store. The cell exists to occupy `T`'s
             // layout and to have an address. `UnsafeCell` because the bytes do
             // change underneath a shared reference: the code under test zeroes
-            // records on claim and the `MEM_RESET` model rewrites whole spans.
+            // records on claim.
             _bytes: std::cell::UnsafeCell<[u8; $bytes]>,
         }
 
@@ -380,12 +389,23 @@ macro_rules! materialized_cell {
 
         impl Resolve for $name {
             fn resolve(&self) -> object::Ref<State> {
-                resolve_materialized(self as *const $name as usize)
+                rt::execution(|execution| {
+                    resolve_materialized(execution, self as *const $name as usize)
+                })
+            }
+
+            fn resolve_for_access(&self, write: bool) -> object::Ref<State> {
+                rt::execution(|execution| {
+                    let addr = self as *const $name as usize;
+                    let state = resolve_materialized(execution, addr);
+                    fault_materialized(execution, addr, write);
+                    state
+                })
             }
 
             fn registered(&self, execution: &Execution) -> Result<object::Ref<State>, u128> {
                 let addr = self as *const $name as usize;
-                execution.materialized.get(&addr).copied().ok_or(0)
+                execution.vm.cells.get(&addr).map(|c| c.state).ok_or(0)
             }
         }
     };
@@ -397,98 +417,283 @@ materialized_cell!(Cell4, 4, 4);
 materialized_cell!(Cell8, 8, 8);
 materialized_cell!(Cell16, 16, 16);
 
-/// A range of raw memory a thread declared published, and that thread's
-/// causality at the moment it did.
+/// Bytes per page: the granule a `MEM_RESET` discard decides at.
+const PAGE: usize = 4096;
+
+/// A set of events, one tick per thread lane and zero for none; each lane keeps
+/// its earliest event. A view has *reached* the set when it happens-after any
+/// one of them — for vector clocks, `view[lane] >= tick` is exactly
+/// "happens-after the event stamped `(lane, tick)`".
+type Epochs = [u16; MAX_THREADS];
+
+fn epoch_add(set: &mut Epochs, lane: usize, tick: u16) {
+    let t = &mut set[lane];
+    if *t == 0 || tick < *t {
+        *t = tick;
+    }
+}
+
+fn epoch_reached(set: &Epochs, view: &VersionVec) -> bool {
+    let mut hit = false;
+    for (lane, &tick) in set.iter().enumerate() {
+        hit |= tick != 0 && view.lane(lane) >= tick;
+    }
+    hit
+}
+
+/// The address space the materialized cells live in, for one execution.
+#[derive(Debug, Default)]
+pub(crate) struct Vm {
+    /// Registered cells, by address.
+    cells: FxHashMap<usize, VmCell>,
+
+    /// The registered addresses, sorted, for the range verbs.
+    order: Vec<usize>,
+
+    /// Committed ranges: disjoint, sorted by base.
+    committed: Vec<Committed>,
+
+    /// Ranges decommitted and not committed since, so an access through a stale
+    /// address is named for what it is.
+    decommitted: Vec<(usize, usize)>,
+
+    /// Pages under an outstanding `MEM_RESET`, sorted by base.
+    reset_pages: Vec<ResetPage>,
+
+    /// Whether any reset ran this execution: until one does, no access has
+    /// page state to settle.
+    any_reset: bool,
+
+    /// The object every page verb orders on — the address-space lock. Commits
+    /// are reads of it, so they commute with each other; decommit and reset
+    /// are writes, so the search explores both orders against any other verb.
+    token: Option<object::Ref<State>>,
+}
+
 #[derive(Debug)]
-pub(crate) struct PublishedRegion {
-    base: usize,
-    len: usize,
-    causality: VersionVec,
+struct VmCell {
+    state: object::Ref<State>,
+
+    /// The cell's `op_clock` when its page was reset, while that reset may
+    /// still discard it: neither discarded nor written since.
+    reset: Option<u64>,
+
+    /// Op id of the zero store the latest discard appended, or 0. A later write
+    /// lands on the zero page, so it is ordered after that store whether or not
+    /// its writer has seen it.
+    discard_op: u64,
+}
+
+#[derive(Debug)]
+struct Committed {
+    lo: usize,
+    hi: usize,
+
+    /// Every commit covering the range. The zero contents a commit guarantees
+    /// are established for whoever returned from any of them, and for no one
+    /// else: an access must happen-after at least one.
+    commits: Epochs,
+
     location: Location,
 }
 
-/// Declare that the calling thread has published `len` bytes of zeroed memory
-/// at `base`.
+/// A page under an outstanding reset. Discards and cancels are per page, but
+/// each cell resolves on its own access, so the page couples its cells only
+/// where happens-before fixes the order: a thread that happens-after a discard
+/// of the page reads zero from every cell of it, and one that happens-after a
+/// write to it reads what the page retained.
+#[derive(Debug)]
+struct ResetPage {
+    base: usize,
+    discards: Epochs,
+    cancels: Epochs,
+}
+
+impl ResetPage {
+    fn new(base: usize) -> ResetPage {
+        ResetPage {
+            base,
+            discards: [0; MAX_THREADS],
+            cancels: [0; MAX_THREADS],
+        }
+    }
+}
+
+impl Vm {
+    /// Forget the execution, keeping the allocations.
+    pub(crate) fn clear(&mut self) {
+        self.cells.clear();
+        self.order.clear();
+        self.committed.clear();
+        self.decommitted.clear();
+        self.reset_pages.clear();
+        self.any_reset = false;
+        self.token = None;
+    }
+
+    /// Positions in `order` of the registered cells inside `[lo, hi)`.
+    fn cells_in(&self, lo: usize, hi: usize) -> std::ops::Range<usize> {
+        self.order.partition_point(|&a| a < lo)..self.order.partition_point(|&a| a < hi)
+    }
+
+    fn committed_at(&self, addr: usize) -> Option<&Committed> {
+        let i = self.committed.partition_point(|r| r.hi <= addr);
+        self.committed.get(i).filter(|r| r.lo <= addr)
+    }
+
+    /// Split the committed range straddling `at`, if any, so a range boundary
+    /// falls there.
+    fn split_committed(&mut self, at: usize) {
+        let i = self.committed.partition_point(|r| r.hi <= at);
+        if let Some(r) = self.committed.get_mut(i) {
+            if r.lo < at {
+                let tail = Committed {
+                    lo: at,
+                    hi: r.hi,
+                    commits: r.commits,
+                    location: r.location,
+                };
+                r.hi = at;
+                self.committed.insert(i + 1, tail);
+            }
+        }
+    }
+
+    /// Panic naming why `addr` has no committed memory under it.
+    fn uncommitted(&self, addr: usize, what: &str) -> ! {
+        if self.decommitted.iter().any(|&(lo, hi)| lo <= addr && addr < hi) {
+            panic!(
+                "use after decommit: {what} at {addr:#x}, in memory declared decommitted with \
+                 `loom::sync::atomic::materialized::unpublish` and not committed since. \
+                 Decommitted memory faults; the decommit asserted no thread could still \
+                 reach it."
+            );
+        }
+        panic!(
+            "materialized atomic at {addr:#x} is not in any published region.\n\
+             A materialized cell takes its identity from where it lives, so the \
+             memory holding it must be declared with \
+             `loom::sync::atomic::materialized::publish(ptr, len)` — by whichever \
+             thread published it, before any thread reaches a cell inside it."
+        );
+    }
+
+    /// The leak check `Builder::check_committed_leaks` asks for: every range
+    /// committed in the execution was decommitted by its end.
+    pub(crate) fn check_for_leaks(&self) {
+        if let Some(r) = self.committed.first() {
+            location::panic(format!(
+                "materialized memory [{:#x}, {:#x}) is still committed at the end of the \
+                 execution ({} committed range(s) in all); commit charge is never returned.",
+                r.lo,
+                r.hi,
+                self.committed.len(),
+            ))
+            .location("committed", r.location)
+            .fire();
+        }
+    }
+}
+
+/// The page-verb object, registered on first use in the execution.
+fn vm_token() -> object::Ref<State> {
+    rt::execution(|execution| {
+        if let Some(token) = execution.vm.token {
+            return token;
+        }
+        let token = execution.objects.insert_with(State::shell, State::recycle);
+        token
+            .get_mut(&mut execution.objects)
+            .init_deferred(0, None);
+        execution.vm.token = Some(token);
+        token
+    })
+}
+
+/// Declare that the calling thread has committed `len` bytes of memory at
+/// `base`: every byte reads zero until written, and an idempotent commit of
+/// memory already committed changes nothing in it.
 ///
 /// Required, not advisory: a materialized cell takes its identity from where it
-/// lives, so a cell outside every published range has no identity and its first
+/// lives, so a cell outside every committed range has no identity and its first
 /// access panics. That is deliberate — it makes the declaration impossible to
 /// forget, where a permissive fallback would silently model the memory as
 /// having preceded the execution and could never report a reader that reached
 /// it unsynchronized.
 ///
-/// A cell inside the range takes this thread's causality as its genesis, so an
-/// access by a thread that has not synchronized-with the publication is
-/// reported.
+/// A commit synchronizes with nothing. It establishes the zero contents for the
+/// committing thread, so an access must happen-after *some* commit covering the
+/// cell — its own, or a committer's it synchronized with through the program's
+/// own release. A second commit of live memory therefore lets its caller use the
+/// memory without ordering it after the first committer's other writes.
 #[track_caller]
 pub(crate) fn publish(base: usize, len: usize) {
     let location = location!();
+    let (lo, hi) = (base, base + len);
 
-    rt::execution(|execution| {
+    vm_token().branch_action(Action::Load(FULL_MASK), location);
 
-
+    super::synchronize(|execution| {
         trace!(base, len, "atomic::publish");
 
-        // Only the parts of the range that are not published already. A second
-        // publication of live memory is what an *idempotent* commit looks like
-        // — a pool re-commits the fringe pages a chunk shares with its
-        // neighbours as a matter of course — and the underlying map does
-        // nothing on such a call: it neither re-zeroes the bytes nor
-        // re-initializes them. Recording it anyway would move those cells'
-        // genesis onto a thread that initialized nothing, and every peer
-        // holding the memory from the first publication would be reported
-        // against it.
-        //
-        // Clipping rather than skipping, because the common case is a range
-        // that is partly live and partly new: the new part must still take this
-        // thread's causality.
-        //
-        // Overlapping an existing publication also *orders* this thread after
-        // the thread that made it. Mapping a range is serialized by the
-        // platform (NT takes the VM lock; `mmap` the mmap lock), so every
-        // caller returns having synchronized-with whoever actually mapped it —
-        // not only the winner. Without this edge a second, idempotent commit
-        // hands its caller memory it has no happens-before with, and the first
-        // access is reported.
+        let lane = execution.threads.active_id().as_usize();
+        let tick = execution.threads.active().causality.lane(lane);
+        let vm = &mut execution.vm;
 
-        let mut acquired = VersionVec::new();
-        for r in &execution.published_regions {
-            if r.base < base + len && base < r.base + r.len {
-                acquired.join(&r.causality);
+        let mut i = 0;
+        while i < vm.decommitted.len() {
+            let (a, b) = vm.decommitted[i];
+            if b <= lo || hi <= a {
+                i += 1;
+                continue;
             }
-        }
-        execution.threads.active_mut().causality.join(&acquired);
-
-        let mut gaps = vec![(base, base + len)];
-        for r in &execution.published_regions {
-            let (lo, hi) = (r.base, r.base + r.len);
-            let mut next = Vec::with_capacity(gaps.len() + 1);
-            for (a, b) in gaps {
-                if hi <= a || lo >= b {
-                    next.push((a, b));
-                    continue;
-                }
-                if a < lo {
-                    next.push((a, lo));
-                }
-                if hi < b {
-                    next.push((hi, b));
-                }
+            vm.decommitted.swap_remove(i);
+            if a < lo {
+                vm.decommitted.push((a, lo));
             }
-            gaps = next;
-            if gaps.is_empty() {
-                break;
+            if hi < b {
+                vm.decommitted.push((hi, b));
             }
         }
 
-        let causality = execution.threads.active().causality;
-        for (a, b) in gaps {
-            execution.published_regions.push(PublishedRegion {
-                base: a,
-                len: b - a,
-                causality,
-                location,
-            });
+        // Covered parts gain this commit; the gaps become committed by it alone.
+        vm.split_committed(lo);
+        vm.split_committed(hi);
+        let mut i = vm.committed.partition_point(|r| r.hi <= lo);
+        let mut at = lo;
+        while at < hi {
+            match vm.committed.get_mut(i) {
+                Some(r) if r.lo == at => {
+                    epoch_add(&mut r.commits, lane, tick);
+                    at = r.hi;
+                }
+                next => {
+                    let end = next.map_or(hi, |r| r.lo.min(hi));
+                    let mut commits = [0; MAX_THREADS];
+                    commits[lane] = tick;
+                    vm.committed.insert(
+                        i,
+                        Committed {
+                            lo: at,
+                            hi: end,
+                            commits,
+                            location,
+                        },
+                    );
+                    at = end;
+                }
+            }
+            i += 1;
+        }
+
+        // A cell registers only in committed memory and leaves at decommit, so
+        // every registered cell here lies in a part that was covered.
+        for addr in &vm.order[vm.cells_in(lo, hi)] {
+            epoch_add(
+                &mut vm.cells[addr].state.get_mut(&mut execution.objects).genesis,
+                lane,
+                tick,
+            );
         }
     })
 }
@@ -496,57 +701,52 @@ pub(crate) fn publish(base: usize, len: usize) {
 /// Withdraw the declaration over `[base, base + len)`: the mapping itself is
 /// gone, not merely its contents.
 ///
-/// The inverse of [`publish`], and the model of a `MEM_DECOMMIT` / `munmap`.
-/// Every cell in the range loses its registration and the range leaves the
-/// published list, so a **subsequent access panics** with the not-published
-/// message rather than reading the value the cell last held. That is the whole
-/// point: a decommitted span faults on real hardware, and a checker that
-/// returned a plausible stale value instead would pass exactly the executions
-/// the caller's unreachability argument exists to forbid.
+/// The inverse of [`publish`], and the model of a `MEM_DECOMMIT` / `munmap`. It
+/// asserts that no thread can still reach the range, and checks both halves of
+/// that: it is a non-atomic write to every registered cell in the range, so an
+/// access by any thread the decommit does not happen-after is reported; and the
+/// cells lose their registrations and the range leaves the committed set, so an
+/// access after it panics as a use after decommit rather than reading the value
+/// the cell last held. Between them every schedule of a concurrent access is
+/// reported, and the page-verb order against a concurrent commit is explored.
 ///
 /// Not [`reset`]: that verb keeps the mapping and admits a concurrent reader.
-/// This one asserts there is none, and the assertion is what the panic checks.
 /// A later [`publish`] over the range re-registers its cells at zero, which is
 /// what re-committing decommitted pages really hands back.
+#[track_caller]
 pub(crate) fn unpublish(base: usize, len: usize) {
-    rt::execution(|execution| {
+    let location = location!();
+    let (lo, hi) = (base, base + len);
+
+    vm_token().branch_action(Action::Store(FULL_MASK), location);
+
+    super::synchronize(|execution| {
         trace!(base, len, "atomic::unpublish");
 
-        // The registrations go first. They are keyed by address, so a cell that
-        // survived here would be adopted by a later publication of the same
-        // range together with its whole store history — the recycled-identity
-        // bug the address keying otherwise avoids.
-        execution
-            .materialized
-            .retain(|&addr, _| addr < base || addr - base >= len);
-
-        // Then the declaration, clipped rather than dropped: a decommit spans
-        // whole pages inside a reservation that stays published around it.
-        let mut kept = Vec::with_capacity(execution.published_regions.len() + 1);
-        for r in execution.published_regions.drain(..) {
-            let (lo, hi) = (r.base, r.base + r.len);
-            if hi <= base || lo >= base + len {
-                kept.push(r);
-                continue;
-            }
-            if lo < base {
-                kept.push(PublishedRegion {
-                    base: lo,
-                    len: base - lo,
-                    causality: r.causality,
-                    location: r.location,
-                });
-            }
-            if base + len < hi {
-                kept.push(PublishedRegion {
-                    base: base + len,
-                    len: hi - (base + len),
-                    causality: r.causality,
-                    location: r.location,
-                });
-            }
+        let vm = &mut execution.vm;
+        let range = vm.cells_in(lo, hi);
+        for addr in &vm.order[range.clone()] {
+            vm.cells[addr]
+                .state
+                .get_mut(&mut execution.objects)
+                .track_decommit(&execution.threads, location);
         }
-        execution.published_regions = kept;
+
+        // The registrations go: they are keyed by address, so a cell that
+        // survived here would be adopted by a later commit of the same range
+        // together with its whole store history.
+        for addr in vm.order.drain(range) {
+            vm.cells.remove(&addr);
+        }
+
+        vm.split_committed(lo);
+        vm.split_committed(hi);
+        let first = vm.committed.partition_point(|r| r.hi <= lo);
+        let last = vm.committed.partition_point(|r| r.lo < hi);
+        vm.committed.drain(first..last);
+
+        vm.decommitted.push((lo, hi));
+        vm.reset_pages.retain(|p| p.base + PAGE <= lo || hi <= p.base);
     })
 }
 
@@ -575,21 +775,19 @@ const _: () = {
 /// Exclusive, and checked: this is a non-atomic write, so it is tracked exactly
 /// as `with_mut` is and a peer that has not synchronized-with the caller is
 /// reported. Cells in the range that are not yet registered are already zero.
+/// Writing the bytes dirties their pages, cancelling any pending reset of them.
 pub(crate) fn zero_exclusive(base: usize, len: usize, location: Location) {
     rt::execution(|execution| {
         trace!(base, len, "atomic::zero_exclusive");
 
-        // Collected first: the loop below needs `objects` mutably while
-        // `materialized` is still borrowed by the iterator.
-        let in_range: SmallVec<[object::Ref<State>; 8]> = execution
-            .materialized
-            .iter()
-            .filter(|(&addr, _)| addr >= base && addr - base < len)
-            .map(|(_, &state)| state)
-            .collect();
+        let (lo, hi) = (base, base + len);
+        cancel_resets(execution, lo, hi);
 
-        for state_ref in in_range {
-            let state = state_ref.get_mut(&mut execution.objects);
+        let vm = &mut execution.vm;
+        for addr in &vm.order[vm.cells_in(lo, hi)] {
+            let cell = vm.cells.get_mut(addr).expect("registered cell");
+            cell.reset = None;
+            let state = cell.state.get_mut(&mut execution.objects);
 
             state
                 .unsync_mut_locations
@@ -610,60 +808,97 @@ pub(crate) fn zero_exclusive(base: usize, len: usize, location: Location) {
     })
 }
 
-/// Model the `MEM_RESET` / `MADV_FREE` verb over `[base, base + len)`: the
-/// content is discarded, but the mapping stays and a concurrent reader is
+/// A write by the active thread lands on every page of `[lo, hi)`: record it
+/// as cancelling each page's pending reset.
+fn cancel_resets(execution: &mut Execution, lo: usize, hi: usize) {
+    // Stamped past the thread's last release, so only a view that synchronized
+    // with a later one counts as having seen the write.
+    let id = execution.threads.active_id();
+    execution.threads.active_mut().causality.inc(id);
+    let lane = execution.threads.active_id().as_usize();
+    let tick = execution.threads.active().causality.lane(lane);
+
+    let first = execution.vm.reset_pages.partition_point(|p| p.base + PAGE <= lo);
+    for page in &mut execution.vm.reset_pages[first..] {
+        if page.base >= hi {
+            break;
+        }
+        epoch_add(&mut page.cancels, lane, tick);
+    }
+}
+
+/// Model the `MEM_RESET` verb over `[base, base + len)`: the contents are no
+/// longer of interest, but the mapping stays and a concurrent reader is
 /// *admissible* rather than a bug.
 ///
-/// Distinct from [`zero_exclusive`] in exactly the way the two verbs are
-/// distinct, and the difference is the whole reason this is a separate
-/// function. A claim-time body zero owns its record; a reset does not — a stale
-/// reader may legally still be walking the span through its own atomics while
-/// the reset lands. So this is modelled as a release-ordered atomic store per
-/// cell, which races an atomic load harmlessly, where an exclusive write would
-/// report it.
+/// `MEM_RESET` marks the pages clean without zeroing them. Until a page is
+/// written again the kernel may discard it at any moment, after which it reads
+/// zero; a write dirties it and cancels the discard. So each page reads its old
+/// contents until a discard that may never come, then zero for good — decided
+/// per page, not at the reset. The cells are marked reset here and resolve on
+/// their next access ([`fault_materialized`]); nothing is stored.
 ///
-/// One store per cell, each its own linearization point, because that is what
-/// the span really is: a reader crossing the reset may see some cells discarded
-/// and others not.
+/// A reset of an atomic a peer is reading is benign: the peer reads old or
+/// zero. It races a non-atomic access like a store does, because the checker
+/// explores no order between a non-atomic access and anything else, and the
+/// caller claiming exclusivity over bytes a peer is resetting is the bug.
+///
+/// One DPOR step per registered cell, so each is dependent with every access
+/// to its cell; the page-verb step orders it against commits and decommits.
 pub(crate) fn reset(base: usize, len: usize, location: Location) {
-    // Collected before the first branch: each store below is a scheduling
-    // point, so a peer may register a further cell in the range midway. That
-    // cell registers at zero and needs no store — and it is exactly the
-    // admissible concurrent access this verb tolerates.
-    let targets: SmallVec<[object::Ref<State>; 8]> = rt::execution(|execution| {
+    let (lo, hi) = (base, base + len);
+
+    vm_token().branch_action(Action::Store(FULL_MASK), location);
+
+    let targets: SmallVec<[(usize, object::Ref<State>); 8]> = rt::execution(|execution| {
         trace!(base, len, "atomic::reset");
 
-        execution
-            .materialized
+        let vm = &mut execution.vm;
+        let mut at = lo;
+        while at < hi {
+            match vm.committed_at(at) {
+                Some(r) => at = r.hi,
+                None => vm.uncommitted(at, "reset"),
+            }
+        }
+
+        vm.any_reset = true;
+        let mut page = lo & !(PAGE - 1);
+        while page < hi {
+            match vm.reset_pages.binary_search_by_key(&page, |p| p.base) {
+                Ok(i) => vm.reset_pages[i] = ResetPage::new(page),
+                Err(i) => vm.reset_pages.insert(i, ResetPage::new(page)),
+            }
+            page += PAGE;
+        }
+
+        vm.order[vm.cells_in(lo, hi)]
             .iter()
-            .filter(|(&addr, _)| addr >= base && addr - base < len)
-            .map(|(_, &state)| state)
+            .map(|addr| (*addr, vm.cells[addr].state))
             .collect()
     });
 
-    for state_ref in targets {
-        // No re-resolve integrity check: that guards a cell's identity *word*
-        // against a stray write, and a materialized cell has none — its
-        // identity is its address, which cannot be corrupted in place.
+    for (addr, state_ref) in targets {
         state_ref.branch_action(Action::Store(FULL_MASK), location);
 
         super::synchronize(|execution| {
-            let state = state_ref.get_mut(&mut execution.objects);
+            // Between the steps a peer may decommit the cell. Recommitted since,
+            // it is a fresh zero cell with nothing to discard.
+            let vm = &mut execution.vm;
+            let Some(cell) = vm.cells.get_mut(&addr) else {
+                if vm.committed_at(addr).is_none() {
+                    vm.uncommitted(addr, "reset");
+                }
+                return;
+            };
+            if !cell.state.ref_eq(state_ref) {
+                return;
+            }
 
+            let state = state_ref.get_mut(&mut execution.objects);
             state.stored_locations.track(location, &execution.threads);
             state.track_store(&execution.threads);
-
-            let op_id = state.next_op_id();
-            for ri in state.covered(FULL_MASK) {
-                state.regions[ri].store(
-                    &mut execution.threads,
-                    Synchronize::new(),
-                    0,
-                    Ordering::Release,
-                    None,
-                    op_id,
-                );
-            }
+            cell.reset = Some(state.op_clock);
         });
     }
 }
@@ -671,48 +906,131 @@ pub(crate) fn reset(base: usize, len: usize, location: Location) {
 /// Resolve — and on first access of this execution, create — the registration
 /// of the materialized cell at `addr`.
 ///
-/// Keyed by the address itself rather than by an index into
-/// `published_regions`: a range may be published more than once in an execution
-/// (`commit` is idempotent, and the pool re-commits the fringe pages a chunk
-/// shares with its neighbours as a matter of course), and re-publishing must
-/// not hand a live cell a fresh registration and drop its history. The region
-/// list is consulted only to establish that the address *is* published, and for
-/// the genesis causality.
-fn resolve_materialized(addr: usize) -> object::Ref<State> {
-    rt::execution(|execution| {
-        if let Some(&state) = execution.materialized.get(&addr) {
-            return state;
+/// Keyed by the address itself rather than by the committed range: a range may
+/// be committed more than once in an execution (`commit` is idempotent, and the
+/// pool re-commits the fringe pages a chunk shares with its neighbours as a
+/// matter of course), and re-committing must not hand a live cell a fresh
+/// registration and drop its history.
+fn resolve_materialized(execution: &mut Execution, addr: usize) -> object::Ref<State> {
+    let vm = &mut execution.vm;
+    if let Some(cell) = vm.cells.get(&addr) {
+        return cell.state;
+    }
+
+    let Some(committed) = vm.committed_at(addr) else {
+        vm.uncommitted(addr, "materialized atomic access");
+    };
+    let genesis = (committed.commits, committed.location);
+
+    let state = execution.objects.insert_with(State::shell, State::recycle);
+    state
+        .get_mut(&mut execution.objects)
+        .init_deferred(0, Some(genesis));
+    // Not reset even on a reset page: never written, it reads zero either
+    // way, and it has no stores for a discard to order.
+    vm.cells.insert(
+        addr,
+        VmCell {
+            state,
+            reset: None,
+            discard_op: 0,
+        },
+    );
+    let at = vm.order.partition_point(|&a| a < addr);
+    vm.order.insert(at, addr);
+
+    trace!(?state, addr, "atomic::resolve_materialized");
+
+    state
+}
+
+/// Settle what a reset left pending on the cell at `addr`, at the access about
+/// to run — after its scheduling point, so the page state is the state at the
+/// access. `write` marks an access that certainly writes (a store, `with_mut`);
+/// an RMW may fail, so its write is found by its store on the next access.
+fn fault_materialized(execution: &mut Execution, addr: usize, write: bool) {
+    let vm = &mut execution.vm;
+    if !vm.any_reset {
+        return;
+    }
+    let Some(cell) = vm.cells.get_mut(&addr) else {
+        return;
+    };
+    if cell.reset.is_none() && (!write || cell.discard_op == 0) {
+        return;
+    }
+    std::hint::cold_path();
+
+    let state = cell.state.get_mut(&mut execution.objects);
+
+    let Some(reset_clock) = cell.reset else {
+        // A write onto the zero page a discard left: ordered after the
+        // discard's store, which the writer may not have seen.
+        for region in &mut state.regions {
+            let live = region.live_stores();
+            if let Some(z) = region.stores[..live]
+                .iter_mut()
+                .find(|s| s.op_id == cell.discard_op)
+            {
+                z.first_seen.touch(&execution.threads);
+            }
         }
+        return;
+    };
 
-        // Most-recent-first: a range published again supersedes the earlier
-        // declaration's causality for cells registering from now on.
-        let published = execution
-            .published_regions
-            .iter()
-            .rev()
-            .find(|r| addr >= r.base && addr - r.base < r.len)
-            .map(|r| (r.causality, r.location));
+    let Ok(p) = vm
+        .reset_pages
+        .binary_search_by_key(&(addr & !(PAGE - 1)), |p| p.base)
+    else {
+        // The page record went with a decommit of part of the page.
+        cell.reset = None;
+        return;
+    };
+    let page = &mut vm.reset_pages[p];
 
-        let Some(published) = published else {
-            panic!(
-                "materialized atomic at {addr:#x} is not in any published region.\n\
-                 A materialized cell takes its identity from where it lives, so the \
-                 memory holding it must be declared with \
-                 `loom::sync::atomic::materialized::publish(ptr, len)` — by whichever \
-                 thread published it, before any thread reaches a cell inside it."
-            );
-        };
+    // A store since the reset dirtied the page.
+    if state.op_clock > reset_clock {
+        for region in &state.regions {
+            for s in &region.stores[..region.live_stores()] {
+                if s.op_id > reset_clock {
+                    epoch_add(&mut page.cancels, s.creator, s.tick());
+                }
+            }
+        }
+        cell.reset = None;
+        return;
+    }
 
-        let state = execution.objects.insert_with(State::shell, State::recycle);
-        state
-            .get_mut(&mut execution.objects)
-            .init_deferred(0, Some(published));
-        execution.materialized.insert(addr, state);
+    let id = execution.threads.active_id();
+    execution.threads.active_mut().causality.inc(id);
+    let lane = execution.threads.active_id().as_usize();
+    let view = execution.threads.active().causality;
+    let tick = view.lane(lane);
 
-        trace!(?state, addr, "atomic::resolve_materialized");
+    let cancelled = epoch_reached(&page.cancels, &view);
+    let discard = if epoch_reached(&page.discards, &view) {
+        true
+    } else if cancelled {
+        false
+    } else {
+        execution.path.branch_spurious()
+    };
 
-        state
-    })
+    if discard {
+        epoch_add(&mut page.discards, lane, tick);
+        let op_id = state.next_op_id();
+        state.touched_by |= 1 << lane;
+        for region in &mut state.regions {
+            region.store_mo_max(&mut execution.threads, 0, op_id);
+        }
+        cell.discard_op = op_id;
+    }
+    if write {
+        epoch_add(&mut page.cancels, lane, tick);
+    }
+    if discard || write || cancelled {
+        cell.reset = None;
+    }
 }
 
 /// A cell's process-global identity, minting one if it has none.
@@ -842,6 +1160,10 @@ pub(crate) trait ModelOps {
 pub(super) struct State {
     /// Where the atomic was created
     created_location: Location,
+
+    /// The commits covering a materialized cell's memory; every access must
+    /// happen-after one of them. Empty for any other cell.
+    genesis: Epochs,
 
     /// Transitive closure of all atomic loads from the cell.
     loaded_at: VersionVec,
@@ -1803,7 +2125,7 @@ impl<C: Resolve + ?Sized> ModelOps for C {
     }
 
     fn unsync_load(&self, location: Location) -> u128 {
-        let state_ref = self.resolve();
+        let state_ref = self.resolve_for_access(false);
         rt::execution(|execution| {
             let state = state_ref.get_mut(&mut execution.objects);
 
@@ -1822,7 +2144,7 @@ impl<C: Resolve + ?Sized> ModelOps for C {
     }
 
     fn with_mut<R>(&mut self, location: Location, f: impl FnOnce(&mut u128) -> R) -> R {
-        let state_ref = self.resolve();
+        let state_ref = self.resolve_for_access(true);
         let value = super::execution(|execution| {
             let state = state_ref.get_mut(&mut execution.objects);
 
@@ -1897,7 +2219,7 @@ fn branch<C: Resolve + ?Sized>(
     // corrupted identity resolves to a different registration and trips the
     // same assert.
     assert!(
-        state_ref.ref_eq(cell.resolve()),
+        state_ref.ref_eq(cell.resolve_for_access(matches!(action, Action::Store(_)))),
         "Internal state mutated during branch. This is \
             usually due to a bug in the algorithm being tested writing in \
             an invalid memory location."
@@ -1930,6 +2252,7 @@ impl State {
     fn shell() -> State {
         State {
             created_location: Location::default(),
+            genesis: [0; MAX_THREADS],
             loaded_at: VersionVec::new(),
             loaded_locations: LocationSet::new(),
             unsync_loaded_at: VersionVec::new(),
@@ -1962,6 +2285,7 @@ impl State {
     /// identical to a fresh one.
     fn init(&mut self, threads: &mut thread::Set, value: u128, location: Location) {
         self.created_location = location;
+        self.genesis = [0; MAX_THREADS];
         self.loaded_at = VersionVec::new();
         self.loaded_locations = LocationSet::new();
         self.unsync_loaded_at = VersionVec::new();
@@ -2010,32 +2334,29 @@ impl State {
     ///   unconditionally modification-order-first — the correct C11 reading of
     ///   an initialization, and strictly more accurate than a genesis whose
     ///   `tick` is some thread's clock.
-    fn init_deferred(&mut self, value: u128, published: Option<(VersionVec, Location)>) {
-        self.created_location = published.map_or_else(Location::default, |(_, l)| l);
+    fn init_deferred(&mut self, value: u128, committed: Option<(Epochs, Location)>) {
+        self.created_location = committed.map_or_else(Location::default, |(_, l)| l);
+        // A cell materialized in committed memory must be reached through a
+        // commit: every `track_*` reports an access that happens-after none of
+        // the commits covering it. A `const` cell keeps the empty set — it is
+        // in the binary image before any thread runs.
+        self.genesis = committed.map_or([0; MAX_THREADS], |(c, _)| c);
         self.loaded_at = VersionVec::new();
         self.loaded_locations = LocationSet::new();
         self.unsync_loaded_at = VersionVec::new();
         self.unsync_loaded_locations = LocationSet::new();
         self.stored_at = VersionVec::new();
         self.stored_locations = LocationSet::new();
-        // A cell materialized inside a published region takes the publishing
-        // thread's causality as its genesis: `track_load`/`track_store`/
-        // `track_unsync_load` all report an access whose causality does not
-        // cover this vector, which is exactly "read the memory without
-        // synchronizing-with whoever handed it out".
-        //
-        // Undeclared memory keeps the empty vector — the `const`-in-the-binary-
-        // image model, which cannot report such an access at all.
-        self.unsync_mut_at = published.map_or_else(VersionVec::new, |(c, _)| c);
+        self.unsync_mut_at = VersionVec::new();
         self.unsync_mut_locations = LocationSet::new();
         self.is_mutating = false;
         self.op_clock = 0;
         self.touched_by = 0;
 
-        // The genesis *store* stays pre-execution even when published: it
+        // The genesis *store* stays pre-execution even when committed: it
         // carries no causality, so an acquiring reader inherits nothing it did
-        // not earn. Publication is modelled as the constraint above, not as a
-        // free happens-before edge.
+        // not earn. A commit is the constraint above, not a happens-before
+        // edge.
         self.regions[0].store_pre_execution(value);
     }
 
@@ -2580,9 +2901,29 @@ impl State {
         }
     }
 
+    /// Report an access to a materialized cell that happens-after none of the
+    /// commits of its memory.
+    fn check_genesis(&self, threads: &thread::Set, access: &str, location: Location) {
+        if self.genesis == [0; MAX_THREADS]
+            || epoch_reached(&self.genesis, &threads.active().causality)
+        {
+            return;
+        }
+        std::hint::cold_path();
+
+        let committer = self.genesis.iter().position(|&t| t != 0).unwrap_or(0);
+        location::panic(
+            "Causality violation: access to committed memory without synchronizing-with its commit.",
+        )
+        .thread("commit", committer, self.created_location)
+        .thread(access, threads.active_id(), location)
+        .fire();
+    }
+
     /// Track an atomic load
     fn track_load(&mut self, threads: &thread::Set) {
         assert!(!self.is_mutating, "atomic cell is in `with_mut` call");
+        self.check_genesis(threads, "load", self.loaded_locations[threads]);
 
         // This op will `touch` a store's `first_seen` (a load reads one; an rmw
         // reads then writes). Record the active thread so acquire fences can
@@ -2605,6 +2946,7 @@ impl State {
     /// Track an unsynchronized load
     fn track_unsync_load(&mut self, threads: &thread::Set) {
         assert!(!self.is_mutating, "atomic cell is in `with_mut` call");
+        self.check_genesis(threads, "unsync_load", self.unsync_loaded_locations[threads]);
 
         let current = &threads.active().causality;
 
@@ -2638,6 +2980,7 @@ impl State {
     /// Track an atomic store
     fn track_store(&mut self, threads: &thread::Set) {
         assert!(!self.is_mutating, "atomic cell is in `with_mut` call");
+        self.check_genesis(threads, "atomic store", self.stored_locations[threads]);
 
         // This op creates a store whose `first_seen` is touched by the active
         // thread; record it so acquire fences can skip this cell if no thread
@@ -2678,6 +3021,7 @@ impl State {
     /// Track an unsynchronized mutation
     fn track_unsync_mut(&mut self, threads: &thread::Set) {
         assert!(!self.is_mutating, "atomic cell is in `with_mut` call");
+        self.check_genesis(threads, "with_mut", self.unsync_mut_locations[threads]);
 
         let current = &threads.active().causality;
 
@@ -2734,6 +3078,32 @@ impl State {
         }
 
         self.unsync_mut_at.join(current);
+    }
+
+    /// Track a decommit of the cell's memory: a non-atomic write that every
+    /// prior access, by any thread, must happen-before.
+    fn track_decommit(&mut self, threads: &thread::Set, location: Location) {
+        assert!(!self.is_mutating, "atomic cell is in `with_mut` call");
+
+        let current = &threads.active().causality;
+        let prior = [
+            ("atomic load", &self.loaded_at, &self.loaded_locations),
+            ("atomic store", &self.stored_at, &self.stored_locations),
+            ("unsync_load", &self.unsync_loaded_at, &self.unsync_loaded_locations),
+            ("with_mut", &self.unsync_mut_at, &self.unsync_mut_locations),
+        ];
+        for (access, at, locations) in prior {
+            if let Some(thread) = current.ahead(at) {
+                location::panic(
+                    "Causality violation: decommit of memory a thread accessed without \
+                     happening-before the decommit.",
+                )
+                .location("created", self.created_location)
+                .thread(access, thread, locations[thread])
+                .thread("decommit", threads.active_id(), location)
+                .fire();
+            }
+        }
     }
 
     /// Calls `f` with every thread's last dependent access **that shares bits
@@ -3250,6 +3620,34 @@ impl Region {
         // future store mo-after the read store gets closed to mo-after this
         // write (`close_rmw_atomicity`).
         self.stores[self::index(self.cnt - 1)].rmw_read = Some(rmw_read);
+    }
+
+    /// Append a store modification-order-after every live store of the region,
+    /// attributed to the active thread and releasing nothing.
+    fn store_mo_max(&mut self, threads: &mut thread::Set, value: u128, op_id: u64) {
+        let happens_before = threads.active().causality;
+        let mut modification_order = threads.active().coherence_view();
+        for store in &self.stores[..self.live_stores()] {
+            modification_order.join(&store.modification_order);
+        }
+
+        let mut first_seen = FirstSeen::new();
+        first_seen.touch(threads);
+
+        self.stores[index(self.cnt)] = Store {
+            value,
+            happens_before,
+            modification_order,
+            id: self.cnt,
+            op_id,
+            creator: threads.active_id().as_usize(),
+            rmw_read: None,
+            sync: Synchronize::new(),
+            first_seen,
+            sc_rank: None,
+            seq_cst: false,
+        };
+        self.cnt += 1;
     }
 
     /// The failed-compare-exchange path: a load synchronizing with `failure`.
