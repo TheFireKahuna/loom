@@ -31,12 +31,12 @@
 //!   (`load_coherent_lane`, the model of a `sync::atomic` lane view's
 //!   `load()`): the lane reads its *own* region(s) only, but its readable set
 //!   is narrowed so it can never travel behind a whole-cell (multi-region) op
-//!   the thread has already observed through another region — whether it read
-//!   or wrote that sibling (`filter_seen_op_floors`). This is the
-//!   consumer-facing claim that an aligned lane load is coherent with the
-//!   whole single-copy-atomic cell (the witnessed failure mode was a
-//!   broadcaster's queue-lane load missing a committed 128-bit push CAS it had
-//!   seen through the value lane). `load_masked` itself stays independently
+//!   the thread has already observed through another region by an
+//!   observation both x86-64 and AArch64 order before the load
+//!   (`filter_seen_op_floors`, `LoadView::is_seen`). The lanes are distinct
+//!   locations, so an unordered observation — a relaxed read, an own store not
+//!   followed by a `SeqCst` fence — may be satisfied after the lane load on
+//!   AArch64 and floors nothing. `load_masked` itself stays independently
 //!   coherent per lane — the weaker, per-byte-coherence model — for consumers
 //!   that want it.
 //! - **DPOR dependence is mask-scoped** (`Action::Load(mask)`): a lane load is
@@ -941,14 +941,37 @@ struct LoadView {
     /// `(region, slot)` pairs the load has committed to reading. `Region::load`
     /// touches `first_seen` for each, which no `causality` join reproduces.
     touched: SmallVec<[(usize, usize); 4]>,
+
+    /// The reader's happens-before alone, projected like `causality`. The
+    /// floor reads this one: a `SeqCst`-fence frontier orders no observation
+    /// before the load.
+    hb: VersionVec,
+
+    /// The reading thread's lane.
+    me: usize,
+
+    /// Whether the load is `SeqCst`: an own `SeqCst` store before it is then
+    /// ordered before it on both targets (`xchg`; `STLR` then `LDAR`).
+    seq_cst: bool,
+
+    /// Own-clock versions of the reader's latest acquire-or-stronger fence and
+    /// latest `SeqCst` fence (`Thread::acq_fence_version`, `sc_fence_version`).
+    acq_fence: u16,
+    own_sc_fence: u16,
 }
 
 impl LoadView {
-    /// The state as of the load, before any region is resolved.
-    fn entry(threads: &thread::Set) -> LoadView {
+    /// The state as of the load, once it has read the `(region, slot)` pairs
+    /// in `touched`.
+    fn entry(threads: &thread::Set, ordering: Ordering, touched: &[(usize, usize)]) -> LoadView {
         LoadView {
             causality: threads.active().coherence_view(),
-            touched: SmallVec::new(),
+            hb: threads.active().causality,
+            touched: SmallVec::from_slice(touched),
+            me: threads.active_id().as_usize(),
+            seq_cst: is_seq_cst(ordering),
+            acq_fence: threads.active().acq_fence_version,
+            own_sc_fence: threads.active().sc_fence_version,
         }
     }
 
@@ -957,15 +980,39 @@ impl LoadView {
         let mut next = self.clone();
         if acquires(ordering) {
             next.causality.join(region.stores[ci].sync.released_view());
+            next.hb.join(region.stores[ci].sync.released_view());
         }
         next.touched.push((ri, ci));
         next
     }
 
-    /// Has the reader seen slot `gi` of region `rj` - either through causality
-    /// or because this same load already committed to reading it?
+    /// Has the reader observed slot `gi` of region `rj` in a way that orders the
+    /// observation before this load on both x86-64 and AArch64? Only then does
+    /// the observation floor a sibling lane: the lanes are distinct locations,
+    /// so an unordered observation may be satisfied after this load.
+    ///
+    /// - Another thread's observation reached this one through a release/acquire
+    ///   edge, which orders it (bob on AArch64, TSO on x86).
+    /// - An own read of a peer's store is ordered once it acquired or an acquire
+    ///   fence followed it; a relaxed read is not (AArch64 reorders loads).
+    /// - An own store is ordered only by a later `SeqCst` fence of this thread,
+    ///   or when it was a `SeqCst` store and this load is `SeqCst`: both targets
+    ///   otherwise let a load pass an earlier store to other bytes.
+    /// - A peer's store this same load already committed to reading is one
+    ///   single-copy-atomic event with it. An own store read here may have been
+    ///   forwarded, which AArch64 permits to split the snapshot.
     fn is_seen(&self, store: &Store, rj: usize, gi: usize) -> bool {
-        store.first_seen.is_seen_in(&self.causality) || self.touched.contains(&(rj, gi))
+        let me_bit = 1u32 << self.me;
+        let seen = store.first_seen.seen_threads(&self.hb);
+        if seen & !me_bit != 0 {
+            return true;
+        }
+        if store.creator == self.me {
+            return self.own_sc_fence > store.tick() || (store.seq_cst && self.seq_cst);
+        }
+        let ordered_read = store.first_seen.1 & me_bit != 0
+            || store.first_seen.0[self.me] < self.acq_fence;
+        (seen & me_bit != 0 && ordered_read) || self.touched.contains(&(rj, gi))
     }
 }
 
@@ -1147,6 +1194,11 @@ struct Store {
     /// to exclude superseded writes without needing a materialized mo edge (see
     /// `match_load_to_stores`).
     sc_rank: Option<u32>,
+
+    /// Whether the store was itself a `SeqCst` store (or RMW write half) —
+    /// unlike `sc_rank`, never set by promotion. A `SeqCst` load after it in
+    /// the same thread is ordered after it on both targets.
+    seq_cst: bool,
 }
 
 /// Creation stamp of the store an RMW write read — the persistent record of
@@ -1284,8 +1336,11 @@ enum OpPin {
 /// `<= MAX_THREADS`-bounded and structurally zero in padding), so they are
 /// inert in every comparison — exactly like the real lanes of a thread that
 /// has not seen the store.
+///
+/// The second field is one bit per thread whose read of the store acquired,
+/// which orders it before everything the thread does next.
 #[derive(Debug, Clone)]
-struct FirstSeen([u16; VersionVec::LANES]);
+struct FirstSeen([u16; VersionVec::LANES], u32);
 
 /// Implements atomic fence behavior
 #[track_caller]
@@ -1329,7 +1384,11 @@ fn fence_acq(execution: &mut Execution) {
         );
     }
 
+    // lanes: the fence orders every earlier read of this thread before its
+    // later accesses (the lane coherence floor, `LoadView::is_seen`).
+    let version = execution.threads.active_atomic_version();
     let active = execution.threads.active_mut();
+    active.acq_fence_version = version;
     let acquirable = active.acquirable;
     active.acquire(&acquirable);
 }
@@ -1347,6 +1406,10 @@ fn fence_acqrel(execution: &mut Execution) {
 
 fn fence_seqcst(execution: &mut Execution) {
     fence_acq(execution);
+    // lanes: the fence orders every earlier access of this thread, stores
+    // included, before its later ones (`LoadView::is_seen`).
+    let version = execution.threads.active_atomic_version();
+    execution.threads.active_mut().sc_fence_version = version;
 
     // Commit the fence into S (its position, and the coherence frontier of the
     // fences before it), then promote into S at its position every store that
@@ -1504,9 +1567,8 @@ impl<C: Resolve + ?Sized> ModelOps for C {
     /// 2. **Cell coherence.** The readable set is additionally narrowed by
     ///    [`State::filter_seen_op_floors`] so the lane can never travel behind a
     ///    whole-cell (multi-region) op the active thread has already observed
-    ///    through a region *outside* this load — whether it read or wrote that
-    ///    sibling. An aligned lane access is coherent with the whole
-    ///    single-copy-atomic cell (spec carve-out #5); this is the property a
+    ///    through a region *outside* this load, by an observation ordered
+    ///    before this load ([`LoadView::is_seen`]). This is the property a
     ///    plain per-lane masked load does not carry.
     ///
     /// The floor consults sibling regions but reads only *already-fixed*
@@ -2178,6 +2240,8 @@ impl State {
         let multi = covered.len() > 1;
         let mut resolved = Resolved::new();
         let mut result = 0u128;
+        // The `(region, slot)` pairs this load has read so far.
+        let mut read: SmallVec<[(usize, usize); 4]> = SmallVec::new();
 
         for (k, &ri) in covered.iter().enumerate() {
             // If necessary, generate the list of stores to permute through for
@@ -2189,9 +2253,10 @@ impl State {
             if path.is_traversed() {
                 // The regions before this one have already been read, so the
                 // live state *is* the projection for this step: their causality
-                // joins and `first_seen` touches are already recorded, which is
-                // also why `touched` starts empty.
-                let view = LoadView::entry(threads);
+                // joins and `first_seen` touches are already recorded. A touch
+                // does not say it came from this load, so `touched` still
+                // names what the load read, exactly as the lookahead does.
+                let view = LoadView::entry(threads, ordering, &read);
 
                 let mut seed = [0; MAX_ATOMIC_HISTORY];
                 let mut n = self.regions[ri].match_load_to_stores(
@@ -2280,6 +2345,9 @@ impl State {
             let mask_ri = self.regions[ri].mask;
             let v = self.regions[ri].load(threads, index, ordering);
             result |= v & mask_ri;
+            if apply_floor && multi {
+                read.push((ri, index));
+            }
         }
 
         result
@@ -2465,17 +2533,16 @@ impl State {
     }
 
     /// True when the active thread has observed whole-cell op `op_id` through
-    /// some region other than `ri` — i.e. that region holds a store `g` the
-    /// thread has *seen* (loaded or itself created; `first_seen`) which is
-    /// op `op_id`'s sibling there or modification-order-after it.
+    /// some region other than `ri` — i.e. that region holds a store `g` which
+    /// is op `op_id`'s sibling there or modification-order-after it, and which
+    /// the thread observed in a way ordered before this load
+    /// ([`LoadView::is_seen`]).
     ///
-    /// This is the union of both routes the single-copy-atomicity claim rests
-    /// on: the thread *read* the wide op through another lane (`g` is that op's
-    /// sibling, or a later store the thread read), or the thread *wrote* that
-    /// other lane past the wide op (`g` is the thread's own store, mo-after the
-    /// op's sibling — owning the line to write it carries the whole wide event
-    /// into this thread's view). A store the thread has neither seen nor passed
-    /// contributes nothing, so a genuinely-concurrent op never floors.
+    /// The thread may have *read* the wide op through another lane (`g` is
+    /// that op's sibling, or a later store it read) or *written* that lane
+    /// past it (`g` is its own store). Either way the floor stands only when
+    /// the observation is ordered before this load on both targets; a
+    /// genuinely-concurrent op, or an unordered observation, never floors.
     fn op_seen_through_other_region(&self, ri: usize, op_id: u64, view: &LoadView) -> bool {
         for (rj, other) in self.regions.iter().enumerate() {
             if rj == ri {
@@ -2837,6 +2904,9 @@ impl Region {
         let store = &mut self.stores[index];
 
         store.first_seen.touch(threads);
+        if acquires(ordering) {
+            store.first_seen.acquire(threads);
+        }
         store.sync.sync_load(threads, ordering);
         store.value
     }
@@ -2923,6 +2993,9 @@ impl Region {
     ) {
         debug_assert!(index < self.live_stores(), "preserve_commit of dead slot");
         self.stores[index].sync.sync_load(threads, success);
+        if acquires(success) {
+            self.stores[index].first_seen.acquire(threads);
+        }
 
         let read = RmwRead {
             read_id: self.stores[index].id,
@@ -3027,6 +3100,7 @@ impl Region {
             // that will read it first.
             first_seen: FirstSeen::new(),
             sc_rank: None,
+            seq_cst: false,
         };
         self.cnt = 1;
     }
@@ -3120,6 +3194,7 @@ impl Region {
             sync,
             first_seen,
             sc_rank,
+            seq_cst: is_seq_cst(ordering),
         };
         self.cnt += 1;
     }
@@ -3153,6 +3228,9 @@ impl Region {
         debug_assert!(index < self.live_stores(), "rmw_commit of dead slot");
         // Perform load synchronization using the `success` ordering.
         self.stores[index].sync.sync_load(threads, success);
+        if acquires(success) {
+            self.stores[index].first_seen.acquire(threads);
+        }
 
         // Capture the read store's creation stamp *before* the write half
         // runs: if the ring is full and the read store is the oldest live
@@ -3178,6 +3256,9 @@ impl Region {
     fn rmw_fail(&mut self, threads: &mut thread::Set, index: usize, failure: Ordering) {
         debug_assert!(index < self.live_stores(), "rmw_fail of dead slot");
         self.stores[index].sync.sync_load(threads, failure);
+        if acquires(failure) {
+            self.stores[index].first_seen.acquire(threads);
+        }
     }
 
     /// `sc_scope` is the read's SC scope (`thread::Set::active_sc_scope`).
@@ -3478,6 +3559,7 @@ impl Default for Store {
             sync: Synchronize::new(),
             first_seen: FirstSeen::new(),
             sc_rank: None,
+            seq_cst: false,
         }
     }
 }
@@ -3486,7 +3568,13 @@ impl Default for Store {
 
 impl FirstSeen {
     fn new() -> FirstSeen {
-        FirstSeen([u16::max_value(); VersionVec::LANES])
+        FirstSeen([u16::max_value(); VersionVec::LANES], 0)
+    }
+
+    /// Record that the active thread read the store acquiring. The caller has
+    /// touched the store first.
+    fn acquire(&mut self, threads: &thread::Set) {
+        self.1 |= 1 << threads.active_id().as_usize();
     }
 
     fn touch(&mut self, threads: &thread::Set) {
@@ -3515,6 +3603,18 @@ impl FirstSeen {
             mask |= ((fs != u16::MAX) as u32) & ((fs <= lanes[i]) as u32);
         }
         mask != 0
+    }
+
+    /// The threads whose first sight of the store is contained in `view`, one
+    /// bit each — `is_seen_in` split by thread.
+    fn seen_threads(&self, view: &VersionVec) -> u32 {
+        let lanes = view.lanes();
+        let mut mask = 0u32;
+        for i in 0..VersionVec::LANES {
+            let fs = self.0[i];
+            mask |= (((fs != <u16>::MAX) & (fs <= lanes[i])) as u32) << i;
+        }
+        mask
     }
 
     fn is_seen_before_yield(&self, threads: &thread::Set) -> bool {

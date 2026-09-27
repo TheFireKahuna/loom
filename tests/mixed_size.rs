@@ -341,14 +341,14 @@ fn dpor_prunes_disjoint_lanes() {
 }
 
 /// Lane-load cell coherence (the single-copy-atomicity claim): a typed lane
-/// `load()` is one coherent whole-cell read projected to the lane, so it may
-/// never return a lane older than a **whole-cell** op the thread has already
-/// observed through another lane. A wide store is one indivisible event on
-/// the one 16-byte cell — having read its lane-B half, reading lane A from
-/// before it would travel backwards through that event, a schedule the
-/// production ISAs forbid (witnessed in ntlib as a broadcaster missing a
-/// committed 128-bit push it had already seen through the value lane).
-/// Contrast `masked_lanes_reorder_independently`: `load_masked` itself stays
+/// `load()` may never return a lane older than a **whole-cell** op the thread
+/// has already observed, through another lane, by an observation ordered
+/// before the load. A wide store is one indivisible event on the one 16-byte
+/// cell — having *acquired* its lane-B half, reading lane A from before it
+/// would travel backwards through that event, which both production ISAs
+/// forbid. A relaxed lane-B read orders nothing on AArch64, so it floors
+/// nothing (`tests/lane_floor.rs`). Contrast
+/// `masked_lanes_reorder_independently`: `load_masked` itself stays
 /// independently coherent — the lane views carry the stronger model.
 #[test]
 fn lane_load_never_travels_behind_seen_wide_op() {
@@ -367,7 +367,7 @@ fn lane_load_never_travels_behind_seen_wide_op() {
         };
 
         // Observe the wide op through lane B ...
-        if x.lane_u64(8).load(Relaxed) == 1 {
+        if x.lane_u64(8).load(Acquire) == 1 {
             // ... then lane A may never read from before it.
             assert_eq!(
                 x.lane_u64(0).load(Relaxed),
@@ -511,13 +511,13 @@ fn refined_lane_load_commutes_with_disjoint_lane_cas() {
     );
 }
 
-/// Coherence is preserved under the refined (mask-scoped) load — the RMW /
-/// written-sibling route of single-copy atomicity. A thread whose own lane-A
-/// RMW landed *after* a wide op (its swap returned the wide op's lane-A half)
-/// has provably passed that one indivisible 16-byte event, so a subsequent
-/// lane-B read may not travel behind it. Pruning the DPOR dependence must not
-/// weaken this: `filter_seen_op_floors` excludes the pre-wide-op lane-B value
-/// once the thread's lane-A store is seen mo-after the wide op's sibling.
+/// Coherence is preserved under the refined (mask-scoped) load — the RMW
+/// route of single-copy atomicity. A thread whose own `SeqCst` lane-A RMW
+/// landed *after* a wide op (its swap returned the wide op's lane-A half) has
+/// passed that one indivisible 16-byte event by an acquiring read, so a
+/// subsequent lane-B read may not travel behind it. Pruning the DPOR
+/// dependence must not weaken this: `filter_seen_op_floors` excludes the
+/// pre-wide-op lane-B value.
 #[test]
 fn refined_lane_load_after_passing_wide_op_is_coherent() {
     loom::model(|| {

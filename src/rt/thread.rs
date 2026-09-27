@@ -43,6 +43,13 @@ pub(crate) struct Thread {
     /// history.
     pub(crate) acquirable: Synchronize,
 
+    /// lanes: own-clock version of this thread's latest acquire-or-stronger
+    /// fence and latest `SeqCst` fence, `0` for none (every operation's
+    /// version is at least `1`). What the lane coherence floor reads to tell
+    /// which of the thread's own earlier accesses its next one is ordered after.
+    pub(crate) acq_fence_version: u16,
+    pub(crate) sc_fence_version: u16,
+
     /// `std::thread::park`'s token.
     park_token: bool,
 
@@ -173,6 +180,8 @@ impl Thread {
             sc_acquired: ScView::new(),
             released: Synchronize::new(),
             acquirable: Synchronize::new(),
+            acq_fence_version: 0,
+            sc_fence_version: 0,
             park_token: false,
             park_view: Synchronize::new(),
             parked: false,

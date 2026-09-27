@@ -142,10 +142,11 @@ fn preserving_reaches_the_same_behaviors_in_fewer_executions() {
     println!("full-width CAS: {full_execs} executions; preserving: {pres_execs}");
 }
 
-/// Whole-cell coherence survives the elision: a reader that takes the value
+/// Whole-cell coherence survives the elision: a reader that acquires the value
 /// lane the wide CAS installed may not then take an owner lane older than the
 /// one that same CAS carried through. The cell is 16-byte single-copy-atomic,
-/// so that pair never existed on the line.
+/// so that pair never existed on the line. (A relaxed value-lane read orders
+/// nothing before the owner-lane read on AArch64, and floors nothing.)
 #[test]
 fn seeing_a_preserving_op_floors_the_lane_it_carried() {
     let (seen, _) = explore(|log: &Log| {
@@ -162,7 +163,7 @@ fn seeing_a_preserving_op_floors_the_lane_it_carried() {
             })
         };
 
-        let v = x.lane_u32(V_OFF).load(Relaxed);
+        let v = x.lane_u32(V_OFF).load(Acquire);
         let o = x.lane_u32(O_OFF).load(Relaxed);
 
         w.join().unwrap();
