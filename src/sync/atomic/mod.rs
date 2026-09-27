@@ -2,7 +2,6 @@
 
 #[allow(clippy::module_inception)]
 mod atomic;
-use self::atomic::Atomic;
 
 mod bool;
 pub use self::bool::AtomicBool;
@@ -35,6 +34,9 @@ pub use self::int::{AtomicI128, AtomicU128};
 mod ptr;
 pub use self::ptr::AtomicPtr;
 
+mod generic;
+pub use self::generic::{Atomic, AtomicPrimitive};
+
 #[doc(no_inline)]
 pub use std::sync::atomic::Ordering;
 
@@ -53,4 +55,22 @@ pub fn spin_loop_hint() {
 /// An atomic fence.
 pub fn fence(order: Ordering) {
     crate::rt::fence(order);
+}
+
+/// A compiler memory fence.
+///
+/// Orders memory operations only against a signal handler interrupting the
+/// same thread. Loom runs no such handler, and a thread's own operations are
+/// already modelled in program order, so this has no effect on the model; it
+/// performs no modelled operation and is not a scheduling point.
+///
+/// # Panics
+///
+/// Panics if `order` is [`Relaxed`](Ordering::Relaxed), as `core`'s does.
+#[inline]
+#[track_caller]
+pub fn compiler_fence(order: Ordering) {
+    if let Ordering::Relaxed = order {
+        panic!("there is no such thing as a relaxed fence");
+    }
 }

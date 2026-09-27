@@ -1,4 +1,4 @@
-use super::Atomic;
+use super::atomic::Atomic;
 
 use std::sync::atomic::Ordering;
 
@@ -24,6 +24,14 @@ macro_rules! atomic_ptr {
                 ))
             }
 
+            /// Creates a new `AtomicPtr` initialized with a null pointer. `const`;
+            /// registers as [`new`](Self::new) does.
+            #[track_caller]
+            #[must_use]
+            pub const fn null() -> $name<T> {
+                $name::new(std::ptr::null_mut())
+            }
+
             /// Creates a null `AtomicPtr` with registration deferred to first
             /// access whatever the context; see
             /// [`AtomicUsize::const_new`](crate::sync::atomic::AtomicUsize::const_new).
@@ -35,6 +43,14 @@ macro_rules! atomic_ptr {
         impl<T> Default for $name<T> {
             fn default() -> $name<T> {
                 $name::new(std::ptr::null_mut())
+            }
+        }
+
+        impl<T> From<*mut T> for $name<T> {
+            /// Converts a `*mut T` into an `AtomicPtr<T>`.
+            #[track_caller]
+            fn from(p: *mut T) -> Self {
+                Self::new(p)
             }
         }
     };
@@ -71,7 +87,13 @@ macro_rules! atomic_ptr {
 
         impl<T> std::fmt::Debug for $name<T> {
             fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                self.0.fmt(f)
+                self.0.fmt_peek(f, stringify!($name), std::fmt::Debug::fmt)
+            }
+        }
+
+        impl<T> std::fmt::Pointer for $name<T> {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                self.0.fmt_peek(f, stringify!($name), std::fmt::Pointer::fmt)
             }
         }
 
@@ -173,6 +195,80 @@ macro_rules! atomic_ptr {
                 F: FnMut(*mut T) -> Option<*mut T>,
             {
                 self.0.try_update(set_order, fetch_order, f)
+            }
+
+            /// Fetches the value, and applies a function to it that returns a new
+            /// value. The new value is stored and the old value is returned.
+            ///
+            /// [`Self::try_update`] with a function that always returns a new value,
+            /// so it takes the same modelled steps: may call `f` more than once if
+            /// the value changes between the load and the compare-exchange.
+            #[track_caller]
+            pub fn update(
+                &self,
+                set_order: Ordering,
+                fetch_order: Ordering,
+                mut f: impl FnMut(*mut T) -> *mut T,
+            ) -> *mut T {
+                match self.try_update(set_order, fetch_order, |p| Some(f(p))) {
+                    Ok(prev) => prev,
+                    Err(_) => unreachable!("`f` always supplies a new value"),
+                }
+            }
+
+            // The address RMWs below are each one modelled step on the stored
+            // pointer. A modelled cell carries its pointer as an exposed address,
+            // so the stored and returned pointers keep the provenance of the one
+            // stored, as `core`'s do, on the permissive-provenance terms every
+            // loom pointer cell has.
+
+            /// Offsets the pointer's address by adding `val` (in units of `T`),
+            /// returning the previous pointer. Wraps, as `wrapping_add` does.
+            #[track_caller]
+            pub fn fetch_ptr_add(&self, val: usize, order: Ordering) -> *mut T {
+                self.fetch_byte_add(val.wrapping_mul(size_of::<T>()), order)
+            }
+
+            /// Offsets the pointer's address by subtracting `val` (in units of
+            /// `T`), returning the previous pointer. Wraps, as `wrapping_sub` does.
+            #[track_caller]
+            pub fn fetch_ptr_sub(&self, val: usize, order: Ordering) -> *mut T {
+                self.fetch_byte_sub(val.wrapping_mul(size_of::<T>()), order)
+            }
+
+            /// Offsets the pointer's address by adding `val` bytes, returning the
+            /// previous pointer.
+            #[track_caller]
+            pub fn fetch_byte_add(&self, val: usize, order: Ordering) -> *mut T {
+                self.0.rmw(|p| p.wrapping_byte_add(val), order)
+            }
+
+            /// Offsets the pointer's address by subtracting `val` bytes, returning
+            /// the previous pointer.
+            #[track_caller]
+            pub fn fetch_byte_sub(&self, val: usize, order: Ordering) -> *mut T {
+                self.0.rmw(|p| p.wrapping_byte_sub(val), order)
+            }
+
+            /// Bitwise "or" of the pointer's address with `val`, returning the
+            /// previous pointer.
+            #[track_caller]
+            pub fn fetch_or(&self, val: usize, order: Ordering) -> *mut T {
+                self.0.rmw(|p| p.map_addr(|a| a | val), order)
+            }
+
+            /// Bitwise "and" of the pointer's address with `val`, returning the
+            /// previous pointer.
+            #[track_caller]
+            pub fn fetch_and(&self, val: usize, order: Ordering) -> *mut T {
+                self.0.rmw(|p| p.map_addr(|a| a & val), order)
+            }
+
+            /// Bitwise "xor" of the pointer's address with `val`, returning the
+            /// previous pointer.
+            #[track_caller]
+            pub fn fetch_xor(&self, val: usize, order: Ordering) -> *mut T {
+                self.0.rmw(|p| p.map_addr(|a| a ^ val), order)
             }
         }
     };

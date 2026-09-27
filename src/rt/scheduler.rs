@@ -88,6 +88,21 @@ impl Scheduler {
         Self::with_state(|state| f(state.execution))
     }
 
+    /// Access the execution if there is one to access: `None` outside a model,
+    /// and while the execution is already borrowed further up the stack.
+    pub(crate) fn try_with_execution<F, R>(f: F) -> Option<R>
+    where
+        F: FnOnce(&mut Execution) -> R,
+    {
+        if !STATE.is_set() {
+            return None;
+        }
+        STATE.with(|state| {
+            let mut state = state.try_borrow_mut().ok()?;
+            Some(f(state.execution))
+        })
+    }
+
     /// Perform a context switch
     pub(crate) fn switch() {
         use std::future::Future;

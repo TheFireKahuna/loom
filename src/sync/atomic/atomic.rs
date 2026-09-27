@@ -154,6 +154,24 @@ where
     T: rt::Numeric,
     B: rt::ModelOps,
 {
+    /// Formats the cell as `core` formats its atomics — through `show` on the
+    /// current value — but reads that value with no model effect
+    /// ([`rt::ModelOps::peek`]) where `core` performs a `Relaxed` load. A load
+    /// would be a modelled step and a scheduling point, so a `Debug` call in
+    /// a rig would change the schedules explored. Outside a model the value is
+    /// not observable, and the cell prints as `name { .. }`.
+    pub(crate) fn fmt_peek(
+        &self,
+        f: &mut std::fmt::Formatter<'_>,
+        name: &str,
+        show: fn(&T, &mut std::fmt::Formatter<'_>) -> std::fmt::Result,
+    ) -> std::fmt::Result {
+        match self.state.peek() {
+            Some(raw) => show(&T::from_u128(raw), f),
+            None => f.debug_struct(name).finish_non_exhaustive(),
+        }
+    }
+
     #[track_caller]
     pub(crate) unsafe fn unsync_load(&self) -> T {
         T::from_u128(self.state.unsync_load(location!()))

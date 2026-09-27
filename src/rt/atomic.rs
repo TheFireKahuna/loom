@@ -288,12 +288,27 @@ pub struct Atomic<T> {
 /// into the cell's own memory.
 pub(super) trait Resolve {
     fn resolve(&self) -> object::Ref<State>;
+
+    /// This cell's registration in `execution` if it has one, else the value
+    /// an unregistered cell holds. Never registers: an observer that must not
+    /// perturb the execution looks the cell up through this.
+    fn registered(&self, execution: &Execution) -> Result<object::Ref<State>, u128>;
 }
 
 impl<T: Numeric> Resolve for Atomic<T> {
     #[inline]
     fn resolve(&self) -> object::Ref<State> {
         self.state()
+    }
+
+    fn registered(&self, execution: &Execution) -> Result<object::Ref<State>, u128> {
+        if let Some(state) = self.state {
+            return Ok(state);
+        }
+        match self.cell_id.load(std::sync::atomic::Ordering::Relaxed) {
+            0 => Err(self.init),
+            id => execution.deferred_atomics.get(&id).copied().ok_or(self.init),
+        }
     }
 }
 
@@ -366,6 +381,11 @@ macro_rules! materialized_cell {
         impl Resolve for $name {
             fn resolve(&self) -> object::Ref<State> {
                 resolve_materialized(self as *const $name as usize)
+            }
+
+            fn registered(&self, execution: &Execution) -> Result<object::Ref<State>, u128> {
+                let addr = self as *const $name as usize;
+                execution.materialized.get(&addr).copied().ok_or(0)
             }
         }
     };
@@ -808,6 +828,14 @@ pub(crate) trait ModelOps {
 
     /// Access the newest value mutably. Must happen-after all stores.
     fn with_mut<R>(&mut self, location: Location, f: impl FnOnce(&mut u128) -> R) -> R;
+
+    /// The composed newest value, for an observer outside the model — `Debug`.
+    ///
+    /// No branch, no access record, no registration: the execution is exactly
+    /// as it was, so formatting a cell never changes which schedules are
+    /// explored. The value is the newest in modification order, which the
+    /// calling thread need not be able to load. `None` outside a model.
+    fn peek(&self) -> Option<u128>;
 }
 
 #[derive(Debug)]
@@ -1778,6 +1806,13 @@ impl<C: Resolve + ?Sized> ModelOps for C {
         // Unset on exit
         let mut reset = Reset(value, state_ref);
         f(&mut reset.0)
+    }
+
+    fn peek(&self) -> Option<u128> {
+        rt::Scheduler::try_with_execution(|execution| match self.registered(execution) {
+            Ok(state) => state.get(&execution.objects).newest_value(),
+            Err(unregistered) => unregistered,
+        })
     }
 }
 

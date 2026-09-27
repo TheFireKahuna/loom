@@ -1,4 +1,4 @@
-use super::Atomic;
+use super::atomic::Atomic;
 
 use std::sync::atomic::Ordering;
 
@@ -6,7 +6,6 @@ use std::sync::atomic::Ordering;
 ///
 /// NOTE: Unlike `std::sync::atomic::AtomicBool`, this type has a different
 /// in-memory representation than `bool`.
-#[derive(Debug)]
 pub struct AtomicBool(Atomic<bool>);
 
 impl AtomicBool {
@@ -118,6 +117,13 @@ impl AtomicBool {
         self.0.rmw(|v| v ^ val, order)
     }
 
+    /// Logical "not" with the current value: one read-modify-write, returning
+    /// the previous value.
+    #[track_caller]
+    pub fn fetch_not(&self, order: Ordering) -> bool {
+        self.fetch_xor(true, order)
+    }
+
     /// Fetches the value, and applies a function to it that returns an optional new value. Returns
     /// a [`Result`] of [`Ok`]`(previous_value)` if the function returned [`Some`]`(_)`, else
     /// [`Err`]`(previous_value)`.
@@ -132,6 +138,31 @@ impl AtomicBool {
         F: FnMut(bool) -> Option<bool>,
     {
         self.0.try_update(set_order, fetch_order, f)
+    }
+
+    /// Fetches the value, and applies a function to it that returns a new value.
+    /// The new value is stored and the old value is returned.
+    ///
+    /// [`Self::try_update`] with a function that always returns a new value, so it
+    /// takes the same modelled steps: may call `f` more than once if the value
+    /// changes between the load and the compare-exchange.
+    #[track_caller]
+    pub fn update(
+        &self,
+        set_order: Ordering,
+        fetch_order: Ordering,
+        mut f: impl FnMut(bool) -> bool,
+    ) -> bool {
+        match self.try_update(set_order, fetch_order, |v| Some(f(v))) {
+            Ok(prev) => prev,
+            Err(_) => unreachable!("`f` always supplies a new value"),
+        }
+    }
+}
+
+impl std::fmt::Debug for AtomicBool {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt_peek(f, "AtomicBool", std::fmt::Debug::fmt)
     }
 }
 

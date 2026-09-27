@@ -27,7 +27,7 @@
 //! pointer-cast lane on the LE targets the production carve-out runs on.
 //! Constructors assert lane-aligned, in-bounds offsets.
 
-use super::Atomic;
+use super::atomic::Atomic;
 
 use std::sync::atomic::Ordering;
 

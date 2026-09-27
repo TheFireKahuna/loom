@@ -1,5 +1,5 @@
 use super::lane::{LaneU32Of64, LaneU32Of128, LaneU64Of128};
-use super::Atomic;
+use super::atomic::Atomic;
 
 use std::sync::atomic::Ordering;
 
@@ -88,10 +88,15 @@ macro_rules! atomic_int {
         #[doc = concat!(
             " Mock implementation of `std::sync::atomic::", stringify!($name), "`.",
         )]
-        #[derive(Debug)]
         $(#[$extra])*
         #[repr(transparent)]
         pub struct $name($backing);
+
+        impl std::fmt::Debug for $name {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                self.0.fmt_peek(f, stringify!($name), std::fmt::Debug::fmt)
+            }
+        }
 
         impl $name {
             /// Get access to a mutable reference to the inner value.
@@ -368,6 +373,25 @@ macro_rules! atomic_int {
                 F: FnMut($int_type) -> Option<$int_type>,
             {
                 self.0.try_update(set_order, fetch_order, f)
+            }
+
+            /// Fetches the value, and applies a function to it that returns a new value.
+            /// The new value is stored and the old value is returned.
+            ///
+            /// [`Self::try_update`] with a function that always returns a new value, so
+            /// it takes the same modelled steps: may call `f` more than once if the
+            /// value changes between the load and the compare-exchange.
+            #[track_caller]
+            pub fn update(
+                &self,
+                set_order: Ordering,
+                fetch_order: Ordering,
+                mut f: impl FnMut($int_type) -> $int_type,
+            ) -> $int_type {
+                match self.try_update(set_order, fetch_order, |v| Some(f(v))) {
+                    Ok(prev) => prev,
+                    Err(_) => unreachable!("`f` always supplies a new value"),
+                }
             }
         }
 
