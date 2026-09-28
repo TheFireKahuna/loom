@@ -236,3 +236,38 @@ mod const_locks {
         });
     }
 }
+
+mod once {
+    use loom::sync::atomic::{AtomicUsize, Ordering::Relaxed};
+    use loom::sync::{Arc, Once};
+    use loom::thread;
+
+    static INIT: Once = Once::new();
+    static RUNS: AtomicUsize = AtomicUsize::new(0);
+
+    // A `static` `Once` runs its closure exactly once in every execution, and
+    // a racing caller returns only after it completed.
+    #[test]
+    fn static_once_runs_once_per_execution() {
+        loom::model(|| {
+            let cell = Arc::new(AtomicUsize::new(0));
+            let c = cell.clone();
+            let t = thread::spawn(move || {
+                INIT.call_once(|| {
+                    c.store(7, Relaxed);
+                    RUNS.fetch_add(1, Relaxed);
+                });
+                c.load(Relaxed)
+            });
+            let c = cell.clone();
+            INIT.call_once(|| {
+                c.store(7, Relaxed);
+                RUNS.fetch_add(1, Relaxed);
+            });
+            assert_eq!(cell.load(Relaxed), 7);
+            assert_eq!(t.join().unwrap(), 7);
+            assert!(INIT.is_completed());
+            assert_eq!(RUNS.load(Relaxed), 1);
+        });
+    }
+}
