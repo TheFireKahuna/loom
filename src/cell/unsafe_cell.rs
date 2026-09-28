@@ -24,7 +24,7 @@ pub struct UnsafeCell<T: ?Sized> {
 ///
 /// Any number of [`ConstPtr`]s may concurrently access a given [`UnsafeCell`].
 /// However, if the [`UnsafeCell`] is accessed mutably (by
-/// [`UnsafeCell::with_mut`] or [`UnsafeCell::get_mut`]) while a [`ConstPtr`]
+/// [`UnsafeCell::with_mut`] or [`UnsafeCell::get_mut_ptr`]) while a [`ConstPtr`]
 /// exists, Loom will detect the concurrent mutable and immutable accesses and
 /// panic.
 ///
@@ -64,11 +64,11 @@ pub struct ConstPtr<T: ?Sized> {
 /// given [`UnsafeCell`] exists, Loom will track that the [`UnsafeCell`] is
 /// being accessed mutably.
 ///
-/// [`MutPtr`]s are produced by the [`UnsafeCell::get_mut`] method. The pointed
+/// [`MutPtr`]s are produced by the [`UnsafeCell::get_mut_ptr`] method. The pointed
 /// value can be accessed using [`MutPtr::deref`].
 ///
 /// If an [`UnsafeCell`] is accessed mutably (by [`UnsafeCell::with_mut`] or
-/// [`UnsafeCell::get_mut`]) or immutably (by [`UnsafeCell::with`] or
+/// [`UnsafeCell::get_mut_ptr`]) or immutably (by [`UnsafeCell::with`] or
 /// [`UnsafeCell::get`]) while a [`MutPtr`] to that cell exists, Loom will
 /// detect the invalid accesses and panic.
 ///
@@ -178,7 +178,7 @@ impl<T: ?Sized> UnsafeCell<T> {
     /// exists, Loom will consider the cell to be accessed immutably.
     ///
     /// This means that any mutable accesses (e.g. calls to [`with_mut`] or
-    /// [`get_mut`]) while the returned guard is live will result in a panic.
+    /// [`get_mut_ptr`]) while the returned guard is live will result in a panic.
     ///
     /// # Panics
     ///
@@ -186,7 +186,7 @@ impl<T: ?Sized> UnsafeCell<T> {
     /// model.
     ///
     /// [`with_mut`]: UnsafeCell::with_mut
-    /// [`get_mut`]: UnsafeCell::get_mut
+    /// [`get_mut_ptr`]: UnsafeCell::get_mut_ptr
     #[track_caller]
     pub fn get(&self) -> ConstPtr<T> {
         ConstPtr {
@@ -202,7 +202,7 @@ impl<T: ?Sized> UnsafeCell<T> {
     /// exists, Loom will consider the cell to be accessed mutably.
     ///
     /// This means that any concurrent mutable or immutable accesses (e.g. calls
-    /// to [`with`], [`with_mut`], [`get`], or [`get_mut`]) while the returned
+    /// to [`with`], [`with_mut`], [`get`], or [`get_mut_ptr`]) while the returned
     /// guard is live will result in a panic.
     ///
     /// # Panics
@@ -213,13 +213,31 @@ impl<T: ?Sized> UnsafeCell<T> {
     /// [`with`]: UnsafeCell::with
     /// [`with_mut`]: UnsafeCell::with_mut
     /// [`get`]: UnsafeCell::get
-    /// [`get_mut`]: UnsafeCell::get_mut
+    /// [`get_mut_ptr`]: UnsafeCell::get_mut_ptr
     #[track_caller]
-    pub fn get_mut(&self) -> MutPtr<T> {
+    pub fn get_mut_ptr(&self) -> MutPtr<T> {
         MutPtr {
             _guard: self.state.start_write(location!()),
             ptr: self.data.get(),
         }
+    }
+}
+
+impl<T: ?Sized> UnsafeCell<T> {
+    /// Returns a mutable reference to the wrapped value, as `std`'s does.
+    ///
+    /// The unique borrow is one tracked write access at this point: every
+    /// earlier access must happen before it, and nothing else can reach the
+    /// cell while the reference lives.
+    ///
+    /// # Panics
+    ///
+    /// This function will panic if the access is not valid under the Rust memory
+    /// model.
+    #[track_caller]
+    pub fn get_mut(&mut self) -> &mut T {
+        drop(self.state.start_write(location!()));
+        self.data.get_mut()
     }
 }
 
@@ -245,7 +263,7 @@ impl<T: ?Sized> ConstPtr<T> {
     ///
     ///
     /// Because the `ConstPtr` type can only be created by calling
-    /// [`UnsafeCell::get_mut`] on a valid `UnsafeCell`, we know the pointer
+    /// [`UnsafeCell::get_mut_ptr`] on a valid `UnsafeCell`, we know the pointer
     /// will never be null.
     ///
     /// Loom tracks whether the value contained in the [`UnsafeCell`] from which
@@ -412,7 +430,7 @@ impl<T: ?Sized> MutPtr<T> {
     /// safety considerations apply here.
     ///
     /// Because the `MutPtr` type can only be created by calling
-    /// [`UnsafeCell::get_mut`] on a valid `UnsafeCell`, we know the pointer
+    /// [`UnsafeCell::get_mut_ptr`] on a valid `UnsafeCell`, we know the pointer
     /// will never be null.
     ///
     /// Loom tracks whether the value contained in the [`UnsafeCell`] from which
@@ -457,7 +475,7 @@ impl<T: ?Sized> MutPtr<T> {
     /// let cell = UnsafeCell::new(1);
     ///
     /// let ptr = {
-    ///     let tracked_ptr = cell.get_mut(); // tracked mutable access begins here
+    ///     let tracked_ptr = cell.get_mut_ptr(); // tracked mutable access begins here
     ///
     ///      // move the real pointer out of the simulated pointer
     ///     tracked_ptr.with(|real_ptr| real_ptr)
@@ -488,7 +506,7 @@ impl<T: ?Sized> MutPtr<T> {
     /// let my_struct = UnsafeCell::new(MyStruct { foo: 1, bar: 1});
     ///
     /// fn get_bar(cell: &UnsafeCell<MyStruct>) -> *mut usize {
-    ///     let tracked_ptr = cell.get_mut(); // tracked mutable access begins here
+    ///     let tracked_ptr = cell.get_mut_ptr(); // tracked mutable access begins here
     ///
     ///     tracked_ptr.with(|ptr| unsafe {
     ///         &mut (*ptr).bar as *mut usize
@@ -517,7 +535,7 @@ impl<T: ?Sized> MutPtr<T> {
     ///
     /// let cell = UnsafeCell::new(1);
     ///
-    /// let ptr = cell.get_mut();
+    /// let ptr = cell.get_mut_ptr();
     /// let value_in_cell = ptr.with(|ptr| unsafe {
     ///     // This is fine, because `ptr::write` does not retain ownership of
     ///     // the pointer after when the function call returns.
@@ -536,7 +554,7 @@ impl<T: ?Sized> MutPtr<T> {
     /// static SOME_IMPORTANT_POINTER: AtomicPtr<usize> = AtomicPtr::new(std::ptr::null_mut());
     ///
     /// fn mess_with_important_pointer(cell: &UnsafeCell<usize>) {
-    ///     cell.get_mut() // mutable access begins here
+    ///     cell.get_mut_ptr() // mutable access begins here
     ///        .with(|ptr| {
     ///             SOME_IMPORTANT_POINTER.store(ptr, Ordering::SeqCst);
     ///         })

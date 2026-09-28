@@ -50,6 +50,12 @@ impl<T> Cell<T> {
             .with_mut(|ptr| unsafe { core::mem::replace(&mut *ptr, val) })
     }
 
+    /// Returns a mutable reference to the contained value, as `std`'s does.
+    #[track_caller]
+    pub fn get_mut(&mut self) -> &mut T {
+        self.cell.get_mut()
+    }
+
     /// Returns a copy of the contained value.
     #[track_caller]
     pub fn get(&self) -> T

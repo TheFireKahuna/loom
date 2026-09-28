@@ -333,3 +333,16 @@ fn unsafe_cell_access_after_sync() {
         }
     });
 }
+
+#[test]
+fn get_mut_is_a_tracked_exclusive_access() {
+    loom::model(|| {
+        let mut c = loom::cell::UnsafeCell::new(1);
+        *c.get_mut() += 1;
+        assert_eq!(c.with(|p| unsafe { *p }), 2);
+
+        let mut cell = loom::cell::Cell::new(5);
+        *cell.get_mut() = 6;
+        assert_eq!(cell.get(), 6);
+    });
+}
