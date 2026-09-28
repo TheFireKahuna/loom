@@ -47,6 +47,9 @@ pub(crate) use self::mutex::Mutex;
 mod path;
 pub(crate) use self::path::Path;
 
+mod registration;
+pub(crate) use self::registration::{Deferred, Registration};
+
 mod rwlock;
 pub(crate) use self::rwlock::RwLock;
 

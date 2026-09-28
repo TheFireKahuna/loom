@@ -43,6 +43,9 @@ pub(crate) struct Execution {
     /// cell. Cleared per iteration alongside every other object ref.
     pub(super) deferred_atomics: FxHashMap<u64, object::Ref<super::atomic::State>>,
 
+    /// The same for `const`-built locks and condvars (`rt::Registration`).
+    pub(super) deferred_objects: FxHashMap<u64, super::Deferred>,
+
     /// The address space materialized cells live in: committed ranges, the
     /// cells registered in them keyed by address (their identity, since such a
     /// cell carries no identity word and cannot move), and outstanding resets.
@@ -136,6 +139,7 @@ impl Execution {
             raw_allocations: FxHashMap::default(),
             arc_objs: FxHashMap::default(),
             deferred_atomics: FxHashMap::default(),
+            deferred_objects: FxHashMap::default(),
             vm: super::atomic::Vm::default(),
             check_committed_leaks: false,
             dpor_update: None,
@@ -198,6 +202,7 @@ impl Execution {
         // iteration; their identities persist (they live in the cells), their
         // registrations do not.
         self.deferred_atomics.clear();
+        self.deferred_objects.clear();
         self.vm.clear();
         self.threads.clear(id);
         self.sleep.clear();

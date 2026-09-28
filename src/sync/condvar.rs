@@ -6,7 +6,7 @@ use std::time::Duration;
 /// Mock implementation of `std::sync::Condvar`.
 #[derive(Debug)]
 pub struct Condvar {
-    object: rt::Condvar,
+    object: rt::Registration<rt::Condvar>,
 }
 
 /// A type indicating whether a timed wait on a condition variable returned due
@@ -16,9 +16,12 @@ pub struct WaitTimeoutResult(bool);
 
 impl Condvar {
     /// Creates a new condition variable which is ready to be waited on and notified.
-    pub fn new() -> Condvar {
+    ///
+    /// `const`, as `std`'s is; see `rt::Registration` for how the two contexts
+    /// register.
+    pub const fn new() -> Condvar {
         Condvar {
-            object: rt::Condvar::new(),
+            object: rt::Registration::new(),
         }
     }
 
@@ -35,7 +38,7 @@ impl Condvar {
         guard.unborrow();
 
         // Wait until notified
-        self.object.wait(guard.rt(), false, location!());
+        self.object.get().wait(&guard.rt(), false, location!());
 
         // Borrow the mutex guarded data again
         guard.reborrow();
@@ -64,7 +67,7 @@ impl Condvar {
         guard.unborrow();
 
         // Wait until notified or "timed out"
-        let timed_out = self.object.wait(guard.rt(), true, location!());
+        let timed_out = self.object.get().wait(&guard.rt(), true, location!());
 
         // Borrow the mutex guarded data again
         guard.reborrow();
@@ -125,13 +128,13 @@ impl Condvar {
     /// Wakes up one blocked thread on this condvar.
     #[track_caller]
     pub fn notify_one(&self) {
-        self.object.notify_one(location!());
+        self.object.get().notify_one(location!());
     }
 
     /// Wakes up all blocked threads on this condvar.
     #[track_caller]
     pub fn notify_all(&self) {
-        self.object.notify_all(location!());
+        self.object.get().notify_all(location!());
     }
 }
 

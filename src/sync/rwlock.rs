@@ -7,7 +7,7 @@ use std::sync::{LockResult, TryLockError, TryLockResult};
 /// Mock implementation of `std::sync::RwLock`
 #[derive(Debug)]
 pub struct RwLock<T: ?Sized> {
-    object: rt::RwLock,
+    object: rt::Registration<rt::RwLock>,
     data: std::sync::RwLock<T>,
 }
 
@@ -26,11 +26,12 @@ pub struct RwLockWriteGuard<'a, T: ?Sized> {
 }
 
 impl<T> RwLock<T> {
-    /// Creates a new rwlock in an unlocked state ready for use.
-    pub fn new(data: T) -> RwLock<T> {
+    /// Creates a new rwlock in an unlocked state ready for use. `const`, as
+    /// `std`'s is; see `rt::Registration` for how the two contexts register.
+    pub const fn new(data: T) -> RwLock<T> {
         RwLock {
             data: std::sync::RwLock::new(data),
-            object: rt::RwLock::new(),
+            object: rt::Registration::new(),
         }
     }
 
@@ -51,7 +52,7 @@ impl<T: ?Sized> RwLock<T> {
     /// or writers will acquire the lock first.
     #[track_caller]
     pub fn read(&self) -> LockResult<RwLockReadGuard<'_, T>> {
-        self.object.acquire_read_lock(location!());
+        self.object.get().acquire_read_lock(location!());
 
         Ok(RwLockReadGuard {
             lock: self,
@@ -68,7 +69,7 @@ impl<T: ?Sized> RwLock<T> {
     /// This function does not block.
     #[track_caller]
     pub fn try_read(&self) -> TryLockResult<RwLockReadGuard<'_, T>> {
-        if self.object.try_acquire_read_lock(location!()) {
+        if self.object.get().try_acquire_read_lock(location!()) {
             Ok(RwLockReadGuard {
                 lock: self,
                 data: Some(self.data.try_read().expect("loom::RwLock state corrupt")),
@@ -85,7 +86,7 @@ impl<T: ?Sized> RwLock<T> {
     /// currently have access to the lock.
     #[track_caller]
     pub fn write(&self) -> LockResult<RwLockWriteGuard<'_, T>> {
-        self.object.acquire_write_lock(location!());
+        self.object.get().acquire_write_lock(location!());
 
         Ok(RwLockWriteGuard {
             lock: self,
@@ -102,7 +103,7 @@ impl<T: ?Sized> RwLock<T> {
     /// This function does not block.
     #[track_caller]
     pub fn try_write(&self) -> TryLockResult<RwLockWriteGuard<'_, T>> {
-        if self.object.try_acquire_write_lock(location!()) {
+        if self.object.get().try_acquire_write_lock(location!()) {
             Ok(RwLockWriteGuard {
                 lock: self,
                 data: Some(self.data.try_write().expect("loom::RwLock state corrupt")),
@@ -150,7 +151,7 @@ impl<'a, T: ?Sized> ops::Deref for RwLockReadGuard<'a, T> {
 impl<'a, T: ?Sized + 'a> Drop for RwLockReadGuard<'a, T> {
     fn drop(&mut self) {
         self.data = None;
-        self.lock.object.release_read_lock()
+        self.lock.object.get().release_read_lock()
     }
 }
 
@@ -177,6 +178,6 @@ impl<'a, T: ?Sized> ops::DerefMut for RwLockWriteGuard<'a, T> {
 impl<'a, T: ?Sized + 'a> Drop for RwLockWriteGuard<'a, T> {
     fn drop(&mut self) {
         self.data = None;
-        self.lock.object.release_write_lock()
+        self.lock.object.get().release_write_lock()
     }
 }

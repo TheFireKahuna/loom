@@ -6,7 +6,7 @@ use std::sync::{LockResult, TryLockError, TryLockResult};
 /// Mock implementation of `std::sync::Mutex`.
 #[derive(Debug)]
 pub struct Mutex<T: ?Sized> {
-    object: rt::Mutex,
+    object: rt::Registration<rt::Mutex>,
     data: std::sync::Mutex<T>,
 }
 
@@ -18,11 +18,12 @@ pub struct MutexGuard<'a, T: ?Sized> {
 }
 
 impl<T> Mutex<T> {
-    /// Creates a new mutex in an unlocked state ready for use.
-    pub fn new(data: T) -> Mutex<T> {
+    /// Creates a new mutex in an unlocked state ready for use. `const`, as
+    /// `std`'s is; see `rt::Registration` for how the two contexts register.
+    pub const fn new(data: T) -> Mutex<T> {
         Mutex {
             data: std::sync::Mutex::new(data),
-            object: rt::Mutex::new(true),
+            object: rt::Registration::new(),
         }
     }
 
@@ -36,7 +37,7 @@ impl<T: ?Sized> Mutex<T> {
     /// Acquires a mutex, blocking the current thread until it is able to do so.
     #[track_caller]
     pub fn lock(&self) -> LockResult<MutexGuard<'_, T>> {
-        self.object.acquire_lock(location!());
+        self.object.get().acquire_lock(location!());
 
         Ok(MutexGuard {
             lock: self,
@@ -53,7 +54,7 @@ impl<T: ?Sized> Mutex<T> {
     /// This function does not block.
     #[track_caller]
     pub fn try_lock(&self) -> TryLockResult<MutexGuard<'_, T>> {
-        if self.object.try_acquire_lock(location!()) {
+        if self.object.get().try_acquire_lock(location!()) {
             Ok(MutexGuard {
                 lock: self,
                 data: Some(self.data.lock().unwrap()),
@@ -93,8 +94,8 @@ impl<'a, T: ?Sized + 'a> MutexGuard<'a, T> {
         self.data = Some(self.lock.data.lock().unwrap());
     }
 
-    pub(super) fn rt(&self) -> &rt::Mutex {
-        &self.lock.object
+    pub(super) fn rt(&self) -> rt::Mutex {
+        self.lock.object.get()
     }
 }
 
@@ -115,6 +116,6 @@ impl<'a, T: ?Sized> ops::DerefMut for MutexGuard<'a, T> {
 impl<'a, T: ?Sized + 'a> Drop for MutexGuard<'a, T> {
     fn drop(&mut self) {
         self.data = None;
-        self.lock.object.release_lock();
+        self.lock.object.get().release_lock();
     }
 }

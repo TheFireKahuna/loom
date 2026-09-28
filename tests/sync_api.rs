@@ -211,3 +211,28 @@ fn barrier_is_reusable_and_trivial_barriers_lead() {
         assert!(mine[1] ^ theirs[1]);
     });
 }
+
+mod const_locks {
+    use loom::sync::{Condvar, Mutex, RwLock};
+    use loom::thread;
+
+    static M: Mutex<()> = Mutex::new(());
+    static C: Condvar = Condvar::new();
+    static R: RwLock<u8> = RwLock::new(0);
+
+    // `static` locks register afresh each execution: a waiter left from one
+    // execution never haunts the next, and contention is still modelled.
+    #[test]
+    fn static_locks_are_fresh_each_execution() {
+        loom::model(|| {
+            let t = thread::spawn(|| {
+                *R.write().unwrap() += 1;
+                let _g = M.lock().unwrap();
+                C.notify_one();
+            });
+            let _ = *R.read().unwrap();
+            drop(M.lock().unwrap());
+            t.join().unwrap();
+        });
+    }
+}
