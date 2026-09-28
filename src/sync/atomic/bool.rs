@@ -24,6 +24,13 @@ impl AtomicBool {
         AtomicBool(Atomic::const_new(v as u128))
     }
 
+    /// Returns a mutable reference to the underlying `bool`, as `std`'s does.
+    /// The borrow is an exclusive access the model checks like `with_mut`'s.
+    #[track_caller]
+    pub fn get_mut(&mut self) -> &mut bool {
+        self.0.get_mut()
+    }
+
     /// Load the value without any synchronization.
     ///
     /// # Safety

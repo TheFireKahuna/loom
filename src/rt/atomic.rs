@@ -268,6 +268,11 @@ pub struct Atomic<T> {
     /// from construction, and for a deferred cell built with no caller.
     created: Option<&'static std::panic::Location<'static>>,
 
+    /// A [`Atomic::get_mut`] borrow wrote its value into `init`'s bytes, not
+    /// yet into the model. The cell's next access folds it in (`Resolve`)
+    /// before anything reads the store the borrow created.
+    lent: std::sync::atomic::AtomicBool,
+
     _p: PhantomData<fn() -> T>,
 }
 
@@ -292,6 +297,13 @@ pub(super) trait Resolve {
     /// perturb the execution looks the cell up through this.
     fn registered(&self, execution: &Execution) -> Result<object::Ref<State>, u128>;
 
+    /// The value a `get_mut` borrow left for the cell's next access to fold
+    /// in, if one is pending.
+    #[inline]
+    fn lent(&self) -> Option<u128> {
+        None
+    }
+
     /// Resolve for the access about to run, settling any page state it depends
     /// on, with nothing between it and the access; `write` marks an access that
     /// certainly writes. `unscheduled` is `None` for an access just past its
@@ -306,7 +318,20 @@ pub(super) trait Resolve {
 impl<T: Numeric> Resolve for Atomic<T> {
     #[inline]
     fn resolve(&self) -> object::Ref<State> {
-        self.state()
+        let state = self.state();
+        if let Some(value) = self.lent() {
+            std::hint::cold_path();
+            self.lent.store(false, std::sync::atomic::Ordering::Relaxed);
+            rt::execution(|execution| state.get_mut(&mut execution.objects).fill_exclusive(value));
+        }
+        state
+    }
+
+    #[inline]
+    fn lent(&self) -> Option<u128> {
+        self.lent
+            .load(std::sync::atomic::Ordering::Relaxed)
+            .then(|| self.shadow().into_u128())
     }
 
     fn registered(&self, execution: &Execution) -> Result<object::Ref<State>, u128> {
@@ -2404,6 +2429,7 @@ impl<T: Numeric> Atomic<T> {
                 cell_id: std::sync::atomic::AtomicU64::new(0),
                 init: 0,
                 created: None,
+                lent: std::sync::atomic::AtomicBool::new(false),
                 _p: PhantomData,
             }
         })
@@ -2443,8 +2469,46 @@ impl<T: Numeric> Atomic<T> {
             cell_id: std::sync::atomic::AtomicU64::new(0),
             init,
             created,
+            lent: std::sync::atomic::AtomicBool::new(false),
             _p: PhantomData,
         }
+    }
+
+    /// `std`'s `get_mut`: the value as a place the caller may write.
+    ///
+    /// Modelled as `with_mut` split at the borrow: the exclusive read and the
+    /// new mo-last store happen here, attributed to this thread at this point,
+    /// and the value the caller leaves is filled into that store by the cell's
+    /// next access. Nothing can read the store in between — the borrow is
+    /// exclusive — so the fill is indistinguishable from writing it here.
+    pub(crate) fn get_mut(&mut self, location: Location) -> &mut T {
+        const { assert!(size_of::<T>() <= size_of::<u128>() && align_of::<T>() <= align_of::<u128>()) };
+        let state_ref = self.resolve_for_access(true, Some(location));
+        let value = super::execution(|execution| {
+            let state = state_ref.get_mut(&mut execution.objects);
+            state.unsync_mut_locations.track(location, &execution.threads);
+            state.track_unsync_mut(&execution.threads);
+            let value = state.exclusive_read(&mut execution.path);
+            state.write_exclusive(&mut execution.threads, value);
+            value
+        });
+        *self.lent.get_mut() = true;
+        // `init` is unread once the cell is registered, which `resolve` made
+        // it; its bytes hold the borrowed `T` until the fill.
+        let place = std::ptr::from_mut(&mut self.init).cast::<T>();
+        // SAFETY: `u128` is at least `T`'s size and alignment (`Numeric`), and
+        // `place` is derived from a unique borrow of `init`.
+        unsafe {
+            place.write(T::from_u128(value));
+            &mut *place
+        }
+    }
+
+    /// The `T` a `get_mut` borrow left in `init`'s bytes.
+    fn shadow(&self) -> T {
+        // SAFETY: only read while `lent` is set, after `get_mut` wrote a `T`
+        // there; `u128` is at least `T`'s size and alignment.
+        unsafe { std::ptr::from_ref(&self.init).cast::<T>().read() }
     }
 
     /// This cell's registration in the *current* execution, registering it
@@ -2733,6 +2797,9 @@ impl<C: Resolve + ?Sized> ModelOps for C {
     }
 
     fn peek(&self) -> Option<u128> {
+        if let Some(value) = self.lent() {
+            return Some(value);
+        }
         rt::Scheduler::try_with_execution(|execution| match self.registered(execution) {
             Ok(state) => state.get(&execution.objects).newest_value(),
             Err(unregistered) => unregistered,
@@ -3314,6 +3381,16 @@ impl State {
         }
 
         value
+    }
+
+    /// Give the cell's newest op — the `write_exclusive` of a `get_mut` borrow,
+    /// unread since — the value the borrow left.
+    fn fill_exclusive(&mut self, value: u128) {
+        let op_id = self.op_clock;
+        for region in &mut self.regions {
+            let slot = region.slot_of_op(op_id).expect("[loom internal bug] lent store evicted");
+            region.stores[slot].value = value;
+        }
     }
 
     /// A non-atomic write by a thread every store happens-before: one new

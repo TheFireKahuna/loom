@@ -92,6 +92,14 @@ where
     }
 }
 
+impl<T: rt::Numeric> Atomic<T> {
+    /// `std`'s `get_mut`; see `rt::Atomic::get_mut` for how it is modelled.
+    #[track_caller]
+    pub(crate) fn get_mut(&mut self) -> &mut T {
+        self.state.get_mut(location!())
+    }
+}
+
 impl<T> Atomic<*mut T> {
     /// The `const` arm of `AtomicPtr::new`: only a null pointer exists in
     /// `const` evaluation, and it is the one value the record can hold without

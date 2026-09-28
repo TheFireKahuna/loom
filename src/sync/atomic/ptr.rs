@@ -38,6 +38,14 @@ macro_rules! atomic_ptr {
             pub const fn const_null() -> $name<T> {
                 $name(Atomic::const_new(0))
             }
+
+            /// Returns a mutable reference to the underlying pointer, as `std`'s
+            /// does. The borrow is an exclusive access the model checks like
+            /// [`with_mut`](Self::with_mut)'s.
+            #[track_caller]
+            pub fn get_mut(&mut self) -> &mut *mut T {
+                self.0.get_mut()
+            }
         }
 
         impl<T> Default for $name<T> {

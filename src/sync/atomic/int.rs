@@ -38,6 +38,14 @@ macro_rules! atomic_int {
             pub const fn const_new(v: $int_type) -> Self {
                 Self(Atomic::const_new(v as u128))
             }
+
+            /// Returns a mutable reference to the underlying integer, as `std`'s
+            /// does. The borrow is an exclusive access the model checks like
+            /// [`with_mut`](Self::with_mut)'s.
+            #[track_caller]
+            pub fn get_mut(&mut self) -> &mut $int_type {
+                self.0.get_mut()
+            }
         }
 
         impl Default for $name {
