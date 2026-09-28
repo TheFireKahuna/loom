@@ -666,3 +666,47 @@ fn sc_store_follows_what_earlier_sc_loads_read() {
         "an SC store landed before a store an earlier SC load read: {out:?}"
     );
 }
+
+/// Loads that fix modification order commute in the search, and must lose
+/// nothing by it. `W1` and `W2` race; each reader reads twice, and its second
+/// read fixes the order of the two stores. Every pair of reader histories that
+/// one of the two orders admits is reachable; the pair needing both is not.
+#[test]
+fn order_fixing_loads_lose_no_history() {
+    let out = outcomes(|| {
+        let x = Arc::new(AtomicUsize::new(0));
+        let ws: Vec<_> = [1, 2]
+            .into_iter()
+            .map(|v| {
+                let x = x.clone();
+                thread::spawn(move || x.store(v, Relaxed))
+            })
+            .collect();
+        let r = {
+            let x = x.clone();
+            thread::spawn(move || (x.load(Relaxed), x.load(Relaxed)))
+        };
+        let own = (x.load(Relaxed), x.load(Relaxed));
+        for w in ws {
+            w.join().unwrap();
+        }
+        (r.join().unwrap(), own)
+    });
+
+    // A history is coherent with `mo` when it never reads backwards in it.
+    let coherent = |mo: [usize; 3], (a, b): (usize, usize)| {
+        let at = |v| mo.iter().position(|&m| m == v).unwrap();
+        at(a) <= at(b)
+    };
+    let mut expected = HashSet::new();
+    for mo in [[0, 1, 2], [0, 2, 1]] {
+        for h1 in [(0, 0), (0, 1), (0, 2), (1, 1), (1, 2), (2, 1), (2, 2)] {
+            for h2 in [(0, 0), (0, 1), (0, 2), (1, 1), (1, 2), (2, 1), (2, 2)] {
+                if coherent(mo, h1) && coherent(mo, h2) {
+                    expected.insert((h1, h2));
+                }
+            }
+        }
+    }
+    assert_eq!(out, expected);
+}

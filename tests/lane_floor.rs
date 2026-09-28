@@ -423,3 +423,78 @@ fn seq_cst_store_orders_a_later_push_for_a_reader_that_happens_after_it() {
     assert_target(&seen, (1, 0), !X86);
     assert!(seen.contains(&(1, 1)) && seen.contains(&(0, 0)), "{seen:?}");
 }
+
+/// A peer stores lane A, then lane B at `b_order`; the active thread reads the
+/// whole cell in one relaxed load: `(b, a)`.
+fn wide_read_of_ordered_lane_stores(b_order: Ordering) -> BTreeSet<(u64, u64)> {
+    wide_access_of_ordered_lane_stores(b_order, false, |x| x.load(Relaxed))
+}
+
+/// As above, the peer optionally fencing `Release` between its stores, and the
+/// active thread reading through `read`.
+fn wide_access_of_ordered_lane_stores(
+    b_order: Ordering,
+    fence_between: bool,
+    read: fn(&AtomicU128) -> u128,
+) -> BTreeSet<(u64, u64)> {
+    let seen: Outcomes = Default::default();
+    let seen_ = seen.clone();
+    loom::model(move || {
+        let x = Arc::new(AtomicU128::new(0));
+        x.store_masked(LANE_A, 0, Relaxed);
+
+        let w = {
+            let x = x.clone();
+            thread::spawn(move || {
+                x.lane_u64(0).store(1, Relaxed);
+                if fence_between {
+                    fence(Release);
+                }
+                x.lane_u64(8).store(1, b_order);
+            })
+        };
+        let v = read(&x);
+        w.join().unwrap();
+        seen_
+            .lock()
+            .unwrap()
+            .insert(((v >> 64) as u64, v as u64));
+    });
+    let seen = seen.lock().unwrap().clone();
+    seen
+}
+
+// One single-copy-atomic read of both lanes cannot take lane B's store and
+// miss the lane-A store ordered before it: `W_A →bob W_B →rfe R →fre W_A` is
+// an `ob` cycle in AArch64 (`STR; STLR` against one `LDP`/`LDR Q`), and x86
+// commits stores in order to a load that reads both.
+#[test]
+fn wide_read_never_sees_a_release_lane_store_without_the_earlier_one() {
+    let seen = wide_read_of_ordered_lane_stores(Release);
+    assert_target(&seen, TRAVELLED, false);
+    assert!(seen.contains(&(0, 0)) && seen.contains(&(1, 1)), "{seen:?}");
+}
+
+// Without the release, AArch64 lets the two stores commit out of order
+// (`STR; STR` against one wide read — Sometimes); x86 still commits in order.
+#[test]
+fn wide_read_sees_relaxed_lane_stores_reordered_only_on_aarch64() {
+    let seen = wide_read_of_ordered_lane_stores(Relaxed);
+    assert_target(&seen, TRAVELLED, !X86);
+}
+
+// `fence(Release)` (`DMB ISH`) orders the earlier store as `STLR` would.
+#[test]
+fn wide_read_never_sees_a_fenced_lane_store_without_the_earlier_one() {
+    let seen = wide_access_of_ordered_lane_stores(Relaxed, true, |x| x.load(Relaxed));
+    assert_target(&seen, TRAVELLED, false);
+}
+
+// A wide RMW's read is the same single-copy-atomic event (`CASP`,
+// `cmpxchg16b`).
+#[test]
+fn wide_rmw_never_sees_a_release_lane_store_without_the_earlier_one() {
+    let seen = wide_access_of_ordered_lane_stores(Release, false, |x| x.fetch_add(0, Relaxed));
+    assert_target(&seen, TRAVELLED, false);
+    assert!(seen.contains(&(0, 0)) && seen.contains(&(1, 1)), "{seen:?}");
+}

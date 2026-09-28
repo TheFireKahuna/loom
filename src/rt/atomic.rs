@@ -1379,9 +1379,16 @@ pub(super) struct State {
 /// may have taken it by store forwarding, which AArch64 lets split a
 /// single-copy-atomic snapshot: missing X beside it constrains nothing, and
 /// only X seen elsewhere puts X's pin before it.
+///
+/// Reading a store `S` also sees every store of another spanned region the
+/// target orders before `S` (`store_ordered_before`): the read is one event,
+/// so taking `S` while missing such an `F` closes `F → S →rf R →fr F`. Each
+/// such `F`'s op is placed like a whole-cell op's, and taking `S` fixes it
+/// seen (`requires`).
 #[derive(Clone, Debug, Default)]
 struct Snapshot {
-    /// The ops pinned in two or more of the read's regions, sorted.
+    /// The ops pinned in two or more of the read's regions, and the ops of
+    /// every store some `requires` entry names, sorted.
     ops: SmallVec<[u64; 8]>,
 
     /// Per op, whether the read sees it, once decided.
@@ -1392,6 +1399,9 @@ struct Snapshot {
 
     /// Chosen stores unordered with an op's pin.
     open: SmallVec<[OpenPin; 8]>,
+
+    /// `(region, slot, op)`: taking that slot of that region sees op `op`.
+    requires: SmallVec<[(u8, u8, u8); 4]>,
 }
 
 /// A region's chosen store left unordered with a whole-cell op's pin.
@@ -1420,9 +1430,41 @@ impl Snapshot {
         for run in all.chunk_by(|a, b| a == b) {
             if run.len() > 1 {
                 snapshot.ops.push(run[0]);
-                snapshot.seen.push(None);
             }
         }
+
+        // `(region, slot, op)` before `op` is an index into `ops`.
+        let mut requires: SmallVec<[(u8, u8, u64); 4]> = SmallVec::new();
+        for &rj in covered {
+            for s in &regions[rj].stores {
+                for &ri in covered {
+                    if ri == rj {
+                        continue;
+                    }
+                    let region = &regions[ri];
+                    let every = Slots::MAX >> (Slots::BITS as usize - region.stores.len());
+                    for f in &region.stores {
+                        // A store no other is mo-before is seen by any read.
+                        if f.op_id != s.op_id
+                            && (f.after | bit(f.slot as usize)) != every
+                            && store_ordered_before(f, s)
+                        {
+                            requires.push((rj as u8, s.slot, f.op_id));
+                        }
+                    }
+                }
+            }
+        }
+        if !requires.is_empty() {
+            snapshot.ops.extend(requires.iter().map(|r| r.2));
+            snapshot.ops.sort_unstable();
+            snapshot.ops.dedup();
+            snapshot.requires = requires
+                .iter()
+                .map(|&(r, c, op)| (r, c, snapshot.ops.binary_search(&op).unwrap() as u8))
+                .collect();
+        }
+        snapshot.seen.resize(snapshot.ops.len(), None);
         snapshot
     }
 
@@ -1515,6 +1557,16 @@ impl Snapshot {
             }
         }
 
+        // A forwarded store was never ordered into memory behind anything.
+        if !forwarded {
+            for k in 0..self.requires.len() {
+                let (r, slot, op) = self.requires[k];
+                if r as usize == ri && slot as usize == c && !self.fix(op as usize, true) {
+                    return false;
+                }
+            }
+        }
+
         self.propagate()
     }
 
@@ -1585,6 +1637,9 @@ struct LaneFloor {
     rmw_is_full_barrier: bool,
     /// A `SeqCst` store orders itself before every later access.
     seq_cst_store_is_full_barrier: bool,
+    /// A thread's stores reach memory in program order, behind every store it
+    /// read before them.
+    stores_in_order: bool,
 }
 
 /// The lane floor of the target loom is built for — the target the model
@@ -1598,11 +1653,13 @@ const LANE_FLOOR: LaneFloor = cfg_select! {
         loads_in_order: true,
         rmw_is_full_barrier: true,
         seq_cst_store_is_full_barrier: true,
+        stores_in_order: true,
     },
     _ => LaneFloor {
         loads_in_order: false,
         rmw_is_full_barrier: false,
         seq_cst_store_is_full_barrier: false,
+        stores_in_order: false,
     },
 };
 
@@ -1619,6 +1676,15 @@ fn ordered_after(g: &Store, threads: &thread::Set) -> Option<u16> {
     let rmw = if LANE_FLOOR.rmw_is_full_barrier { t.rmw_version } else { 0 };
     let barrier = t.sc_fence_version.max(rmw);
     (barrier > g.tick()).then_some(barrier)
+}
+
+/// Whether the target orders store `f` before store `s` for a read that takes
+/// both in one single-copy-atomic event: `f` was seen within `s`'s release
+/// view (AArch64 `bob` and cumulativity: `STLR`, or a `DMB` before `STR`), or,
+/// where stores reach memory in order, `s`'s writer had seen `f` before `s`.
+fn store_ordered_before(f: &Store, s: &Store) -> bool {
+    f.first_seen.is_seen_in(s.sync.released_view())
+        || (LANE_FLOOR.stores_in_order && f.first_seen.0[s.creator] < s.tick())
 }
 
 #[derive(Clone)]
