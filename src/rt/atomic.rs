@@ -2414,6 +2414,7 @@ impl<C: Resolve + ?Sized> ModelOps for C {
     /// of the lanes' readable sets — independent per-lane staleness — while the
     /// op stays one linearization point.
     fn load_masked(&self, location: Location, mask: u128, ordering: Ordering) -> u128 {
+        check_load_ordering(ordering);
         let state_ref = self.resolve();
         ensure_partition(state_ref, mask);
         branch(self, state_ref, Action::Load(mask), is_seq_cst(ordering), location);
@@ -2468,6 +2469,7 @@ impl<C: Resolve + ?Sized> ModelOps for C {
     /// on this region. Reading only the lane's own regions is what preserves
     /// the pruning (2) grants (module docs, "Sub-word sub-locations").
     fn load_coherent_lane(&self, location: Location, mask: u128, ordering: Ordering) -> u128 {
+        check_load_ordering(ordering);
         let state_ref = self.resolve();
         ensure_partition(state_ref, mask);
         branch(self, state_ref, Action::Load(mask), is_seq_cst(ordering), location);
@@ -2496,6 +2498,7 @@ impl<C: Resolve + ?Sized> ModelOps for C {
     /// full store passes `FULL_MASK` and writes every region as one event
     /// (one shared SC position).
     fn store_masked(&self, location: Location, mask: u128, val: u128, ordering: Ordering) {
+        check_store_ordering(ordering);
         let state_ref = self.resolve();
         ensure_partition(state_ref, mask);
         branch(self, state_ref, Action::Store(mask), is_seq_cst(ordering), location);
@@ -2699,6 +2702,9 @@ where
         failure,
     } = op;
 
+    if expected.is_some() {
+        check_failure_ordering(failure);
+    }
     assert!(
         write_mask & !read_mask == 0,
         "rmw_preserving: write mask {:#034x} is not contained in read mask {:#034x} \
@@ -5286,6 +5292,37 @@ fn weak_cas_spurs(bits: u32) -> bool {
 
     let width = bits.max(8).next_power_of_two().trailing_zeros() as usize - 3;
     forced || TARGET_SPURS[width.min(4)]
+}
+
+// The orderings core rejects, rejected with core's messages: a model run must
+// not pass code that panics on every real execution.
+#[track_caller]
+fn check_load_ordering(order: Ordering) {
+    match order {
+        Ordering::Release => panic!("there is no such thing as a release load"),
+        Ordering::AcqRel => panic!("there is no such thing as an acquire-release load"),
+        _ => {}
+    }
+}
+
+#[track_caller]
+fn check_store_ordering(order: Ordering) {
+    match order {
+        Ordering::Acquire => panic!("there is no such thing as an acquire store"),
+        Ordering::AcqRel => panic!("there is no such thing as an acquire-release store"),
+        _ => {}
+    }
+}
+
+#[track_caller]
+fn check_failure_ordering(order: Ordering) {
+    match order {
+        Ordering::Release => panic!("there is no such thing as a release failure ordering"),
+        Ordering::AcqRel => {
+            panic!("there is no such thing as an acquire-release failure ordering")
+        }
+        _ => {}
+    }
 }
 
 fn is_seq_cst(order: Ordering) -> bool {
