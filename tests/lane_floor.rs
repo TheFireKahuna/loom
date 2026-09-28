@@ -389,3 +389,37 @@ fn seq_cst_store_then_presence_load_orders_a_later_push_only_on_x86() {
     assert_target(&seen, (1, 0), !X86);
     assert!(seen.contains(&(1, 1)) && seen.contains(&(0, 0)), "{seen:?}");
 }
+
+// The dual with the presence load on another thread, one that happens-after
+// the store's barrier (here through spawn, as the futex's two-notifier rig
+// does): on x86 the load still follows the `xchg` in memory order, so the
+// later-landing push reads the store.
+#[test]
+fn seq_cst_store_orders_a_later_push_for_a_reader_that_happens_after_it() {
+    const V: u128 = u64::MAX as u128;
+    let seen: Outcomes = Default::default();
+    let seen_ = seen.clone();
+    loom::model(move || {
+        let x = Arc::new(AtomicU128::new(0));
+        x.store_masked(V, 0, Relaxed);
+
+        let waiter = {
+            let x = x.clone();
+            thread::spawn(move || {
+                let snap = x.load(Acquire);
+                snap & V == 0 && x.compare_exchange(snap, snap | (1 << 64), AcqRel, Relaxed).is_ok()
+            })
+        };
+        x.lane_u64(0).store(1, SeqCst);
+        let reader = {
+            let x = x.clone();
+            thread::spawn(move || x.lane_u64(8).load(Acquire))
+        };
+        let s = reader.join().unwrap();
+        let pushed = waiter.join().unwrap();
+        seen_.lock().unwrap().insert((u64::from(pushed), s));
+    });
+    let seen = seen.lock().unwrap().clone();
+    assert_target(&seen, (1, 0), !X86);
+    assert!(seen.contains(&(1, 1)) && seen.contains(&(0, 0)), "{seen:?}");
+}

@@ -1784,9 +1784,9 @@ struct Region {
     readers: u32,
     acquiring_readers: u32,
 
-    /// Per thread, its own clock version at its latest read of these bits and
-    /// the `Store::id` it read; `(0, _)` for none (`State::rmw_passes_barrier`).
-    last_read: [(u16, u16); MAX_THREADS],
+    /// Per thread, its causality at its latest read of these bits and the
+    /// `Store::id` it read; all-zero for none (`State::rmw_passes_barrier`).
+    last_read: [(VersionVec, u16); MAX_THREADS],
 }
 
 #[derive(Debug, Copy, Clone, PartialEq)]
@@ -3637,8 +3637,9 @@ impl State {
         Some((next, next_view))
     }
 
-    /// The lane floor's dual: a successful RMW may not write before a peer's store `g` when the
-    /// peer, ordered after `g` (`LANE_FLOOR`), read a region this RMW writes at or before its read.
+    /// The lane floor's dual: a successful RMW may not write before a peer's store `g` when a
+    /// read ordered after `g`'s barrier (`LANE_FLOOR`) — by `g`'s creator, or by any thread that
+    /// happens-after that barrier — read a region this RMW writes at or before its read.
     fn rmw_passes_barrier(&self, ri: usize, ci: usize, acc: &RmwAcc, threads: &thread::Set) -> bool {
         acc.chosen.iter().any(|&(rj, cj)| {
             self.passes_barrier(ri, ci, rj, cj, acc.writes, threads)
@@ -3669,11 +3670,15 @@ impl State {
             let Some(barrier) = ordered_after(g, threads) else {
                 return false;
             };
-            let (at, id) = wr.last_read[g.creator];
-            at > barrier
-                && wr
-                    .slot_of_store(id)
-                    .is_some_and(|s| s == r || wr.stores[r].before & bit(s) != 0)
+            wr.last_read.iter().enumerate().any(|(t, (view, id))| {
+                let lane = view.lane(g.creator);
+                let after = if t == g.creator { lane > barrier } else { lane >= barrier };
+                t != me
+                    && after
+                    && wr
+                        .slot_of_store(*id)
+                        .is_some_and(|s| s == r || wr.stores[r].before & bit(s) != 0)
+            })
         })
     }
 
@@ -4342,7 +4347,7 @@ impl Region {
             unrouted_readers: 0,
             readers: 0,
             acquiring_readers: 0,
-            last_read: [(0, 0); MAX_THREADS],
+            last_read: [(VersionVec::new(), 0); MAX_THREADS],
         }
     }
 
@@ -4359,7 +4364,7 @@ impl Region {
         self.unrouted_readers = 0;
         self.readers = 0;
         self.acquiring_readers = 0;
-        self.last_read = [(0, 0); MAX_THREADS];
+        self.last_read = [(VersionVec::new(), 0); MAX_THREADS];
     }
 
     /// Keep the `keep_mask` bits of this region in place; split the remaining
@@ -4461,7 +4466,7 @@ impl Region {
     /// candidate filters guarantee `index` is mo-before none of them.
     fn observe(&mut self, threads: &thread::Set, index: usize, ordering: Ordering) {
         self.last_read[threads.active_id().as_usize()] =
-            (threads.active_atomic_version(), self.stores[index].id);
+            (threads.active().causality, self.stores[index].id);
 
         // Only a store not already mo-before `index` can gain an edge.
         let open = self.all_slots() & !self.stores[index].before & !bit(index);
