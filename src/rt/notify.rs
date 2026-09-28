@@ -84,6 +84,14 @@ impl Notify {
         });
     }
 
+    /// Whether `notify` has run, observed without synchronizing with it. A
+    /// scheduling point dependent with `notify`, so both answers are explored
+    /// wherever the two race.
+    pub(crate) fn is_notified(self, location: Location) -> bool {
+        self.state.branch_opaque(location);
+        rt::execution(|execution| self.state.get(&execution.objects).notified)
+    }
+
     pub(crate) fn wait(self, location: Location) {
         let (notified, spurious) = rt::execution(|execution| {
             let spurious = if self.state.get(&execution.objects).might_spur() {

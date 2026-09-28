@@ -143,3 +143,18 @@ fn park_unpark_std() {
     std::thread::park();
     println!("it did not deadlock");
 }
+
+#[test]
+fn is_finished_races_the_thread_and_join_still_waits() {
+    use std::collections::HashSet;
+    use std::sync::{Arc as StdArc, Mutex as StdMutex};
+    let seen = StdArc::new(StdMutex::new(HashSet::new()));
+    let seen_ = seen.clone();
+    loom::model(move || {
+        let t = loom::thread::spawn(|| 7);
+        let finished = t.is_finished();
+        assert_eq!(t.join().unwrap(), 7);
+        seen_.lock().unwrap().insert(finished);
+    });
+    assert_eq!(*seen.lock().unwrap(), HashSet::from([false, true]));
+}

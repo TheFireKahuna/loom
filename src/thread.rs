@@ -304,6 +304,14 @@ impl<T> JoinHandle<T> {
         self.result.lock().unwrap().take().unwrap()
     }
 
+    /// Whether the thread has finished running its main function, as `std`'s
+    /// `is_finished`. Like `std`'s, a `true` does not synchronize with the
+    /// thread: only [`join`](Self::join) does.
+    #[track_caller]
+    pub fn is_finished(&self) -> bool {
+        self.notify.is_notified(location!())
+    }
+
     /// Gets a handle to the underlying [`Thread`]
     pub fn thread(&self) -> &Thread {
         &self.thread
