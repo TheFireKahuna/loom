@@ -128,3 +128,68 @@ fn try_unwrap_multithreaded() {
         let _ = Arc::try_unwrap(num).unwrap();
     });
 }
+
+mod weak {
+    use loom::sync::atomic::{AtomicUsize, Ordering::Relaxed};
+    use loom::sync::{Arc, Weak};
+    use loom::thread;
+
+    // The last strong drop races an upgrade: both outcomes are explored, and
+    // an upgrade ahead of the drop may read the cell either side of the store.
+    #[test]
+    fn upgrade_races_the_last_drop() {
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()));
+        let seen_ = seen.clone();
+        loom::model(move || {
+            let a = Arc::new(AtomicUsize::new(0));
+            let w = Arc::downgrade(&a);
+            let t = thread::spawn(move || w.upgrade().map(|a| a.load(Relaxed)));
+            a.store(1, Relaxed);
+            drop(a);
+            seen_.lock().unwrap().insert(t.join().unwrap());
+        });
+        assert_eq!(*seen.lock().unwrap(), [None, Some(0), Some(1)].into());
+    }
+
+    #[test]
+    fn weak_blocks_get_mut_but_not_try_unwrap() {
+        loom::model(|| {
+            let mut a = Arc::new(1);
+            let w = Arc::downgrade(&a);
+            assert!(Arc::get_mut(&mut a).is_none());
+            assert_eq!((Arc::strong_count(&a), Arc::weak_count(&a)), (1, 1));
+            assert_eq!(Arc::try_unwrap(a).ok(), Some(1));
+            assert!(w.upgrade().is_none());
+            assert_eq!(w.weak_count(), 0);
+            assert!(Weak::<u8>::new().upgrade().is_none());
+        });
+    }
+
+    #[test]
+    fn new_cyclic_and_make_mut() {
+        struct Node {
+            me: Weak<Node>,
+            v: u32,
+        }
+        impl Clone for Node {
+            fn clone(&self) -> Node {
+                Node { me: Weak::new(), v: self.v }
+            }
+        }
+        loom::model(|| {
+            let mut n = Arc::new_cyclic(|me| {
+                assert!(me.upgrade().is_none());
+                Node { me: me.clone(), v: 1 }
+            });
+            assert!(Arc::ptr_eq(&n.me.upgrade().unwrap(), &n));
+            // Only its own `Weak` shares it: moved, not cloned.
+            Arc::make_mut(&mut n).v = 2;
+            assert_eq!(n.v, 2);
+            assert!(n.me.upgrade().is_none());
+
+            let other = n.clone();
+            Arc::make_mut(&mut n).v = 3;
+            assert_eq!((n.v, other.v), (3, 2));
+        });
+    }
+}

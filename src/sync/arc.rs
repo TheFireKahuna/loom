@@ -20,6 +20,30 @@ impl<T> Arc<T> {
         Arc::from_std(std)
     }
 
+    /// Constructs an `Arc<T>` whose value is built by `data_fn` from a `Weak`
+    /// to itself, as `std`'s. Upgrading that `Weak` fails until this returns.
+    #[track_caller]
+    pub fn new_cyclic<F>(data_fn: F) -> Arc<T>
+    where
+        F: FnOnce(&Weak<T>) -> T,
+    {
+        let obj = std::sync::Arc::new(rt::Arc::new_cyclic(location!()));
+        let value = std::sync::Arc::new_cyclic(|weak| {
+            obj.weak_inc(location!());
+            let weak = Weak {
+                obj: Some(obj.clone()),
+                value: weak.clone(),
+            };
+            data_fn(&weak)
+        });
+        obj.strong_init();
+        rt::execution(|e| {
+            e.arc_objs
+                .insert(std::sync::Arc::as_ptr(&value) as *const (), obj.clone());
+        });
+        Arc { obj, value }
+    }
+
     /// Constructs a new `Pin<Arc<T>>`.
     pub fn pin(data: T) -> Pin<Arc<T>> {
         unsafe { Pin::new_unchecked(Arc::new(data)) }
@@ -28,7 +52,7 @@ impl<T> Arc<T> {
     /// Returns the inner value, if the `Arc` has exactly one strong reference.
     #[track_caller]
     pub fn try_unwrap(this: Arc<T>) -> Result<T, Arc<T>> {
-        if !this.obj.get_mut(location!()) {
+        if !this.obj.sole_strong(location!()) {
             return Err(this);
         }
 
@@ -92,7 +116,56 @@ impl<T> Arc<T> {
     }
 }
 
+impl<T: Clone> Arc<T> {
+    /// Makes the value unique and returns it mutably, as `std`'s: in place when
+    /// this is the only reference; moved into a fresh allocation, leaving the
+    /// `Weak`s dangling, when only `Weak`s share it; otherwise cloned.
+    #[track_caller]
+    pub fn make_mut(this: &mut Arc<T>) -> &mut T {
+        if !this.obj.get_mut(location!()) {
+            if this.obj.sole_strong(location!()) {
+                // Only `Weak`s share it, and none can upgrade while this holds
+                // the one strong reference: `std` moves the value out, which
+                // ends the old allocation's strong life here.
+                let old = std::sync::Arc::as_ptr(&this.value);
+                std::sync::Arc::make_mut(&mut this.value);
+                assert!(this.obj.ref_dec(location!()), "[loom internal bug] strong reference raced");
+                rt::execution(|e| {
+                    e.arc_objs
+                        .remove(&old.cast())
+                        .expect("Arc object was removed before dropping last Arc");
+                });
+                let obj = std::sync::Arc::new(rt::Arc::new(location!()));
+                rt::execution(|e| {
+                    e.arc_objs
+                        .insert(std::sync::Arc::as_ptr(&this.value) as *const (), obj.clone());
+                });
+                this.obj = obj;
+            } else {
+                *this = Arc::new((**this).clone());
+            }
+        }
+        Arc::get_mut(this).expect("[loom internal bug] a fresh Arc is shared")
+    }
+}
+
 impl<T: ?Sized> Arc<T> {
+    /// Creates a new `Weak` pointer to this allocation.
+    #[track_caller]
+    pub fn downgrade(this: &Self) -> Weak<T> {
+        this.obj.weak_inc(location!());
+        Weak {
+            obj: Some(this.obj.clone()),
+            value: std::sync::Arc::downgrade(&this.value),
+        }
+    }
+
+    /// Gets the number of `Weak` pointers to this allocation.
+    #[track_caller]
+    pub fn weak_count(this: &Self) -> usize {
+        this.obj.counts().1
+    }
+
     /// Converts `std::sync::Arc` to `loom::sync::Arc`.
     ///
     /// This is needed to create a `loom::sync::Arc<T>` where `T: !Sized`.
@@ -322,5 +395,103 @@ impl<T: ?Sized> AsRef<T> for Arc<T> {
 impl<T: ?Sized> Borrow<T> for Arc<T> {
     fn borrow(&self) -> &T {
         self
+    }
+}
+
+/// Mock implementation of `std::sync::Weak`.
+pub struct Weak<T: ?Sized> {
+    /// The allocation's model object; `None` for [`Weak::new`], which points
+    /// at nothing.
+    obj: Option<std::sync::Arc<rt::Arc>>,
+    value: std::sync::Weak<T>,
+}
+
+impl<T> Weak<T> {
+    /// Constructs a `Weak` that points at nothing: `upgrade` always fails.
+    pub const fn new() -> Weak<T> {
+        Weak {
+            obj: None,
+            value: std::sync::Weak::new(),
+        }
+    }
+}
+
+impl<T: ?Sized> Weak<T> {
+    /// Attempts to upgrade to an `Arc`, failing once the value is dropped.
+    #[track_caller]
+    pub fn upgrade(&self) -> Option<Arc<T>> {
+        let obj = self.obj.as_ref()?;
+        if !obj.upgrade(location!()) {
+            return None;
+        }
+        let value = self
+            .value
+            .upgrade()
+            .expect("[loom internal bug] the model upgraded a dropped value");
+        Some(Arc {
+            obj: obj.clone(),
+            value,
+        })
+    }
+
+    /// Gets the number of strong (`Arc`) pointers to this allocation.
+    #[track_caller]
+    pub fn strong_count(&self) -> usize {
+        self.obj.as_ref().map_or(0, |obj| obj.counts().0)
+    }
+
+    /// Gets the number of `Weak` pointers to this allocation, or 0 once no
+    /// strong pointer remains, as `std`'s.
+    #[track_caller]
+    pub fn weak_count(&self) -> usize {
+        self.obj.as_ref().map_or(0, |obj| match obj.counts() {
+            (0, _) => 0,
+            (_, weak) => weak,
+        })
+    }
+
+    /// Returns `true` if the two `Weak`s point to the same allocation, or both
+    /// point at nothing.
+    pub fn ptr_eq(&self, other: &Self) -> bool {
+        self.value.ptr_eq(&other.value)
+    }
+
+    /// Returns a raw pointer to the object pointed to.
+    pub fn as_ptr(&self) -> *const T {
+        self.value.as_ptr()
+    }
+}
+
+impl<T: ?Sized> Clone for Weak<T> {
+    #[track_caller]
+    fn clone(&self) -> Weak<T> {
+        if let Some(obj) = &self.obj {
+            obj.weak_inc(location!());
+        }
+        Weak {
+            obj: self.obj.clone(),
+            value: self.value.clone(),
+        }
+    }
+}
+
+impl<T: ?Sized> Drop for Weak<T> {
+    #[track_caller]
+    fn drop(&mut self) {
+        if let Some(obj) = &self.obj {
+            obj.weak_dec(location!());
+        }
+    }
+}
+
+impl<T> Default for Weak<T> {
+    fn default() -> Weak<T> {
+        Weak::new()
+    }
+}
+
+impl<T: ?Sized> std::fmt::Debug for Weak<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("(Weak)")
     }
 }

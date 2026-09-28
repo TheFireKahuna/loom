@@ -14,6 +14,9 @@ pub(super) struct State {
     /// Reference count
     ref_cnt: usize,
 
+    /// Live `Weak` handles. The allocation outlives the value while any does.
+    weak_cnt: usize,
+
     /// Location where the arc was allocated
     allocated: Location,
 
@@ -63,6 +66,7 @@ impl Arc {
         rt::execution(|execution| {
             let state = execution.objects.insert(State {
                 ref_cnt: 1,
+                weak_cnt: 0,
                 allocated: location,
                 synchronize: Synchronize::new(),
                 last_ref_inc: None,
@@ -88,7 +92,88 @@ impl Arc {
         })
     }
 
-    /// Validate a `get_mut` call
+    /// The object of an `Arc::new_cyclic` under construction: no strong
+    /// reference until [`Arc::strong_init`], so every upgrade meanwhile fails.
+    pub(crate) fn new_cyclic(location: Location) -> Arc {
+        let arc = Arc::new(location);
+        rt::execution(|execution| arc.state.get_mut(&mut execution.objects).ref_cnt = 0);
+        arc
+    }
+
+    /// The first strong reference of a `new_cyclic` object, once its value
+    /// exists.
+    pub(crate) fn strong_init(&self) {
+        rt::execution(|execution| {
+            let state = self.state.get_mut(&mut execution.objects);
+            assert_eq!(state.ref_cnt, 0, "[loom internal bug] cyclic Arc already live");
+            state.ref_cnt = 1;
+        })
+    }
+
+    /// `Arc::downgrade` or `Weak::clone`: one more weak handle. Like a clone,
+    /// it needs a live handle, so it changes no answer another op can give
+    /// except through the counts.
+    pub(crate) fn weak_inc(&self, location: Location) {
+        self.branch(Action::RefInc, location);
+        rt::execution(|execution| {
+            let state = self.state.get_mut(&mut execution.objects);
+            state.weak_cnt = state.weak_cnt.checked_add(1).expect("overflow");
+        })
+    }
+
+    /// Dropping a `Weak`: a release, as a strong drop is, which a later
+    /// `get_mut` acquires.
+    pub(crate) fn weak_dec(&self, location: Location) {
+        self.branch(Action::RefDec, location);
+        rt::execution(|execution| {
+            let state = self.state.get_mut(&mut execution.objects);
+            assert!(state.weak_cnt >= 1, "Weak is already released");
+            state.weak_cnt -= 1;
+            state.synchronize.sync_store(&mut execution.threads, Release);
+        })
+    }
+
+    /// `Weak::upgrade`: one more strong reference if any is left, acquiring
+    /// every earlier release when it succeeds, as `std`'s `Acquire` increment
+    /// does. Dependent with the drops: whether it succeeds is the race.
+    pub(crate) fn upgrade(&self, location: Location) -> bool {
+        self.branch(Action::RefDec, location);
+        rt::execution(|execution| {
+            let state = self.state.get_mut(&mut execution.objects);
+            if state.ref_cnt == 0 {
+                return false;
+            }
+            state.ref_cnt += 1;
+            state.synchronize.sync_load(&mut execution.threads, Acquire);
+            true
+        })
+    }
+
+    /// `(strong, weak)` counts, observed like `strong_count`.
+    #[track_caller]
+    pub(crate) fn counts(&self) -> (usize, usize) {
+        self.branch(Action::Inspect, location!());
+        rt::execution(|execution| {
+            let state = self.state.get_mut(&mut execution.objects);
+            state.synchronize.sync_load(&mut execution.threads, SeqCst);
+            (state.ref_cnt, state.weak_cnt)
+        })
+    }
+
+    /// `try_unwrap`'s test: the only strong reference, whatever `Weak`s remain
+    /// (they fail to upgrade once it is taken).
+    pub(crate) fn sole_strong(&self, location: Location) -> bool {
+        self.branch(Action::RefDec, location);
+        rt::execution(|execution| {
+            let state = self.state.get_mut(&mut execution.objects);
+            assert!(state.ref_cnt >= 1, "Arc is released");
+            state.synchronize.sync_load(&mut execution.threads, Acquire);
+            state.ref_cnt == 1
+        })
+    }
+
+    /// Validate a `get_mut` call: unique when this is the only strong
+    /// reference and no `Weak` could upgrade to a second.
     pub(crate) fn get_mut(&self, location: Location) -> bool {
         self.branch(Action::RefDec, location);
 
@@ -100,7 +185,7 @@ impl Arc {
             // Synchronize the threads
             state.synchronize.sync_load(&mut execution.threads, Acquire);
 
-            let is_only_ref = state.ref_cnt == 1;
+            let is_only_ref = state.ref_cnt == 1 && state.weak_cnt == 0;
 
             trace!(state = ?self.state, ?is_only_ref, %location, "Arc::get_mut");
 
@@ -169,7 +254,7 @@ impl Arc {
 
 impl State {
     pub(super) fn check_for_leaks(&self, index: usize) {
-        if self.ref_cnt != 0 {
+        if self.ref_cnt != 0 || self.weak_cnt != 0 {
             if self.allocated.is_captured() {
                 panic!(
                     "Arc leaked.\n  Allocated: {}\n      Index: {}",

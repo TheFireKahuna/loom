@@ -9,7 +9,7 @@ mod mutex;
 mod notify;
 mod rwlock;
 
-pub use self::arc::Arc;
+pub use self::arc::{Arc, Weak};
 pub use self::barrier::{Barrier, BarrierWaitResult};
 pub use self::condvar::{Condvar, WaitTimeoutResult};
 pub use self::mutex::{Mutex, MutexGuard};
