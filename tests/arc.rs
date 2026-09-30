@@ -475,4 +475,50 @@ mod dependence {
             );
         }
     }
+
+    /// An upgrade after a concurrent `Weak::strong_count` must be reversed
+    /// against it: the weak side reads the count before and after.
+    #[test]
+    fn an_upgrade_is_reversed_against_an_earlier_weak_inspection() {
+        let model = || {
+            let a = Arc::new(0usize);
+            let w1 = Arc::downgrade(&a);
+            let w2 = w1.clone();
+            let upgrader = thread::spawn(move || w1.upgrade());
+            let n = w2.strong_count();
+            let upgraded = upgrader.join().unwrap();
+            drop((upgraded, w2, a));
+            n
+        };
+
+        for (bound, sleep_sets) in CONFIGS {
+            assert_eq!(
+                counts(bound, sleep_sets, model),
+                BTreeSet::from([1, 2]),
+                "bound = {bound:?}, sleep_sets = {sleep_sets}"
+            );
+        }
+    }
+
+    /// A `Weak` dropped after a concurrent `weak_count` must be reversed
+    /// against it.
+    #[test]
+    fn a_weak_drop_is_reversed_against_an_earlier_weak_count() {
+        let model = || {
+            let a = Arc::new(0usize);
+            let w = Arc::downgrade(&a);
+            let dropper = thread::spawn(move || drop(w));
+            let n = Arc::weak_count(&a);
+            dropper.join().unwrap();
+            n
+        };
+
+        for (bound, sleep_sets) in CONFIGS {
+            assert_eq!(
+                counts(bound, sleep_sets, model),
+                BTreeSet::from([0, 1]),
+                "bound = {bound:?}, sleep_sets = {sleep_sets}"
+            );
+        }
+    }
 }
