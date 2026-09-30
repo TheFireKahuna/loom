@@ -361,12 +361,6 @@ macro_rules! if_futures {
     }
 }
 
-macro_rules! dbg {
-    ($($t:tt)*) => {
-        $($t)*
-    };
-}
-
 #[macro_use]
 mod rt;
 
