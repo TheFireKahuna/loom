@@ -21,6 +21,9 @@ use tracing::trace;
 pub struct JoinHandle<T> {
     result: Arc<Mutex<Option<std::thread::Result<T>>>>,
     notify: rt::Notify,
+    /// Notified when the main function returns, before the TLS destructors:
+    /// what `is_finished` reads.
+    finished: rt::Notify,
     thread: Thread,
 }
 
@@ -224,6 +227,7 @@ where
 {
     let result = Arc::new(Mutex::new(None));
     let notify = rt::Notify::new(true, false);
+    let finished = rt::Notify::new(false, false);
 
     let id = {
         let name = name.clone();
@@ -234,6 +238,8 @@ where
             });
 
             *result.lock().unwrap() = Some(Ok(f()));
+
+            finished.notify(location);
 
             // Run this thread's `thread_local` destructors before notifying
             // the join handle, so their effects happen-before `join`
@@ -248,6 +254,7 @@ where
     JoinHandle {
         result,
         notify,
+        finished,
         thread: Thread {
             id: ThreadId { id },
             name,
@@ -305,11 +312,12 @@ impl<T> JoinHandle<T> {
     }
 
     /// Whether the thread has finished running its main function, as `std`'s
-    /// `is_finished`. Like `std`'s, a `true` does not synchronize with the
+    /// `is_finished`: true from the return on, before the thread's TLS
+    /// destructors run. Like `std`'s, a `true` does not synchronize with the
     /// thread: only [`join`](Self::join) does.
     #[track_caller]
     pub fn is_finished(&self) -> bool {
-        self.notify.is_notified(location!())
+        self.finished.is_notified(location!())
     }
 
     /// Gets a handle to the underlying [`Thread`]

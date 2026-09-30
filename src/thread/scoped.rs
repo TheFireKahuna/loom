@@ -39,6 +39,8 @@ struct ScopeData {
 struct Packet<'scope, T> {
     result: Mutex<Option<std::thread::Result<T>>>,
     done: rt::Notify,
+    /// Notified when the main function returns, before the TLS destructors.
+    finished: rt::Notify,
     _scope: PhantomData<&'scope ()>,
 }
 
@@ -130,6 +132,7 @@ where
     let packet = Arc::new(Packet {
         result: Mutex::new(None),
         done: rt::Notify::new(true, false),
+        finished: rt::Notify::new(false, false),
         _scope: PhantomData,
     });
 
@@ -145,6 +148,8 @@ where
             });
 
             *packet.result.lock().unwrap() = Some(Ok(f()));
+
+            packet.finished.notify(location);
 
             rt::drop_locals();
 
@@ -194,6 +199,14 @@ impl<'scope, T> ScopedJoinHandle<'scope, T> {
     pub fn join(self) -> std::thread::Result<T> {
         self.packet.done.wait(location!());
         self.packet.result.lock().unwrap().take().unwrap()
+    }
+
+    /// Mock implementation of `std::thread::ScopedJoinHandle::is_finished`:
+    /// true once the main function returns, before the thread's TLS
+    /// destructors run. A `true` does not synchronize with the thread.
+    #[track_caller]
+    pub fn is_finished(&self) -> bool {
+        self.packet.finished.is_notified(location!())
     }
 }
 

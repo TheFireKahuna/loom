@@ -158,3 +158,52 @@ fn is_finished_races_the_thread_and_join_still_waits() {
     });
     assert_eq!(*seen.lock().unwrap(), HashSet::from([false, true]));
 }
+
+// `is_finished` turns true once the main function returns, which is before the
+// thread's TLS destructors run.
+#[test]
+fn is_finished_before_tls_destructors() {
+    use loom::sync::{Arc, Mutex};
+    use std::sync::atomic::{AtomicBool, Ordering::SeqCst};
+
+    struct Dtor(Arc<Mutex<bool>>);
+    impl Drop for Dtor {
+        fn drop(&mut self) {
+            *self.0.lock().unwrap() = true;
+        }
+    }
+    loom::thread_local! {
+        static SLOT: std::cell::RefCell<Option<Dtor>> = std::cell::RefCell::new(None);
+    }
+    static EARLY: AtomicBool = AtomicBool::new(false);
+
+    loom::model(|| {
+        let ran = Arc::new(Mutex::new(false));
+        let ran2 = ran.clone();
+        let t = loom::thread::spawn(move || SLOT.with(|s| *s.borrow_mut() = Some(Dtor(ran2))));
+        if t.is_finished() && !*ran.lock().unwrap() {
+            EARLY.store(true, SeqCst);
+        }
+        t.join().unwrap();
+        assert!(*ran.lock().unwrap());
+    });
+    assert!(EARLY.load(SeqCst), "is_finished never preceded the TLS destructor");
+}
+
+#[test]
+fn scoped_is_finished_races_the_thread() {
+    use std::collections::HashSet;
+    use std::sync::Mutex as StdMutex;
+
+    static SEEN: StdMutex<Option<HashSet<bool>>> = StdMutex::new(None);
+    loom::model(|| {
+        let finished = loom::thread::scope(|s| {
+            let t = s.spawn(|| 7);
+            let finished = t.is_finished();
+            assert_eq!(t.join().unwrap(), 7);
+            finished
+        });
+        SEEN.lock().unwrap().get_or_insert_with(HashSet::new).insert(finished);
+    });
+    assert_eq!(SEEN.lock().unwrap().take().unwrap(), HashSet::from([false, true]));
+}
