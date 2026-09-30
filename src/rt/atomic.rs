@@ -39,6 +39,12 @@
 //!   AArch64 and floors nothing. `load_masked` itself stays independently
 //!   coherent per lane — the weaker, per-byte-coherence model — for consumers
 //!   that want it.
+//! - **The floor binds every later access to the lane**, not only a typed
+//!   load: an RMW's read, on either arm, cannot travel behind such an op, and
+//!   a store or an RMW's write lands modification-order-after it
+//!   (`State::floor_mask`). A write is ordered after an observation by
+//!   everything that orders a read after one, and also by releasing, or
+//!   always where stores reach memory in order.
 //! - **DPOR dependence is mask-scoped** (`Action::Load(mask)`): a lane load is
 //!   dependent only with ops whose mask it intersects, so it commutes with
 //!   disjoint-lane traffic (a value-lane load no longer serializes against
@@ -1820,6 +1826,11 @@ struct LoadView {
 
     /// Own-clock version of the reader's latest RMW (`Thread::rmw_version`).
     own_rmw: u16,
+
+    /// `Some(release)` when the access the observations must be ordered
+    /// before also writes, `release` saying whether that write releases: a
+    /// store, or an RMW's write half. `None` for a read alone.
+    write: Option<bool>,
 }
 
 impl LoadView {
@@ -1835,6 +1846,16 @@ impl LoadView {
             acq_fence: threads.active().acq_fence_version,
             own_sc_fence: threads.active().sc_fence_version,
             own_rmw: threads.active().rmw_version,
+            write: None,
+        }
+    }
+
+    /// The state as of an access that writes at `ordering` — a store, or an
+    /// RMW whose read is at `ordering` too — before it reads anything.
+    fn writing(threads: &thread::Set, ordering: Ordering) -> LoadView {
+        LoadView {
+            write: Some(releases(ordering)),
+            ..LoadView::entry(threads, ordering, &[])
         }
     }
 
@@ -1865,20 +1886,28 @@ impl LoadView {
     /// - A peer's store this same load already committed to reading is one
     ///   single-copy-atomic event with it. An own store read here may have been
     ///   forwarded, which AArch64 permits to split the snapshot.
+    /// - A write is ordered after every earlier access of its thread where
+    ///   stores reach memory in order, or when it releases. Everything that
+    ///   orders an observation before a read orders it before a write too.
     fn is_seen(&self, store: &Store, rj: usize, gi: usize) -> bool {
         let me_bit = 1u32 << self.me;
         let seen = store.first_seen.seen_threads(&self.hb);
         if seen & !me_bit != 0 {
             return true;
         }
+        let ordered_write = self
+            .write
+            .is_some_and(|release| release || LANE_FLOOR.stores_in_order);
         if store.creator == self.me {
             return self.own_sc_fence > store.tick()
                 || (store.seq_cst && (self.seq_cst || LANE_FLOOR.seq_cst_store_is_full_barrier))
-                || (LANE_FLOOR.rmw_is_full_barrier && (store.rmw || self.own_rmw > store.tick()));
+                || (LANE_FLOOR.rmw_is_full_barrier && (store.rmw || self.own_rmw > store.tick()))
+                || ordered_write;
         }
         let ordered_read = LANE_FLOOR.loads_in_order
             || store.first_seen.1 & me_bit != 0
-            || store.first_seen.0[self.me] < self.acq_fence;
+            || store.first_seen.0[self.me] < self.acq_fence
+            || ordered_write;
         (seen & me_bit != 0 && ordered_read) || self.touched.contains(&(rj, gi))
     }
 }
@@ -2755,6 +2784,9 @@ impl<C: Resolve + ?Sized> ModelOps for C {
             } else {
                 None
             };
+            // Before any region appends: the floors are what the thread
+            // observed ahead of this store, not the store itself.
+            let floors = state.write_floors(&execution.threads, ordering);
             let op_id = state.next_op_id();
 
             for ri in state.covered(mask) {
@@ -2765,6 +2797,7 @@ impl<C: Resolve + ?Sized> ModelOps for C {
                     ordering,
                     sc_rank,
                     op_id,
+                    floors[ri],
                 );
             }
         })
@@ -2995,6 +3028,10 @@ where
         let thread = 1u32 << execution.threads.active_id().as_usize();
         let may_spur = weak && state.spurious_last & thread == 0;
 
+        // What the thread observed ahead of the op, per region: its write
+        // goes after these, so a success reads none before one.
+        let floors = state.write_floors(&execution.threads, success);
+
         let (reads, current, arm, snapshot) = state.choose_rmw_reads(
             &mut execution.path,
             &execution.threads,
@@ -3004,6 +3041,7 @@ where
             success,
             failure,
             may_spur,
+            &floors,
         );
 
         if weak {
@@ -3075,6 +3113,7 @@ where
                     success,
                     sc_rank,
                     op_id,
+                    floors[ri],
                 );
                 continue;
             }
@@ -3219,7 +3258,7 @@ impl State {
         // creation of this atomic cell.
         //
         // This is verified using `cell`.
-        self.regions[0].store(threads, Synchronize::new(), value, Ordering::Release, None, 0);
+        self.regions[0].store(threads, Synchronize::new(), value, Ordering::Release, None, 0, 0);
     }
 
     /// Initialize a shell for a `const`-constructed cell, whose genesis store
@@ -3668,10 +3707,12 @@ impl State {
         success: Ordering,
         failure: Ordering,
         may_spur: bool,
+        floors: &[Slots],
     ) -> (SmallVec<[(usize, usize); 4]>, u128, Arm, Snapshot) {
         if let [ri] = *covered {
-            let (reads, value, arm) =
-                self.choose_rmw_read(path, threads, ri, cmp, success, failure, may_spur);
+            let (reads, value, arm) = self.choose_rmw_read(
+                path, threads, ri, cmp, success, failure, may_spur, floors[ri],
+            );
             return (reads, value, arm, Snapshot::default());
         }
 
@@ -3688,8 +3729,9 @@ impl State {
                 writes,
                 chosen: SmallVec::new(),
             };
-            let possible =
-                self.rmw_completes(covered, threads, cmp, orders, true, &start, &entry, &entry);
+            let possible = self.rmw_completes(
+                covered, threads, cmp, orders, true, &start, &entry, &entry, floors,
+            );
             spur = possible && path.branch_spurious();
         }
 
@@ -3705,7 +3747,8 @@ impl State {
         let mut reads = SmallVec::new();
 
         for (k, &ri) in covered.iter().enumerate() {
-            let (writable, readable) = self.rmw_candidates(ri, threads, orders, &acc, &entry, &view);
+            let (writable, readable) =
+                self.rmw_candidates(ri, threads, orders, &acc, &entry, &view, floors[ri]);
 
             if path.is_traversed() {
                 let rest = &covered[k + 1..];
@@ -3718,6 +3761,7 @@ impl State {
                         .is_some_and(|(next, next_view)| {
                             self.rmw_completes(
                                 rest, threads, cmp, orders, spur, &next, &entry, &next_view,
+                                floors,
                             )
                         });
 
@@ -3763,6 +3807,7 @@ impl State {
         success: Ordering,
         failure: Ordering,
         may_spur: bool,
+        floors: Slots,
     ) -> (SmallVec<[(usize, usize); 4]>, u128, Arm) {
         let region = &self.regions[ri];
         let passing = |set: Slots, pass: bool| {
@@ -3779,14 +3824,16 @@ impl State {
         let readable = if cmp.is_always() && !may_spur {
             0
         } else {
-            region.rmw_readable(threads, &view, failure)
+            let at = LoadView::entry(threads, failure, &[]);
+            self.filter_seen_op_floors(ri, &at, region.rmw_readable(threads, &view, failure))
         };
 
         let spur = may_spur && passing(readable, true) != 0 && path.branch_spurious();
         let candidates = if spur {
             passing(readable, true)
         } else {
-            passing(region.rmw_writable(threads, &view, success), true) | passing(readable, false)
+            let writable = region.rmw_writable(threads, &view, success, floors);
+            passing(writable, true) | passing(readable, false)
         };
 
         if path.is_traversed() {
@@ -3818,7 +3865,9 @@ impl State {
     /// The candidates region `ri` offers an RMW whose prefix is `acc`: the
     /// stores its write can follow while the success arm is open, and the
     /// stores a load at the failure ordering could return while a failing
-    /// read is. A success reads at `entry`, a failure at the projected `view`.
+    /// read is. A success reads at `entry` and writes after `floors`, a
+    /// failure reads at the projected `view` and above its floors.
+    #[allow(clippy::too_many_arguments)]
     fn rmw_candidates(
         &self,
         ri: usize,
@@ -3827,15 +3876,17 @@ impl State {
         acc: &RmwAcc,
         entry: &LoadView,
         view: &LoadView,
+        floors: Slots,
     ) -> (Slots, Slots) {
         let region = &self.regions[ri];
         let writable = if acc.success.is_some() {
-            region.rmw_writable(threads, &entry.causality, success)
+            region.rmw_writable(threads, &entry.causality, success, floors)
         } else {
             0
         };
         let readable = if acc.failure.is_some() {
-            region.rmw_readable(threads, &view.causality, failure)
+            let readable = region.rmw_readable(threads, &view.causality, failure);
+            self.filter_seen_op_floors(ri, view, readable)
         } else {
             0
         };
@@ -3946,6 +3997,7 @@ impl State {
         acc: &RmwAcc,
         entry: &LoadView,
         view: &LoadView,
+        floors: &[Slots],
     ) -> bool {
         let Some((&rj, tail)) = rest.split_first() else {
             let passes = cmp.succeeds(acc.value);
@@ -3956,11 +4008,14 @@ impl State {
             };
         };
 
-        let (writable, readable) = self.rmw_candidates(rj, threads, orders, acc, entry, view);
+        let (writable, readable) =
+            self.rmw_candidates(rj, threads, orders, acc, entry, view, floors[rj]);
         slots(writable | readable).any(|ci| {
             self.rmw_step(rj, ci, (writable, readable), threads, orders, acc, entry, view)
                 .is_some_and(|(next, next_view)| {
-                    self.rmw_completes(tail, threads, cmp, orders, spur, &next, entry, &next_view)
+                    self.rmw_completes(
+                        tail, threads, cmp, orders, spur, &next, entry, &next_view, floors,
+                    )
                 })
         })
     }
@@ -4019,22 +4074,20 @@ impl State {
             //
             // A `SeqCst` load participates in the SC total order S; a load past
             // a `SeqCst` fence is bounded by the fence's position. The readable
-            // set is restricted inside `match_load_to_stores`.
+            // set is restricted inside `readable_mask`.
             if path.is_traversed() {
-                let mut seed = [0; MAX_ATOMIC_HISTORY];
-                let mut n = self.regions[ri].match_load_to_stores(
-                    threads,
-                    &view.causality,
-                    &mut seed[..],
-                    ordering,
-                );
+                let mut readable =
+                    self.regions[ri].readable_mask(threads, &view.causality, ordering);
 
                 // Whole-cell coherence for a typed lane load: drop candidates
                 // that would travel behind a wide op already observed through
                 // another region. `load_masked` skips this (per-lane coherent).
                 if apply_floor {
-                    n = self.filter_seen_op_floors(ri, &view, &mut seed[..], n);
+                    readable = self.filter_seen_op_floors(ri, &view, readable);
                 }
+
+                let mut seed = [0; MAX_ATOMIC_HISTORY];
+                let mut n = seed_of(readable, &mut seed);
 
                 if multi {
                     // Keep only candidates consistent with what earlier
@@ -4114,8 +4167,8 @@ impl State {
     /// two later regions, and both sets are bounded (regions per cell, and
     /// `MAX_ATOMIC_HISTORY` candidates each).
     ///
-    /// Reads nothing the caller has not already fixed — `match_load_to_stores`
-    /// and `filter_seen_op_floors` both take `&self`/`&thread::Set` — so the
+    /// Reads nothing the caller has not already fixed — `readable_mask` and
+    /// `filter_seen_op_floors` both take `&self`/`&thread::Set` — so the
     /// lookahead cannot perturb the execution it is predicting.
     fn has_consistent_completion(
         &self,
@@ -4130,22 +4183,15 @@ impl State {
             return true;
         };
 
-        let mut seed = [0; MAX_ATOMIC_HISTORY];
-        let mut n = self.regions[rj].match_load_to_stores(
-            threads,
-            &view.causality,
-            &mut seed[..],
-            ordering,
-        );
+        let mut readable = self.regions[rj].readable_mask(threads, &view.causality, ordering);
         if apply_floor {
-            n = self.filter_seen_op_floors(rj, view, &mut seed[..], n);
+            readable = self.filter_seen_op_floors(rj, view, readable);
         }
 
         let preds = self.regions[rj].read_preds(threads, &view.causality, ordering);
         let me = Some(threads.active_id().as_usize());
 
-        seed[..n].iter().any(|&ci| {
-            let ci = ci as usize;
+        slots(readable).any(|ci| {
             let mut next = snapshot.clone();
             next.take(rj, &self.regions[rj], ci, preds & !bit(ci), me)
                 && (tail.is_empty() || {
@@ -4163,10 +4209,11 @@ impl State {
     }
 
     /// Whole-cell coherence for a typed lane load (module docs, "Typed lane
-    /// loads"): drop every candidate in `seed[..n]` for region `ri` that is
+    /// loads"), and for every other read of region `ri` an observation is
+    /// ordered before: drop every candidate in `candidates` that is
     /// modification-order-before a region-`ri` store whose whole-cell op the
     /// active thread has already observed through *another* region of this
-    /// cell. Returns the retained count.
+    /// cell. Returns the candidates kept.
     ///
     /// A region-`ri` store `f` is a **floor** when its op `f.op_id` is observed
     /// through some other region `rj` (`op_seen_through_other_region`) — the
@@ -4175,34 +4222,27 @@ impl State {
     /// through it. Only genuine `mo_before` edges exclude: a racing store
     /// mo-incomparable to `f` stays readable (per-byte coherence permits either
     /// order until something orders them), and same-region observations need no
-    /// floor — the plain coherence rules in `match_load_to_stores` cover them.
+    /// floor — the plain coherence rules in `readable_mask` cover them.
     ///
-    /// The result can never be empty: a floor `f` is never mo-before itself,
+    /// A non-empty set stays non-empty: a floor `f` is never mo-before itself,
     /// and any candidate dropped by the "saw a newer store" rule in
-    /// `match_load_to_stores` is superseded by a store mo-after it, which
-    /// clears every floor too. The RMW read path needs no such filter —
-    /// `match_rmw_to_stores` offers only mo-maximal stores, and a candidate
-    /// mo-before a floor has a known mo successor, so it was never offered.
-    fn filter_seen_op_floors(
-        &self,
-        ri: usize,
-        view: &LoadView,
-        seed: &mut [u8],
-        n: usize,
-    ) -> usize {
+    /// `readable_mask` is superseded by a store mo-after it, which clears every
+    /// floor too. A read of an RMW is filtered alike, whichever arm it takes; a
+    /// write is placed after the floors instead (`floor_mask`).
+    fn filter_seen_op_floors(&self, ri: usize, view: &LoadView, candidates: Slots) -> Slots {
         // A cell never touched by a masked op has one region — no siblings.
-        if self.regions.len() <= 1 {
-            return n;
+        if self.regions.len() <= 1 || candidates == 0 {
+            return candidates;
         }
 
         let region = &self.regions[ri];
-        let mut w = 0;
+        let mut kept = 0;
 
         // `op_seen_through_other_region` is an O(regions x stores) sweep whose
         // answer depends only on the floor slot (`f.op_id` is a function of
         // `f_idx` — one region holds one store per op). The candidate loop
-        // re-asks it for the same floors up to `n` times, so resolve each slot
-        // at most once. `None` = not yet asked; the floor is only consulted
+        // re-asks it for the same floors once per candidate, so resolve each
+        // slot at most once. `None` = not yet asked; the floor is only consulted
         // when `mo_before` holds, so this stays lazy.
         let live = region.live_stores();
         let mut seen_memo: [Option<bool>; MAX_ATOMIC_HISTORY] = [None; MAX_ATOMIC_HISTORY];
@@ -4216,8 +4256,8 @@ impl State {
         let live_pre = region.live_preserved();
         let mut pre_memo: [Option<bool>; MAX_ATOMIC_HISTORY] = [None; MAX_ATOMIC_HISTORY];
 
-        'candidate: for k in 0..n {
-            let c = &region.stores[seed[k] as usize];
+        'candidate: for ci in slots(candidates) {
+            let c = &region.stores[ci];
 
             for f_idx in 0..live {
                 let f = &region.stores[f_idx];
@@ -4266,27 +4306,65 @@ impl State {
                 }
             }
 
-            seed[w] = seed[k];
-            w += 1;
+            kept |= bit(ci);
         }
 
         assert!(
-            w > 0,
+            kept != 0,
             "[loom internal bug] cell-coherence floor filter emptied a readable set"
         );
-        w
+        kept
+    }
+
+    /// The floors of region `ri` for a write whose observations `view` holds:
+    /// each store whose whole-cell op the active thread observed through
+    /// another region, ordered before the write, and for a preserving op so
+    /// observed the store it carried. The write goes modification-order-after
+    /// all of them, as a read of the region may not go before one
+    /// (`filter_seen_op_floors`).
+    fn floor_mask(&self, ri: usize, view: &LoadView) -> Slots {
+        if self.regions.len() <= 1 {
+            return 0;
+        }
+
+        let region = &self.regions[ri];
+        let mut floors = 0;
+        for (i, f) in region.stores.iter().enumerate() {
+            // The genesis is mo-before every store already.
+            if f.id != 0 && self.op_seen_through_other_region(ri, f.op_id, view) {
+                floors |= bit(i);
+            }
+        }
+        for p in region.preserved_ops() {
+            if let Some(s) = region.slot_of_store(p.read.read_id) {
+                if floors & bit(s) == 0 && self.op_seen_through_other_region(ri, p.op_id, view) {
+                    floors |= bit(s);
+                }
+            }
+        }
+        floors
+    }
+
+    /// [`Self::floor_mask`] for each region of the cell, for an access that
+    /// writes at `ordering`; empty where the cell has one region.
+    fn write_floors(&self, threads: &thread::Set, ordering: Ordering) -> SmallVec<[Slots; 4]> {
+        if self.regions.len() <= 1 {
+            return SmallVec::from_elem(0, self.regions.len());
+        }
+        let view = LoadView::writing(threads, ordering);
+        (0..self.regions.len()).map(|ri| self.floor_mask(ri, &view)).collect()
     }
 
     /// True when the active thread has observed whole-cell op `op_id` through
     /// some region other than `ri` — i.e. that region holds a store `g` which
     /// is op `op_id`'s sibling there or modification-order-after it, and which
-    /// the thread observed in a way ordered before this load
+    /// the thread observed in a way ordered before this access
     /// ([`LoadView::is_seen`]).
     ///
     /// The thread may have *read* the wide op through another lane (`g` is
     /// that op's sibling, or a later store it read) or *written* that lane
     /// past it (`g` is its own store). Either way the floor stands only when
-    /// the observation is ordered before this load on both targets; a
+    /// the observation is ordered before this access on the target; a
     /// genuinely-concurrent op, or an unordered observation, never floors.
     fn op_seen_through_other_region(&self, ri: usize, op_id: u64, view: &LoadView) -> bool {
         for (rj, other) in self.regions.iter().enumerate() {
@@ -4920,6 +4998,7 @@ impl Region {
         self.cnt = 1;
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn store(
         &mut self,
         threads: &mut thread::Set,
@@ -4928,8 +5007,9 @@ impl Region {
         ordering: Ordering,
         sc_rank: Option<u32>,
         op_id: u64,
+        floors: Slots,
     ) {
-        self.append(threads, sync, value, ordering, sc_rank, op_id, None);
+        self.append(threads, sync, value, ordering, sc_rank, op_id, None, floors);
     }
 
     /// Append a store and order it after every store it must follow: each
@@ -4941,7 +5021,8 @@ impl Region {
     /// per-location and never enters causality.
     ///
     /// `rmw_read` is the slot an RMW's write read; the write goes right after
-    /// it, and `order` keeps the pair adjacent from here on.
+    /// it, and `order` keeps the pair adjacent from here on. `floors` are the
+    /// stores of the region's whole-cell floor (`State::floor_mask`).
     #[allow(clippy::too_many_arguments)]
     fn append(
         &mut self,
@@ -4952,6 +5033,7 @@ impl Region {
         sc_rank: Option<u32>,
         op_id: u64,
         rmw_read: Option<usize>,
+        floors: Slots,
     ) {
         let slot = self.next_slot();
 
@@ -4960,7 +5042,8 @@ impl Region {
         let sc_scope = threads.active_sc_scope(sc_rank.is_some());
         let mut preds = self.seen_mask(&threads.active().coherence_view())
             | self.genesis_mask()
-            | self.sc_mask(sc_scope);
+            | self.sc_mask(sc_scope)
+            | floors;
         if let Some(r) = rmw_read {
             preds |= bit(r);
         }
@@ -5005,7 +5088,9 @@ impl Region {
     }
 
     /// The write half of a successful RMW: synchronize with the read store and
-    /// append the new value immediately after it in modification order.
+    /// append the new value immediately after it in modification order, and
+    /// after `floors`.
+    #[allow(clippy::too_many_arguments)]
     fn rmw_commit(
         &mut self,
         threads: &mut thread::Set,
@@ -5014,6 +5099,7 @@ impl Region {
         success: Ordering,
         sc_rank: Option<u32>,
         op_id: u64,
+        floors: Slots,
     ) {
         // Perform load synchronization using the `success` ordering.
         self.stores[index].sync.sync_load(threads, success);
@@ -5024,7 +5110,7 @@ impl Region {
         // The write inherits the read store's release view: the release
         // sequence an RMW continues.
         let sync = self.stores[index].sync;
-        self.append(threads, sync, next, success, sc_rank, op_id, Some(index));
+        self.append(threads, sync, next, success, sc_rank, op_id, Some(index), floors);
     }
 
     /// Append a store modification-order-after every store of the region,
@@ -5112,15 +5198,23 @@ impl Region {
     /// can all follow the write: no RMW write already sits right after it,
     /// and adding the write there — after everything the RMW must follow,
     /// before every successor of the store it read — closes no cycle
-    /// (`Region::rmw_edges`, run on a scratch copy of the order).
-    fn rmw_writable(&self, threads: &thread::Set, view: &VersionVec, success: Ordering) -> Slots {
+    /// (`Region::rmw_edges`, run on a scratch copy of the order). `floors` are
+    /// among what the RMW must follow (`State::floor_mask`), which is what
+    /// keeps its read off every store before one.
+    fn rmw_writable(
+        &self,
+        threads: &thread::Set,
+        view: &VersionVec,
+        success: Ordering,
+        floors: Slots,
+    ) -> Slots {
         let maximal = self.maximal_mask();
         let inner = self.readable_mask(threads, view, success) & self.overtaken(threads);
         if inner == 0 {
             return maximal;
         }
 
-        let preds = self.write_preds(threads, view, success);
+        let preds = self.write_preds(threads, view, success) | floors;
         let mut writable = maximal;
         for s in slots(inner) {
             if self.stores[s].rmw_write.is_some() {
@@ -5330,22 +5424,6 @@ impl Region {
         }
 
         readable
-    }
-
-    /// [`Self::readable_mask`] as the candidate list a load branches over.
-    fn match_load_to_stores(
-        &self,
-        threads: &thread::Set,
-        view: &VersionVec,
-        dst: &mut [u8],
-        ordering: Ordering,
-    ) -> usize {
-        let mut n = 0;
-        for i in slots(self.readable_mask(threads, view, ordering)) {
-            dst[n] = i as u8;
-            n += 1;
-        }
-        n
     }
 
     /// Promote into the SC total order S, at an executing `SeqCst` fence's
@@ -5605,6 +5683,12 @@ fn acquires(order: Ordering) -> bool {
     matches!(order, Ordering::Acquire | Ordering::AcqRel | Ordering::SeqCst)
 }
 
+/// True when a write of this ordering is ordered after every earlier access of
+/// its thread (`STLR`; C++ release).
+fn releases(order: Ordering) -> bool {
+    matches!(order, Ordering::Release | Ordering::AcqRel | Ordering::SeqCst)
+}
+
 /// The SC scope a read of this ordering obeys in the current thread: all of S
 /// for a `SeqCst` read, else the latest `SeqCst` fence happening before it
 /// (C++20 [atomics.order] p4), else none.
@@ -5614,6 +5698,17 @@ fn sc_scope(threads: &thread::Set, ordering: Ordering) -> Option<u32> {
 
 fn bit(slot: usize) -> Slots {
     1 << slot
+}
+
+/// Write the slots of `set` into `dst`, ascending — the candidate list a read
+/// branches over — and return how many.
+fn seed_of(set: Slots, dst: &mut [u8; MAX_ATOMIC_HISTORY]) -> usize {
+    let mut n = 0;
+    for i in slots(set) {
+        dst[n] = i as u8;
+        n += 1;
+    }
+    n
 }
 
 /// The slots of `set`, ascending.

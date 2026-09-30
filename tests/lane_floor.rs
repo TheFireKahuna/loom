@@ -37,6 +37,22 @@
 //! The own-store rows read lane B first: that read is what makes the store
 //! coherence-after the wide op in the model, which fixes modification order
 //! only from what the writer has seen. On x86 that read alone floors.
+//!
+//! The floor binds every access to lane A the observation is ordered before,
+//! not only a load: an RMW's read, a failed compare-exchange's read, and where
+//! a store lands in lane A's modification order. A store is ordered after an
+//! earlier read by an acquire on the read, an acquire fence between them, or
+//! its own release (AArch64 `bob`: `[A];po`, `[R];po;[dmb.ld]`, `po;[L]`), and
+//! on x86 always.
+//!
+//! | Observation, then lane-A access                  | AArch64 | x86    |
+//! |--------------------------------------------------|---------|--------|
+//! | acquire read of B, relaxed RMW of A              | forbid  | forbid |
+//! | relaxed read of B, relaxed RMW of A              | allowed | forbid |
+//! | acquire read of B, failed relaxed CAS of A       | forbid  | forbid |
+//! | acquire read of B, relaxed store to A            | forbid  | forbid |
+//! | relaxed read of B, relaxed store to A            | allowed | forbid |
+//! | relaxed read of B, release store to A            | forbid  | forbid |
 
 use loom::sync::atomic::{fence, AtomicU128, AtomicU32, Ordering, Ordering::*};
 use loom::thread;
@@ -497,4 +513,94 @@ fn wide_rmw_never_sees_a_release_lane_store_without_the_earlier_one() {
     let seen = wide_access_of_ordered_lane_stores(Release, false, |x| x.fetch_add(0, Relaxed));
     assert_target(&seen, TRAVELLED, false);
     assert!(seen.contains(&(0, 0)) && seen.contains(&(1, 1)), "{seen:?}");
+}
+
+/// Read lane B at `b_order`, then run `access` on lane A: `(b, a)`, where `a`
+/// is what the access read.
+fn rmw_route(b_order: Ordering, access: fn(&AtomicU128) -> u64) -> BTreeSet<(u64, u64)> {
+    explore(move |x| {
+        let b = x.lane_u64(8).load(b_order);
+        Some((b, access(x)))
+    })
+}
+
+// AArch64 RMW-after-acq: `LDAR W0,[x+4]; LDADD W4,W2,[x]` — Never.
+#[test]
+fn acquire_sibling_read_floors_a_later_rmw() {
+    let seen = rmw_route(Acquire, |x| x.lane_u64(0).fetch_add(0, Relaxed));
+    assert!(!seen.contains(&TRAVELLED), "{seen:?}");
+    assert!(seen.contains(&(1, 1)) && seen.contains(&(0, 0)), "{seen:?}");
+}
+
+// AArch64 RMW-after-rlx: `LDR W0,[x+4]; LDADD W4,W2,[x]` — Sometimes. x86:
+// loads stay in order, and the RMW's read is one.
+#[test]
+fn relaxed_sibling_read_floors_a_later_rmw_only_on_x86() {
+    let seen = rmw_route(Relaxed, |x| x.lane_u64(0).fetch_add(0, Relaxed));
+    assert_target(&seen, TRAVELLED, !X86);
+}
+
+// A failed compare-exchange is a load at its failure ordering: `LDAR; CAS`
+// failing — Never.
+#[test]
+fn acquire_sibling_read_floors_a_later_failed_cas() {
+    let seen = rmw_route(Acquire, |x| {
+        x.lane_u64(0)
+            .compare_exchange(7, 8, Relaxed, Relaxed)
+            .expect_err("lane A never holds 7")
+    });
+    assert!(!seen.contains(&TRAVELLED), "{seen:?}");
+    assert!(seen.contains(&(1, 1)) && seen.contains(&(0, 0)), "{seen:?}");
+}
+
+/// Read lane B at `b_order`, then store 2 to lane A at `a_order`; once the
+/// wide op joins, read where lane A ended: `(b, final a)`.
+fn store_route(b_order: Ordering, a_order: Ordering) -> BTreeSet<(u64, u64)> {
+    let seen: Outcomes = Default::default();
+    let seen_ = seen.clone();
+    loom::model(move || {
+        let x = Arc::new(AtomicU128::new(0));
+        x.store_masked(LANE_A, 0, Relaxed);
+
+        let w = {
+            let x = x.clone();
+            thread::spawn(move || x.store(WIDE, Relaxed))
+        };
+        let b = x.lane_u64(8).load(b_order);
+        x.lane_u64(0).store(2, a_order);
+        w.join().unwrap();
+        let a = x.lane_u64(0).load(Relaxed);
+        seen_.lock().unwrap().insert((b, a));
+    });
+    let seen = seen.lock().unwrap().clone();
+    seen
+}
+
+/// Lane A ended at the wide op's half although the store read its lane B
+/// first: the store landed modification-order-before the wide op.
+const STORE_TRAVELLED: (u64, u64) = (1, 1);
+
+// AArch64 W-after-acq: `LDAR W0,[x+4]; STR W4,[x]` with `W` coherence-after
+// the store — Never.
+#[test]
+fn acquire_sibling_read_floors_a_later_store() {
+    let seen = store_route(Acquire, Relaxed);
+    assert!(!seen.contains(&STORE_TRAVELLED), "{seen:?}");
+    assert!(seen.contains(&(1, 2)) && seen.contains(&(0, 1)), "{seen:?}");
+}
+
+// AArch64 W-after-rlx: `LDR W0,[x+4]; STR W4,[x]` — Sometimes: nothing orders
+// the read before the store. x86: a store never passes an earlier load.
+#[test]
+fn relaxed_sibling_read_floors_a_later_store_only_on_x86() {
+    let seen = store_route(Relaxed, Relaxed);
+    assert_target(&seen, STORE_TRAVELLED, !X86);
+}
+
+// AArch64 W-rel-after-rlx: `LDR W0,[x+4]; STLR W4,[x]` — Never: a release
+// store is ordered after everything before it.
+#[test]
+fn relaxed_sibling_read_floors_a_later_release_store() {
+    let seen = store_route(Relaxed, Release);
+    assert!(!seen.contains(&STORE_TRAVELLED), "{seen:?}");
 }
