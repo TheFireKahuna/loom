@@ -318,6 +318,11 @@ impl Path {
         }
     }
 
+    /// The preemption bound this path is explored under.
+    pub(crate) fn preemption_bound(&self) -> Option<u8> {
+        self.preemption_bound
+    }
+
     /// Whether a preemption bound limits the search.
     pub(crate) fn is_bounded(&self) -> bool {
         self.preemption_bound.is_some()
@@ -360,8 +365,14 @@ impl Path {
     }
 
     pub(crate) fn set_max_branches(&mut self, max_branches: usize) {
-        self.branches
-            .reserve_exact(max_branches - self.branches.len());
+        let len = self.branches.len();
+
+        assert!(
+            len <= max_branches,
+            "the loaded path has {len} branches, more than max_branches ({max_branches})"
+        );
+
+        self.branches.reserve_exact(max_branches - len);
     }
 
     /// Returns `true` if the execution has reached a point where the known path

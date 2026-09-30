@@ -511,7 +511,22 @@ impl Builder {
 
         if let Some(ref path) = self.checkpoint_file {
             if path.exists() {
-                execution.path = checkpoint::load_execution_path(path);
+                let saved = checkpoint::load_execution_path(path);
+
+                // The saved prefix was explored, and its backtrack points
+                // placed, under the bound it was written with; resumed under
+                // another, the walk would be neither bound's.
+                let bound = saved.preemption_bound().map(usize::from);
+                assert_eq!(
+                    bound, self.preemption_bound,
+                    "checkpoint {} was written under preemption_bound {:?}, \
+                     but this Builder's is {:?}",
+                    path.display(),
+                    bound,
+                    self.preemption_bound,
+                );
+
+                execution.path = saved;
                 execution.path.set_max_branches(self.max_branches);
             }
         }
