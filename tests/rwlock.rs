@@ -162,3 +162,31 @@ fn rwlock_into_inner() {
         assert_eq!(lock, 2);
     })
 }
+
+// An unlock is a step of its own: a peer's `try_read` or `try_write` may run
+// while a critical section with no modelled op inside it still holds the lock.
+#[test]
+fn try_locks_see_empty_critical_sections_held() {
+    use std::sync::atomic::{AtomicBool, Ordering::SeqCst};
+
+    static READ_FAILED: AtomicBool = AtomicBool::new(false);
+    static WRITE_FAILED: AtomicBool = AtomicBool::new(false);
+    loom::model(|| {
+        let l = Arc::new(RwLock::new(()));
+        let l2 = l.clone();
+        let t = thread::spawn(move || drop(l2.write().unwrap()));
+        if l.try_read().is_err() {
+            READ_FAILED.store(true, SeqCst);
+        }
+        t.join().unwrap();
+
+        let l2 = l.clone();
+        let t = thread::spawn(move || drop(l2.read().unwrap()));
+        if l.try_write().is_err() {
+            WRITE_FAILED.store(true, SeqCst);
+        }
+        t.join().unwrap();
+    });
+    assert!(READ_FAILED.load(SeqCst), "try_read never saw the write lock held");
+    assert!(WRITE_FAILED.load(SeqCst), "try_write never saw the read lock held");
+}

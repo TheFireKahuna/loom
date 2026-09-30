@@ -91,3 +91,23 @@ fn mutex_into_inner() {
         assert_eq!(lock, 2);
     })
 }
+
+// An unlock is a step of its own: a peer's `try_lock` may run while a critical
+// section with no modelled op inside it still holds the lock.
+#[test]
+fn try_lock_sees_an_empty_critical_section_held() {
+    use loom::sync::Arc;
+    use std::sync::atomic::AtomicBool;
+
+    static FAILED: AtomicBool = AtomicBool::new(false);
+    loom::model(|| {
+        let m = Arc::new(Mutex::new(()));
+        let m2 = m.clone();
+        let t = thread::spawn(move || drop(m2.lock().unwrap()));
+        if m.try_lock().is_err() {
+            FAILED.store(true, SeqCst);
+        }
+        t.join().unwrap();
+    });
+    assert!(FAILED.load(SeqCst), "try_lock never saw the lock held");
+}

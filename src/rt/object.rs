@@ -109,6 +109,9 @@ pub(super) enum Action {
     /// Action on a channel
     Channel(rt::mpsc::Action),
 
+    /// Action on a Mutex
+    Mutex(rt::mutex::Action),
+
     /// Action on a RwLock
     RwLock(rt::rwlock::Action),
 
@@ -777,6 +780,12 @@ impl From<rt::atomic::Action> for Action {
 impl From<rt::mpsc::Action> for Action {
     fn from(action: rt::mpsc::Action) -> Self {
         Action::Channel(action)
+    }
+}
+
+impl From<rt::mutex::Action> for Action {
+    fn from(action: rt::mutex::Action) -> Self {
+        Action::Mutex(action)
     }
 }
 

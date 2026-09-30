@@ -25,6 +25,16 @@ pub(super) struct State {
     synchronize: Synchronize,
 }
 
+/// What a thread's pending operation on the mutex is. Only `Lock` blocks:
+/// another thread taking the lock disables a pending `Lock`, never a pending
+/// `TryLock`, which is to fail there instead.
+#[derive(Debug, Copy, Clone, PartialEq)]
+pub(super) enum Action {
+    Lock,
+    TryLock,
+    Unlock,
+}
+
 impl Mutex {
     pub(crate) fn new(seq_cst: bool) -> Mutex {
         super::execution(|execution| {
@@ -42,15 +52,26 @@ impl Mutex {
     }
 
     pub(crate) fn acquire_lock(&self, location: Location) {
-        self.state.branch_acquire(self.is_locked(), location);
+        self.state.branch_disable(Action::Lock, self.is_locked(), location);
         assert!(self.post_acquire(), "expected to be able to acquire lock");
     }
 
     pub(crate) fn try_acquire_lock(&self, location: Location) -> bool {
-        self.state.branch_opaque(location);
+        self.state.branch_action(Action::TryLock, location);
         self.post_acquire()
     }
 
+    /// A guard's unlock: a step of its own, so a peer's `try_lock` can find
+    /// the lock held however little the critical section does.
+    pub(crate) fn unlock(&self, location: Location) {
+        if super::execution(|execution| execution.threads.is_active()) {
+            self.state.branch_action(Action::Unlock, location);
+        }
+        self.release_lock();
+    }
+
+    /// The release itself, with no step of its own: a condvar wait releases
+    /// inside the step that enqueues it.
     pub(crate) fn release_lock(&self) {
         super::execution(|execution| {
             let state = self.state.get_mut(&mut execution.objects);
@@ -112,14 +133,16 @@ impl Mutex {
                 execution.threads.seq_cst();
             }
 
-            // Block all **other** threads attempting to acquire the mutex
+            // Block all **other** threads waiting to acquire the mutex
             for (id, thread) in execution.threads.iter_mut() {
                 if id == thread_id {
                     continue;
                 }
 
                 if let Some(operation) = thread.operation.as_ref() {
-                    if operation.object() == self.state.erase() {
+                    if operation.object() == self.state.erase()
+                        && operation.action() == object::Action::Mutex(Action::Lock)
+                    {
                         let location = operation.location();
                         trace!(state = ?self.state, thread = ?id,
                             "Mutex::post_acquire");

@@ -114,8 +114,9 @@ impl<'a, T: ?Sized> ops::DerefMut for MutexGuard<'a, T> {
 }
 
 impl<'a, T: ?Sized + 'a> Drop for MutexGuard<'a, T> {
+    #[track_caller]
     fn drop(&mut self) {
         self.data = None;
-        self.lock.object.get().release_lock();
+        self.lock.object.get().unlock(location!());
     }
 }

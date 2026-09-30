@@ -15,6 +15,9 @@ enum Locked {
     Write(thread::Id),
 }
 
+/// What a thread's pending operation on the lock is. Only `Read` and `Write`
+/// block: another thread taking the lock disables those, never a pending `Try*`,
+/// which is to fail there instead.
 #[derive(Debug, Copy, Clone, PartialEq)]
 pub(super) enum Action {
     /// Read lock
@@ -22,6 +25,15 @@ pub(super) enum Action {
 
     /// Write lock
     Write,
+
+    /// `try_read`
+    TryRead,
+
+    /// `try_write`
+    TryWrite,
+
+    /// Either guard's unlock
+    Unlock,
 }
 
 #[derive(Debug)]
@@ -79,16 +91,19 @@ impl RwLock {
     }
 
     pub(crate) fn try_acquire_read_lock(&self, location: Location) -> bool {
-        self.state.branch_action(Action::Read, location);
+        self.state.branch_action(Action::TryRead, location);
         self.post_acquire_read_lock()
     }
 
     pub(crate) fn try_acquire_write_lock(&self, location: Location) -> bool {
-        self.state.branch_action(Action::Write, location);
+        self.state.branch_action(Action::TryWrite, location);
         self.post_acquire_write_lock()
     }
 
-    pub(crate) fn release_read_lock(&self) {
+    /// A read guard's unlock: a step of its own, so a peer's `try_write` can
+    /// find the lock held however little the critical section does.
+    pub(crate) fn release_read_lock(&self, location: Location) {
+        self.branch_release(location);
         super::execution(|execution| {
             let state = self.state.get_mut(&mut execution.objects);
             let thread_id = execution.threads.active_id();
@@ -115,7 +130,9 @@ impl RwLock {
         });
     }
 
-    pub(crate) fn release_write_lock(&self) {
+    /// A write guard's unlock, a step of its own as a read unlock is.
+    pub(crate) fn release_write_lock(&self, location: Location) {
+        self.branch_release(location);
         super::execution(|execution| {
             let state = self.state.get_mut(&mut execution.objects);
 
@@ -132,6 +149,12 @@ impl RwLock {
 
             self.unlock_threads(execution, thread_id);
         });
+    }
+
+    fn branch_release(&self, location: Location) {
+        if super::execution(|execution| execution.threads.is_active()) {
+            self.state.branch_action(Action::Unlock, location);
+        }
     }
 
     fn unlock_threads(&self, execution: &mut Execution, thread_id: thread::Id) {
@@ -239,15 +262,17 @@ impl RwLock {
             // Establish sequential consistency between locks
             execution.threads.seq_cst();
 
-            // Block all other threads attempting to acquire rwlock
-            // Block all writer threads from attempting to acquire the RwLock
+            // Block all other threads waiting to acquire the RwLock
             for (id, th) in execution.threads.iter_mut() {
                 if id == thread_id {
                     continue;
                 }
 
                 match th.operation.as_ref() {
-                    Some(op) if op.object() == self.state.erase() => {
+                    Some(op)
+                        if op.object() == self.state.erase()
+                            && (op.action() == Action::Read || op.action() == Action::Write) =>
+                    {
                         let location = op.location();
                         th.set_blocked(location, false);
                     }
