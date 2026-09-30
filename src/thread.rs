@@ -167,6 +167,13 @@ where
 /// qualifies; asserting *which* member got an outcome does not). Divergence
 /// the members earn at runtime from shared state is fine — the relabeling
 /// carries it.
+///
+/// Joining is part of that uniformity. The handles come back in spawn order,
+/// and joining them one by one singles members out: nothing observable may
+/// happen between two joins of the group, or an assertion made there tells
+/// the first-joined member apart from the rest. Join the whole group, then
+/// observe. (Under a preemption bound the relabeling needs no more
+/// preemptions than the execution it stands for only when that holds.)
 #[track_caller]
 pub fn symmetric<F, T>(n: usize, f: F) -> Vec<JoinHandle<T>>
 where
