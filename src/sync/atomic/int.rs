@@ -387,6 +387,25 @@ macro_rules! atomic_int {
                 self.0.try_update(set_order, fetch_order, f)
             }
 
+            /// An alias for [`Self::try_update`], deprecated as `core`'s is.
+            #[track_caller]
+            #[deprecated(
+                since = "1.99.0",
+                note = "renamed to `try_update` for consistency",
+                suggestion = "try_update"
+            )]
+            pub fn fetch_update<F>(
+                &self,
+                set_order: Ordering,
+                fetch_order: Ordering,
+                f: F,
+            ) -> Result<$int_type, $int_type>
+            where
+                F: FnMut($int_type) -> Option<$int_type>,
+            {
+                self.try_update(set_order, fetch_order, f)
+            }
+
             /// Fetches the value, and applies a function to it that returns a new value.
             /// The new value is stored and the old value is returned.
             ///

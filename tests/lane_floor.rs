@@ -32,6 +32,7 @@
 //! | ... own release store, acquire load of A         | allowed | forbid |
 //! | ... own store, `fence(SeqCst)`                   | forbid  | forbid |
 //! | ... own `SeqCst` store, `SeqCst` load of A       | forbid  | forbid |
+//! | ... own release store, `SeqCst` load of A        | forbid  | forbid |
 //! | uncommunicating `SeqCst` fences                  | allowed | allowed|
 //!
 //! The own-store rows read lane B first: that read is what makes the store
@@ -603,4 +604,143 @@ fn relaxed_sibling_read_floors_a_later_store_only_on_x86() {
 fn relaxed_sibling_read_floors_a_later_release_store() {
     let seen = store_route(Relaxed, Release);
     assert!(!seen.contains(&STORE_TRAVELLED), "{seen:?}");
+}
+
+// AArch64 RWR-rel-sc: `LDR; STLR W4,[x+4]; LDAR W2,[x]` — Never: `STLR` is
+// ordered before a later `LDAR` (`[L];po;[A]`), whatever the store's C++
+// ordering beyond release.
+#[test]
+fn own_release_store_then_seq_cst_load_floors() {
+    let seen = write_route(Release, None, SeqCst);
+    assert!(!seen.contains(&TRAVELLED), "{seen:?}");
+    assert!(seen.contains(&(1, 1)), "{seen:?}");
+}
+
+// The dual binds from the first barrier the store's creator runs after it, not
+// its latest: the presence load sits between two `SeqCst` fences, the second
+// after it. `STR W4,[x]; DMB ISH; LDAR W6,[x+4]; DMB ISH` against a
+// snapshot-then-`CASP` push — Never on AArch64, and on x86 (`mfence`).
+#[test]
+fn seq_cst_fence_orders_a_later_push_whatever_barrier_follows() {
+    const V: u128 = u64::MAX as u128;
+    let seen: Outcomes = Default::default();
+    let seen_ = seen.clone();
+    loom::model(move || {
+        let x = Arc::new(AtomicU128::new(0));
+        x.store_masked(V, 0, Relaxed);
+
+        let waiter = {
+            let x = x.clone();
+            thread::spawn(move || {
+                let snap = x.load(Acquire);
+                snap & V == 0 && x.compare_exchange(snap, snap | (1 << 64), AcqRel, Relaxed).is_ok()
+            })
+        };
+        x.lane_u64(0).store(1, Relaxed);
+        fence(SeqCst);
+        let s = x.lane_u64(8).load(Acquire);
+        fence(SeqCst);
+        let pushed = waiter.join().unwrap();
+        seen_.lock().unwrap().insert((u64::from(pushed), s));
+    });
+    let seen = seen.lock().unwrap().clone();
+    assert!(!seen.contains(&(1, 0)), "{seen:?}");
+    assert!(seen.contains(&(1, 1)) && seen.contains(&(0, 0)), "{seen:?}");
+}
+
+/// A peer stores lane A; a second thread, having observed that store through
+/// `observe`, stores lane B; the active thread reads the whole cell in one
+/// relaxed load: `(b, a)`.
+fn wide_read_behind_an_observation(observe: fn(&AtomicU128) -> bool) -> BTreeSet<(u64, u64)> {
+    let seen: Outcomes = Default::default();
+    let seen_ = seen.clone();
+    loom::model(move || {
+        let x = Arc::new(AtomicU128::new(0));
+        x.store_masked(LANE_A, 0, Relaxed);
+
+        let a = {
+            let x = x.clone();
+            thread::spawn(move || x.lane_u64(0).store(1, Relaxed))
+        };
+        let b = {
+            let x = x.clone();
+            thread::spawn(move || {
+                if observe(&x) {
+                    x.lane_u64(8).store(1, Relaxed);
+                }
+            })
+        };
+        let v = x.load(Relaxed);
+        a.join().unwrap();
+        b.join().unwrap();
+        seen_.lock().unwrap().insert(((v >> 64) as u64, v as u64));
+    });
+    let seen = seen.lock().unwrap().clone();
+    seen
+}
+
+// `STR x_A=1` | `LDAR W0,[x_A]; STR x_B=1` | one wide `LDR Q` — the read may
+// not take lane B's store and miss lane A's: `W_A ->rfe LDAR ->bob W_B ->rfe R
+// ->fre W_A` (AArch64), and TSO is causal (x86). Never.
+#[test]
+fn wide_read_never_sees_a_store_ordered_by_an_acquire_without_what_it_read() {
+    let seen = wide_read_behind_an_observation(|x| x.lane_u64(0).load(Acquire) == 1);
+    assert_target(&seen, TRAVELLED, false);
+    assert!(seen.contains(&(1, 1)) && seen.contains(&(0, 0)), "{seen:?}");
+}
+
+// The same through `LDR; DMB ISHLD; STR` — Never.
+#[test]
+fn wide_read_never_sees_a_store_ordered_by_an_acquire_fence_without_what_it_read() {
+    let seen = wide_read_behind_an_observation(|x| {
+        let a = x.lane_u64(0).load(Relaxed);
+        fence(Acquire);
+        a == 1
+    });
+    assert_target(&seen, TRAVELLED, false);
+}
+
+// Without an acquire the observing read is unordered with the store after it
+// on AArch64 (`LDR; STR` — Sometimes); x86 keeps them in order.
+#[test]
+fn wide_read_sees_a_store_after_a_relaxed_observation_reordered_only_on_aarch64() {
+    let seen = wide_read_behind_an_observation(|x| x.lane_u64(0).load(Relaxed) == 1);
+    assert_target(&seen, TRAVELLED, !X86);
+}
+
+// The lane-A store reaches the lane-B writer through a release/acquire flag,
+// never read by the writer itself: `STR x_A; STLR f` | `LDAR f; STR x_B` | one
+// wide read — Never on AArch64 (cumulativity), and on x86 (TSO is causal).
+#[test]
+fn wide_read_never_sees_a_store_behind_a_synchronized_one_without_it() {
+    let seen: Outcomes = Default::default();
+    let seen_ = seen.clone();
+    loom::model(move || {
+        let x = Arc::new(AtomicU128::new(0));
+        let flag = Arc::new(AtomicU32::new(0));
+        x.store_masked(LANE_A, 0, Relaxed);
+
+        let a = {
+            let (x, flag) = (x.clone(), flag.clone());
+            thread::spawn(move || {
+                x.lane_u64(0).store(1, Relaxed);
+                flag.store(1, Release);
+            })
+        };
+        let b = {
+            let (x, flag) = (x.clone(), flag.clone());
+            thread::spawn(move || {
+                if flag.load(Acquire) == 1 {
+                    x.lane_u64(8).store(1, Relaxed);
+                }
+            })
+        };
+        let v = x.load(Relaxed);
+        a.join().unwrap();
+        b.join().unwrap();
+        seen_.lock().unwrap().insert(((v >> 64) as u64, v as u64));
+    });
+    let seen = seen.lock().unwrap().clone();
+    assert_target(&seen, TRAVELLED, false);
+    assert!(seen.contains(&(1, 1)) && seen.contains(&(0, 0)), "{seen:?}");
 }

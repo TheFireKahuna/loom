@@ -54,6 +54,11 @@ pub(crate) struct Thread {
     /// none — a full barrier on some targets (`rt::atomic::LANE_FLOOR`).
     pub(crate) rmw_version: u16,
 
+    /// lanes: own-clock versions of every full barrier this thread has run —
+    /// each `SeqCst` fence, and each RMW where the target makes one a barrier
+    /// — ascending. What tells a peer which barrier first followed a store.
+    pub(crate) barriers: smallvec::SmallVec<[u16; 8]>,
+
     /// `std::thread::park`'s token.
     park_token: bool,
 
@@ -207,6 +212,7 @@ impl Thread {
             acq_fence_version: 0,
             sc_fence_version: 0,
             rmw_version: 0,
+            barriers: smallvec::SmallVec::new(),
             park_token: false,
             park_view: Synchronize::new(),
             parked: false,

@@ -78,3 +78,26 @@ fn try_update_retries_a_spurious_failure() {
 
     assert_eq!(out, HashSet::from([(Ok(3), 1), (Ok(3), 2)]));
 }
+
+/// A spurious failure is the exclusive monitor lost; a store landing on the
+/// cell between two attempts clears it again, even one writing the value the
+/// attempt expects. So a retry loop may fail spuriously twice running around
+/// a peer's store, and still terminates once the peer is done.
+#[test]
+fn weak_cas_fails_spuriously_again_after_a_store_lands() {
+    let out = outcomes(|| {
+        let x = Arc::new(AtomicUsize::new(0));
+        let t = {
+            let x = x.clone();
+            loom::thread::spawn(move || x.store(0, Relaxed))
+        };
+        let mut attempts = 0;
+        while x.compare_exchange_weak(0, 1, AcqRel, Acquire).is_err() {
+            attempts += 1;
+        }
+        t.join().unwrap();
+        attempts
+    });
+
+    assert_eq!(out, HashSet::from([0, 1, 2]));
+}

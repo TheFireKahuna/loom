@@ -1366,11 +1366,14 @@ pub(crate) trait ModelOps {
     /// failure returns the value read.
     ///
     /// A spurious failure is the failure-ordering load of a real one, taking a
-    /// value that passes the compare. It is explored as its own branch, and a
-    /// thread's weak compare-exchange right after its own spurious failure on
-    /// the same cell does not fail spuriously: a retry loop takes at most one
-    /// spurious failure per genuine attempt, so it terminates, while every
-    /// weak compare-exchange site still has its spurious arm explored.
+    /// value that passes the compare. It is explored as its own branch. On a
+    /// target that spurs, it is the exclusive monitor lost between the
+    /// load-exclusive and the store-exclusive: to an exception, or to another
+    /// thread's store to the bits. So after a thread's spurious failure on a
+    /// cell, its next weak compare-exchange there fails spuriously again only
+    /// once another thread has stored to the bits it covers since: a retry
+    /// loop takes one spurious failure more than the peer stores it races,
+    /// and terminates once they do.
     #[allow(clippy::too_many_arguments)]
     fn compare_exchange_weak(
         &self,
@@ -1461,11 +1464,12 @@ pub(super) struct State {
     /// `first_seen.touch` runs (see `track_load`/`track_store`).
     touched_by: u32,
 
-    /// Threads (one bit each) whose latest `compare_exchange_weak` on this
-    /// cell failed spuriously. Such a thread's next weak compare-exchange here
-    /// behaves as the strong one, which is what bounds a retry loop's
-    /// spurious failures.
-    spurious_last: u32,
+    /// Per thread whose latest `compare_exchange_weak` on this cell failed
+    /// spuriously, how many stores other threads had made to the bits it
+    /// covered then (`State::foreign_stores`). Its next weak compare-exchange
+    /// here behaves as the strong one unless that count has moved, which is
+    /// what bounds a retry loop's spurious failures.
+    spurious_at: [Option<u32>; MAX_THREADS],
 
     /// Region carcasses from previous epochs of this cell. A reincarnated
     /// cell collapses its partition back to one full-width region; the split
@@ -1761,32 +1765,46 @@ struct LaneFloor {
     /// A thread's stores reach memory in program order, behind every store it
     /// read before them.
     stores_in_order: bool,
+    /// A releasing store is ordered before every later `SeqCst` load.
+    release_before_seq_cst_load: bool,
 }
 
 /// The lane floor of the target loom is built for — the target the model
 /// stands in for. x86 is TSO (Intel SDM Vol. 3A §10.2.2): loads are not
 /// reordered with loads, a store may pass a later load through the store
 /// buffer, and locked instructions (every RMW, and `xchg` for a `SeqCst`
-/// store) drain it. AArch64 (herd7 `aarch64.cat -variant mixed`) orders none
-/// of these by itself. Every other target gets that, the weaker rule set.
+/// store) drain it. AArch64 (herd7 `aarch64.cat -variant mixed`) orders
+/// none of the first four by itself, but `STLR` is ordered before a later
+/// `LDAR` (`[L];po;[A]`), and a `SeqCst` load is `LDAR` even where an acquire
+/// load is `LDAPR`. Every other target gets none of the orderings.
 const LANE_FLOOR: LaneFloor = cfg_select! {
     any(target_arch = "x86", target_arch = "x86_64") => LaneFloor {
         loads_in_order: true,
         rmw_is_full_barrier: true,
         seq_cst_store_is_full_barrier: true,
         stores_in_order: true,
+        release_before_seq_cst_load: false,
+    },
+    target_arch = "aarch64" => LaneFloor {
+        loads_in_order: false,
+        rmw_is_full_barrier: false,
+        seq_cst_store_is_full_barrier: false,
+        stores_in_order: false,
+        release_before_seq_cst_load: true,
     },
     _ => LaneFloor {
         loads_in_order: false,
         rmw_is_full_barrier: false,
         seq_cst_store_is_full_barrier: false,
         stores_in_order: false,
+        release_before_seq_cst_load: false,
     },
 };
 
 /// The version of `g`'s creator from which its later accesses are ordered
-/// after `g` (its own clock at `g`, or at a later `SeqCst` fence or, where
-/// `LANE_FLOOR` makes RMWs barriers, a later RMW), or `None` if none is yet.
+/// after `g` (its own clock at `g`, or at the first barrier it ran after `g`:
+/// a `SeqCst` fence or, where `LANE_FLOOR` makes RMWs barriers, an RMW), or
+/// `None` if none is yet.
 fn ordered_after(g: &Store, threads: &thread::Set) -> Option<u16> {
     if (LANE_FLOOR.rmw_is_full_barrier && g.rmw)
         || (LANE_FLOOR.seq_cst_store_is_full_barrier && g.seq_cst)
@@ -1794,18 +1812,34 @@ fn ordered_after(g: &Store, threads: &thread::Set) -> Option<u16> {
         return Some(g.tick());
     }
     let (_, t) = threads.iter().nth(g.creator)?;
-    let rmw = if LANE_FLOOR.rmw_is_full_barrier { t.rmw_version } else { 0 };
-    let barrier = t.sc_fence_version.max(rmw);
-    (barrier > g.tick()).then_some(barrier)
+    let first = t.barriers.partition_point(|&b| b <= g.tick());
+    t.barriers.get(first).copied()
 }
 
 /// Whether the target orders store `f` before store `s` for a read that takes
-/// both in one single-copy-atomic event: `f` was seen within `s`'s release
-/// view (AArch64 `bob` and cumulativity: `STLR`, or a `DMB` before `STR`), or,
-/// where stores reach memory in order, `s`'s writer had seen `f` before `s`.
+/// both in one single-copy-atomic event:
+///
+/// - `f` was seen within `s`'s release view (AArch64 `bob` and cumulativity:
+///   `STLR`, or a `DMB` before `STR`);
+/// - another thread's sight of `f` happens before `s`: it reached `s`'s
+///   writer through a release and an acquire, which order it (cumulativity);
+/// - `s`'s writer read `f` before `s`, and acquired in that read, or ran an
+///   acquire fence after it (`[A];po`, `[R];po;[dmb.ld];po`); or
+/// - where stores reach memory in order, `s`'s writer had seen `f` before `s`.
 fn store_ordered_before(f: &Store, s: &Store) -> bool {
-    f.first_seen.is_seen_in(s.sync.released_view())
-        || (LANE_FLOOR.stores_in_order && f.first_seen.0[s.creator] < s.tick())
+    let writer = s.creator;
+    if f.first_seen.is_seen_in(s.sync.released_view())
+        || f.first_seen.seen_threads(&s.hb) & !(1 << writer) != 0
+    {
+        return true;
+    }
+    let sight = f.first_seen.0[writer];
+    if sight >= s.tick() {
+        return false;
+    }
+    LANE_FLOOR.stores_in_order
+        || (f.creator != writer
+            && (f.first_seen.acquired_before(writer, s.tick()) || s.acq_fence > sight))
 }
 
 #[derive(Clone)]
@@ -1890,9 +1924,10 @@ impl LoadView {
     /// - An own read of a peer's store is ordered once it acquired or an acquire
     ///   fence followed it, or always where the target keeps loads in order.
     /// - An own store is ordered by a later `SeqCst` fence of this thread, or
-    ///   when it was a `SeqCst` store and this load is `SeqCst`, or where the
-    ///   target's RMWs and `SeqCst` stores are full barriers, by those.
-    ///   Otherwise a load may pass an earlier store to other bytes.
+    ///   when it was a `SeqCst` store and this load is `SeqCst` (on AArch64 any
+    ///   releasing store), or where the target's RMWs and `SeqCst` stores are
+    ///   full barriers, by those. Otherwise a load may pass an earlier store to
+    ///   other bytes.
     /// - A peer's store this same load already committed to reading is one
     ///   single-copy-atomic event with it. An own store read here may have been
     ///   forwarded, which AArch64 permits to split the snapshot.
@@ -1911,11 +1946,12 @@ impl LoadView {
         if store.creator == self.me {
             return self.own_sc_fence > store.tick()
                 || (store.seq_cst && (self.seq_cst || LANE_FLOOR.seq_cst_store_is_full_barrier))
+                || (LANE_FLOOR.release_before_seq_cst_load && store.release && self.seq_cst)
                 || (LANE_FLOOR.rmw_is_full_barrier && (store.rmw || self.own_rmw > store.tick()))
                 || ordered_write;
         }
         let ordered_read = LANE_FLOOR.loads_in_order
-            || store.first_seen.1 & me_bit != 0
+            || store.first_seen.acquired_before(self.me, <u16>::MAX)
             || store.first_seen.0[self.me] < self.acq_fence
             || ordered_write;
         (seen & me_bit != 0 && ordered_read) || self.touched.contains(&(rj, gi))
@@ -1945,6 +1981,9 @@ struct Region {
 
     /// The total number of stores to the region.
     cnt: u16,
+
+    /// How many of them each thread made (`State::foreign_stores`).
+    stores_by: [u16; MAX_THREADS],
 
     /// Last time each thread accessed **this region**. Tracks the dependent
     /// accesses for the DPOR algorithm.
@@ -2214,6 +2253,16 @@ struct Store {
 
     /// Whether the store is the write half of an RMW (`LANE_FLOOR`).
     rmw: bool,
+
+    /// Whether the store releases: `Release` or stronger, or the write half of
+    /// such an RMW (`LANE_FLOOR`).
+    release: bool,
+
+    /// The creating thread's happens-before at the store, and its latest
+    /// acquire fence then (`Thread::acq_fence_version`): what decides which
+    /// stores the target orders before this one (`store_ordered_before`).
+    hb: VersionVec,
+    acq_fence: u16,
 }
 
 /// The store a preserving op read — its pin in this region's modification
@@ -2453,10 +2502,11 @@ enum OpPin {
 /// inert in every comparison — exactly like the real lanes of a thread that
 /// has not seen the store.
 ///
-/// The second field is one bit per thread whose read of the store acquired,
-/// which orders it before everything the thread does next.
+/// The second field is, the same way, the version at which each thread first
+/// read the store acquiring, which orders that read before everything the
+/// thread does next.
 #[derive(Debug, Clone)]
-struct FirstSeen([u16; VersionVec::LANES], u32);
+struct FirstSeen([u16; VersionVec::LANES], [u16; VersionVec::LANES]);
 
 /// Implements atomic fence behavior
 #[track_caller]
@@ -2525,7 +2575,9 @@ fn fence_seqcst(execution: &mut Execution) {
     // lanes: the fence orders every earlier access of this thread, stores
     // included, before its later ones (`LoadView::is_seen`).
     let version = execution.threads.active_atomic_version();
-    execution.threads.active_mut().sc_fence_version = version;
+    let active = execution.threads.active_mut();
+    active.sc_fence_version = version;
+    active.barriers.push(version);
 
     // Commit the fence into S (its position, and the coherence frontier of the
     // fences before it), then promote into S at its position every store that
@@ -3017,7 +3069,11 @@ where
         state.track_load(&execution.threads);
         // lanes: an RMW is a full barrier where `LANE_FLOOR` says so.
         let version = execution.threads.active_atomic_version();
-        execution.threads.active_mut().rmw_version = version;
+        let active = execution.threads.active_mut();
+        active.rmw_version = version;
+        if LANE_FLOOR.rmw_is_full_barrier {
+            active.barriers.push(version);
+        }
 
         // Either arm's ordering may acquire, and which one runs is decided
         // with the read below.
@@ -3035,8 +3091,9 @@ where
 
         let covered = state.covered(read_mask);
         let cmp = Compare::new(read_mask, expected);
-        let thread = 1u32 << execution.threads.active_id().as_usize();
-        let may_spur = weak && state.spurious_last & thread == 0;
+        let me = execution.threads.active_id().as_usize();
+        let foreign = state.foreign_stores(&covered, me);
+        let may_spur = weak && state.spurious_at[me] != Some(foreign);
 
         // What the thread observed ahead of the op, per region: its write
         // goes after these, so a success reads none before one.
@@ -3055,11 +3112,7 @@ where
         );
 
         if weak {
-            if arm == Arm::Spurious {
-                state.spurious_last |= thread;
-            } else {
-                state.spurious_last &= !thread;
-            }
+            state.spurious_at[me] = (arm == Arm::Spurious).then_some(foreign);
         }
 
         if arm != Arm::Success {
@@ -3223,7 +3276,7 @@ impl State {
             regions: vec![Region::new(FULL_MASK)],
             op_clock: 0,
             touched_by: 0,
-            spurious_last: 0,
+            spurious_at: [None; MAX_THREADS],
             spares: Vec::new(),
         }
     }
@@ -3256,7 +3309,7 @@ impl State {
         // The genesis store's `first_seen` is touched by the creating
         // thread, so seed its bit.
         self.touched_by = 1 << threads.active_id().as_usize();
-        self.spurious_last = 0;
+        self.spurious_at = [None; MAX_THREADS];
 
         // All subsequent accesses must happen-after.
         self.track_unsync_mut(threads);
@@ -3310,7 +3363,7 @@ impl State {
         self.is_mutating = false;
         self.op_clock = 0;
         self.touched_by = 0;
-        self.spurious_last = 0;
+        self.spurious_at = [None; MAX_THREADS];
 
         // The genesis *store* stays pre-execution even when committed: it
         // carries no causality, so an acquiring reader inherits nothing it did
@@ -3324,6 +3377,15 @@ impl State {
     fn next_op_id(&mut self) -> u64 {
         self.op_clock += 1;
         self.op_clock
+    }
+
+    /// How many stores threads other than `me` have made to the regions in
+    /// `covered`: what can have cleared `me`'s exclusive monitor on them.
+    fn foreign_stores(&self, covered: &[usize], me: usize) -> u32 {
+        covered
+            .iter()
+            .map(|&ri| u32::from(self.regions[ri].cnt - self.regions[ri].stores_by[me]))
+            .sum()
     }
 
     /// Guard the one behavior a preserving RMW gives up (see [`PreservedOp`]):
@@ -4685,6 +4747,7 @@ impl Region {
             stores: Vec::with_capacity(INLINE_HISTORY),
             paired: 0,
             cnt: 0,
+            stores_by: [0; MAX_THREADS],
             last_access: Default::default(),
             last_non_load_access: Default::default(),
             last_sc_read: Default::default(),
@@ -4703,6 +4766,7 @@ impl Region {
         self.stores.clear();
         self.paired = 0;
         self.cnt = 0;
+        self.stores_by = [0; MAX_THREADS];
         *self.last_access = Default::default();
         *self.last_non_load_access = Default::default();
         *self.last_sc_read = Default::default();
@@ -4733,6 +4797,7 @@ impl Region {
             Some(mut region) => {
                 region.mask = other_mask;
                 region.cnt = self.cnt;
+                region.stores_by = self.stores_by;
                 region.stores.clone_from(&self.stores);
                 region.paired = self.paired;
                 region.last_access.clone_from(&self.last_access);
@@ -4753,6 +4818,7 @@ impl Region {
                 stores: self.stores.clone(),
                 paired: self.paired,
                 cnt: self.cnt,
+                stores_by: self.stores_by,
                 last_access: self.last_access.clone(),
                 last_non_load_access: self.last_non_load_access.clone(),
                 last_sc_read: self.last_sc_read.clone(),
@@ -5004,6 +5070,9 @@ impl Region {
             sc_rank: None,
             seq_cst: false,
             rmw: false,
+            release: false,
+            hb: VersionVec::new(),
+            acq_fence: 0,
         });
         self.cnt = 1;
     }
@@ -5079,12 +5148,16 @@ impl Region {
             sc_rank,
             seq_cst: is_seq_cst(ordering),
             rmw: rmw_read.is_some(),
+            release: releases(ordering),
+            hb: threads.active().causality,
+            acq_fence: threads.active().acq_fence_version,
         });
         if let Some(r) = rmw_read {
             self.stores[r].rmw_write = Some(slot as u8);
             self.paired |= bit(r) | bit(slot);
         }
         self.cnt += 1;
+        self.stores_by[threads.active_id().as_usize()] += 1;
 
         self.order_all(preds, slot);
 
@@ -5149,8 +5222,12 @@ impl Region {
             sc_rank: None,
             seq_cst: false,
             rmw: false,
+            release: false,
+            hb: threads.active().causality,
+            acq_fence: threads.active().acq_fence_version,
         });
         self.cnt += 1;
+        self.stores_by[threads.active_id().as_usize()] += 1;
 
         self.order_all(bit(slot) - 1, slot);
     }
@@ -5543,13 +5620,22 @@ impl Region {
 
 impl FirstSeen {
     fn new() -> FirstSeen {
-        FirstSeen([u16::max_value(); VersionVec::LANES], 0)
+        FirstSeen([<u16>::MAX; VersionVec::LANES], [<u16>::MAX; VersionVec::LANES])
     }
 
     /// Record that the active thread read the store acquiring. The caller has
     /// touched the store first.
     fn acquire(&mut self, threads: &thread::Set) {
-        self.1 |= 1 << threads.active_id().as_usize();
+        let lane = &mut self.1[threads.active_id().as_usize()];
+        if *lane == <u16>::MAX {
+            *lane = threads.active_atomic_version();
+        }
+    }
+
+    /// Whether thread `t` has read the store acquiring, at a version below
+    /// `before`.
+    fn acquired_before(&self, t: usize, before: u16) -> bool {
+        self.1[t] < before
     }
 
     fn touch(&mut self, threads: &thread::Set) {

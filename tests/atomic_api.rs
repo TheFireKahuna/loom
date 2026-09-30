@@ -252,3 +252,25 @@ fn generic_atomic_names_the_cells() {
     });
 }
 
+
+// `fetch_update` is `core`'s deprecated name for `try_update`, and code
+// written against `std` still calls it.
+#[test]
+#[allow(deprecated)]
+fn fetch_update_is_try_update() {
+    loom::model(|| {
+        let n = AtomicU32::new(3);
+        assert_eq!(n.fetch_update(AcqRel, Acquire, |x| Some(x + 1)), Ok(3));
+        assert_eq!(n.fetch_update(AcqRel, Acquire, |_| None), Err(4));
+
+        let b = AtomicBool::new(false);
+        assert_eq!(b.fetch_update(AcqRel, Acquire, |x| Some(!x)), Ok(false));
+        assert!(b.load(Relaxed));
+
+        let mut buf = [0u8; 2];
+        let base = buf.as_mut_ptr();
+        let p = AtomicPtr::new(base);
+        assert_eq!(p.fetch_update(Relaxed, Relaxed, |q| Some(q.wrapping_add(1))), Ok(base));
+        assert_eq!(p.load(Relaxed), base.wrapping_add(1));
+    });
+}
