@@ -148,13 +148,15 @@ where
     F: 'static,
     T: 'static,
 {
-    spawn_internal(f, None, None, false, location!())
+    spawn_internal(f, None, None, None, location!())
 }
 
 /// Spawn `n` interchangeable threads of one closure. The scheduler pins the
-/// group's *first* transitions to spawn order, so the search walks one
-/// representative per relabeling of the group instead of all `n!`
-/// permutations of identical futures.
+/// order in which the group's members are *first scheduled* to spawn order,
+/// so the search walks one representative per relabeling of the group
+/// instead of all `n!` permutations of identical futures. Each call is its
+/// own group: members of different calls are never pinned against each
+/// other.
 ///
 /// Taking a single `Fn` closure is what makes the thread side of the
 /// symmetry sound by construction: every member runs the same code over the
@@ -172,11 +174,13 @@ where
     T: 'static,
 {
     let f = Arc::new(f);
+    let group = rt::symmetry_group();
 
     (0..n)
-        .map(|_| {
+        .map(|rank| {
             let f = f.clone();
-            spawn_internal(move || f(), None, None, true, location!())
+            let symmetry = rt::thread::Symmetry { group, rank };
+            spawn_internal(move || f(), None, None, Some(symmetry), location!())
         })
         .collect()
 }
@@ -217,7 +221,7 @@ fn spawn_internal<F, T>(
     f: F,
     name: Option<String>,
     stack_size: Option<usize>,
-    symmetric: bool,
+    symmetry: Option<rt::thread::Symmetry>,
     location: Location,
 ) -> JoinHandle<T>
 where
@@ -232,7 +236,7 @@ where
     let id = {
         let name = name.clone();
         let result = result.clone();
-        rt::spawn(stack_size, symmetric, move || {
+        rt::spawn(stack_size, symmetry, move || {
             rt::execution(|execution| {
                 init_current(execution, name);
             });
@@ -299,7 +303,7 @@ impl Builder {
         F: Send + 'static,
         T: Send + 'static,
     {
-        Ok(spawn_internal(f, self.name, self.stack_size, false, location!()))
+        Ok(spawn_internal(f, self.name, self.stack_size, None, location!()))
     }
 }
 

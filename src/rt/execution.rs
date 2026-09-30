@@ -153,8 +153,8 @@ impl Execution {
     }
 
     /// Create state to track a new thread
-    pub(crate) fn new_thread(&mut self, symmetric: bool) -> thread::Id {
-        let thread_id = self.threads.new_thread(symmetric);
+    pub(crate) fn new_thread(&mut self, symmetry: Option<thread::Symmetry>) -> thread::Id {
+        let thread_id = self.threads.new_thread(symmetry);
         let active_id = self.threads.active_id();
 
         let (active, new) = self.threads.active2_mut(thread_id);
@@ -289,8 +289,8 @@ impl Execution {
             self.sleep.wake_all();
         }
 
-        // Threads whose first transition symmetry holds back for now
-        // (`thread::spawn_symmetric`). Shown as disabled below: unschedulable
+        // Threads symmetry holds back from being scheduled for now
+        // (`thread::symmetric`). Shown as disabled below: unschedulable
         // and never a DPOR alternative, which is the entire reduction.
         let pinned = self.threads.symmetry_pinned_mask();
 
@@ -400,8 +400,8 @@ impl Execution {
             return true;
         }
 
-        // The chosen thread takes a transition now: any symmetry pin waiting
-        // on it releases from the next branch on.
+        // The chosen thread is scheduled now: any symmetry pin waiting on it
+        // releases from the next branch on.
         self.threads.active_mut().started = true;
 
         // TODO: refactor

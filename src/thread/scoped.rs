@@ -173,7 +173,7 @@ where
     // them, so no path runs this body's drop glue once `scope` has returned.
     let body: Box<dyn FnOnce() + 'static> = unsafe { std::mem::transmute(body) };
 
-    let id = rt::spawn(stack_size, false, body);
+    let id = rt::spawn(stack_size, None, body);
 
     ScopedJoinHandle {
         packet,

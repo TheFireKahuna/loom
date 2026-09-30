@@ -83,12 +83,12 @@ pub(crate) struct Thread {
     /// Number of times the thread yielded
     pub yield_count: usize,
 
-    /// Position in the execution's symmetry group (`thread::spawn_symmetric`),
-    /// or `None` for an ordinary thread.
-    pub symmetry_rank: Option<usize>,
+    /// The symmetry group (`thread::symmetric`) the thread belongs to and its
+    /// rank in it, or `None` for an ordinary thread.
+    pub symmetry: Option<Symmetry>,
 
-    /// Whether the thread has taken its first transition. What releases the
-    /// symmetry pin on later-ranked group members.
+    /// Whether the thread has been scheduled at least once. What releases the
+    /// symmetry pin on later-ranked members of its group.
     pub started: bool,
 
     locals: LocalMap,
@@ -128,11 +128,19 @@ pub(crate) struct Set {
     /// sit in S against an SC access in another.
     sc_clock: u32,
 
-    /// Symmetric threads spawned so far this execution; the next one's rank.
-    symmetry_spawned: usize,
+    /// Symmetry groups minted so far this execution; the next one's id.
+    symmetry_groups: usize,
 
     /// `tracing` span used as the parent for new thread spans.
     iteration_span: tracing::Span,
+}
+
+/// A thread's place in one `thread::symmetric` call: the call's group, and
+/// the thread's spawn position in it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Symmetry {
+    pub(crate) group: usize,
+    pub(crate) rank: usize,
 }
 
 #[derive(Eq, PartialEq, Hash, Copy, Clone)]
@@ -201,7 +209,7 @@ impl Thread {
             dpor_prior: None,
             last_yield: None,
             yield_count: 0,
-            symmetry_rank: None,
+            symmetry: None,
             started: false,
             locals: Vec::new(),
         }
@@ -360,13 +368,13 @@ impl Set {
             active: Some(0),
             sc_fence_frontier: VersionVec::new(),
             sc_clock: 0,
-            symmetry_spawned: 0,
+            symmetry_groups: 0,
             iteration_span,
         }
     }
 
     /// Create a new thread
-    pub(crate) fn new_thread(&mut self, symmetric: bool) -> Id {
+    pub(crate) fn new_thread(&mut self, symmetry: Option<Symmetry>) -> Id {
         assert!(self.threads.len() < self.max());
 
         // Get the identifier for the thread about to be created
@@ -386,45 +394,44 @@ impl Set {
             self.threads[id].sc = sc;
         }
 
-        if symmetric {
-            self.threads[id].symmetry_rank = Some(self.symmetry_spawned);
-            self.symmetry_spawned += 1;
-        }
+        self.threads[id].symmetry = symmetry;
 
         Id::new(self.execution_id, id)
     }
 
-    /// Mask of threads pinned by symmetry: a `spawn_symmetric` thread may not
-    /// take its first transition while a lower-ranked group member has yet to
-    /// take its own. The scheduler shows a pinned thread as disabled, which
-    /// is what restricts the walk to one representative per relabeling of the
-    /// group (see `thread::spawn_symmetric` for the soundness contract).
+    /// Mint the group of one `thread::symmetric` call. Relabeling holds only
+    /// among the members of one call, so each call pins its own.
+    pub(crate) fn new_symmetry_group(&mut self) -> usize {
+        let group = self.symmetry_groups;
+        self.symmetry_groups += 1;
+        group
+    }
+
+    /// Mask of threads pinned by symmetry: a `thread::symmetric` thread may
+    /// not be scheduled while a lower-ranked member of its own group has yet
+    /// to be. The scheduler shows a pinned thread as disabled, which is what
+    /// restricts the walk to one representative per relabeling of each group
+    /// (see `thread::symmetric` for the soundness contract).
     ///
-    /// The lowest not-yet-started rank is never pinned, so among the group
-    /// there is always a schedulable member and no deadlock can be
-    /// introduced.
+    /// Each group's lowest unscheduled rank is never pinned, so every group
+    /// always has a schedulable member and no deadlock can be introduced.
     pub(crate) fn symmetry_pinned_mask(&self) -> u16 {
-        let mut lowest_waiting: Option<usize> = None;
-
-        for th in &self.threads {
-            if let Some(rank) = th.symmetry_rank {
-                if !th.started {
-                    lowest_waiting = Some(lowest_waiting.map_or(rank, |low| low.min(rank)));
-                }
-            }
-        }
-
-        let Some(lowest) = lowest_waiting else {
-            return 0;
-        };
-
         let mut mask = 0u16;
 
         for (i, th) in self.threads.iter().enumerate() {
-            if let Some(rank) = th.symmetry_rank {
-                if rank > lowest && !th.started {
-                    mask |= 1 << i;
-                }
+            let Some(sym) = th.symmetry.filter(|_| !th.started) else {
+                continue;
+            };
+
+            let behind = self.threads.iter().any(|other| {
+                !other.started
+                    && other
+                        .symmetry
+                        .is_some_and(|o| o.group == sym.group && o.rank < sym.rank)
+            });
+
+            if behind {
+                mask |= 1 << i;
             }
         }
 
@@ -628,7 +635,7 @@ impl Set {
         self.active = Some(0);
         self.sc_fence_frontier = VersionVec::new();
         self.sc_clock = 0;
-        self.symmetry_spawned = 0;
+        self.symmetry_groups = 0;
     }
 
     pub(crate) fn iter(&self) -> impl ExactSizeIterator<Item = (Id, &Thread)> + '_ {

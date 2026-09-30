@@ -77,11 +77,15 @@ pub const MAX_THREADS: usize = 5;
 /// more live stores than this fails loudly rather than dropping one.
 pub(crate) const MAX_ATOMIC_HISTORY: usize = 32;
 
-pub(crate) fn spawn<F>(stack_size: Option<usize>, symmetric: bool, f: F) -> crate::rt::thread::Id
+pub(crate) fn spawn<F>(
+    stack_size: Option<usize>,
+    symmetry: Option<thread::Symmetry>,
+    f: F,
+) -> crate::rt::thread::Id
 where
     F: FnOnce() + 'static,
 {
-    let id = execution(|execution| execution.new_thread(symmetric));
+    let id = execution(|execution| execution.new_thread(symmetry));
 
     trace!(thread = ?id, "spawn");
 
@@ -94,6 +98,11 @@ where
     );
 
     id
+}
+
+/// A fresh group for one `thread::symmetric` call.
+pub(crate) fn symmetry_group() -> usize {
+    execution(|execution| execution.threads.new_symmetry_group())
 }
 
 /// Marks the current thread as blocked until a modeled primitive wakes it
