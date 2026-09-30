@@ -22,9 +22,12 @@ where
 
     let notify = Arc::new(rt::Notify::new(false, true));
 
+    // The vtable hands the data pointer to `Arc::from_raw`, which writes the
+    // counts beside the value: it must carry the allocation's provenance, as
+    // `as_ptr`'s does, not a shared borrow of the value's.
     let waker = unsafe {
         mem::ManuallyDrop::new(Waker::from_raw(RawWaker::new(
-            &*notify as *const _ as *const (),
+            Arc::as_ptr(&notify) as *const (),
             waker_vtable(),
         )))
     };
