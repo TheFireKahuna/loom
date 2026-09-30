@@ -774,6 +774,11 @@ where
         // drop outside of execution
         drop(lazy_statics);
 
+        // Then the execution's instances of `const`-built locks' data, which
+        // a lazy static's value may have borrowed.
+        let lock_data = rt::execution(|execution| execution.take_lock_data());
+        drop(lock_data);
+
         rt::thread_done();
     })
 }

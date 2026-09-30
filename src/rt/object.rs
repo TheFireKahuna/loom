@@ -194,6 +194,9 @@ objects! {
     // State associated with a modeled channel.
     Channel(rt::mpsc::State),
 
+    // State associated with a futex wait queue.
+    Futex(rt::futex::State),
+
     // Tracks access to a memory cell
     Cell(rt::cell::State),
 }
@@ -211,6 +214,7 @@ impl Store {
             Entry::Notify(_) => "Notify",
             Entry::RwLock(_) => "RwLock",
             Entry::Channel(_) => "channel",
+            Entry::Futex(_) => "futex",
             Entry::Cell(_) => "UnsafeCell",
         })
     }
@@ -407,6 +411,11 @@ impl Store {
                 }
             }
             Entry::Channel(entry) => entry.for_each_dependent_access(operation.action.into(), f),
+            Entry::Futex(entry) => {
+                if let Some(access) = entry.last_dependent_access() {
+                    f(access);
+                }
+            }
             obj => panic!(
                 "object is not branchable {:?}; ref = {:?}",
                 obj, operation.obj
@@ -454,6 +463,7 @@ impl Store {
             Entry::Condvar(entry) => entry.set_last_access(path_id, dpor_vv),
             Entry::Notify(entry) => entry.set_last_access(path_id, dpor_vv),
             Entry::RwLock(entry) => entry.set_last_access(path_id, dpor_vv),
+            Entry::Futex(entry) => entry.set_last_access(path_id, dpor_vv),
             Entry::Channel(entry) => {
                 entry.set_last_access(operation.action.into(), path_id, dpor_vv)
             }

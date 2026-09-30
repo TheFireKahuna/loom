@@ -1,14 +1,21 @@
 use crate::rt;
 
 use core::fmt;
+use std::mem::ManuallyDrop;
 use std::ops;
+use std::ptr::{self, NonNull};
 use std::sync::{LockResult, TryLockError, TryLockResult};
 
 /// Mock implementation of `std::sync::RwLock`
-#[derive(Debug)]
+///
+/// Holds its data as [`Mutex`](crate::sync::Mutex) does: inline when built
+/// at runtime, and when built in `const` evaluation a pristine value each
+/// execution copies afresh on first use, so a `static` rwlock's data is fresh
+/// in every execution and shared by none.
 pub struct RwLock<T: ?Sized> {
     object: rt::Registration<rt::RwLock>,
-    data: std::sync::RwLock<T>,
+    fresh: rt::Fresh,
+    data: ManuallyDrop<std::sync::RwLock<T>>,
 }
 
 /// Mock implementation of `std::sync::RwLockReadGuard`
@@ -30,18 +37,54 @@ impl<T> RwLock<T> {
     /// `std`'s is; see `rt::Registration` for how the two contexts register.
     pub const fn new(data: T) -> RwLock<T> {
         RwLock {
-            data: std::sync::RwLock::new(data),
+            data: ManuallyDrop::new(std::sync::RwLock::new(data)),
+            fresh: rt::Fresh::of::<std::sync::RwLock<T>>(),
             object: rt::Registration::new(),
         }
     }
 
     /// Consumes this `RwLock`, returning the underlying data.
     pub fn into_inner(self) -> LockResult<T> {
-        Ok(self.data.into_inner().expect("loom::RwLock state corrupt"))
+        let mut this = ManuallyDrop::new(self);
+
+        let data = match this.object.minted().and_then(rt::take_instance) {
+            // SAFETY: as `Mutex::into_inner`: the instance is a boxed
+            // `std::sync::RwLock<T>`, now owned here, and the inline value a
+            // template left undropped.
+            Some(instance) => unsafe {
+                *Box::from_raw(instance.into_raw().cast::<std::sync::RwLock<T>>().as_ptr())
+            },
+            // SAFETY: `this` is never used again, and its only other fields
+            // own nothing.
+            None => unsafe { ManuallyDrop::take(&mut this.data) },
+        };
+
+        Ok(data.into_inner().expect("loom::RwLock state corrupt"))
     }
 }
 
 impl<T: ?Sized> RwLock<T> {
+    /// The data this execution works on, as `Mutex::data`.
+    fn data(&self) -> &std::sync::RwLock<T> {
+        if !self.object.is_deferred() {
+            return &self.data;
+        }
+
+        let pristine: *const std::sync::RwLock<T> = &*self.data;
+
+        // SAFETY: as `Mutex::data`: the inline value is never touched and is
+        // what `fresh` was made for; the instance is its bitwise copy, living
+        // until the execution ends or this rwlock drops.
+        unsafe {
+            let instance = rt::instance(
+                self.object.id(),
+                NonNull::new_unchecked(pristine as *mut u8),
+                self.fresh,
+            );
+            &*ptr::from_raw_parts(instance.as_ptr().cast_const(), ptr::metadata(pristine))
+        }
+    }
+
     /// Locks this rwlock with shared read access, blocking the current
     /// thread until it can be acquired.
     ///
@@ -56,7 +99,7 @@ impl<T: ?Sized> RwLock<T> {
 
         Ok(RwLockReadGuard {
             lock: self,
-            data: Some(self.data.try_read().expect("loom::RwLock state corrupt")),
+            data: Some(self.data().try_read().expect("loom::RwLock state corrupt")),
         })
     }
 
@@ -72,7 +115,7 @@ impl<T: ?Sized> RwLock<T> {
         if self.object.get().try_acquire_read_lock(location!()) {
             Ok(RwLockReadGuard {
                 lock: self,
-                data: Some(self.data.try_read().expect("loom::RwLock state corrupt")),
+                data: Some(self.data().try_read().expect("loom::RwLock state corrupt")),
             })
         } else {
             Err(TryLockError::WouldBlock)
@@ -90,7 +133,7 @@ impl<T: ?Sized> RwLock<T> {
 
         Ok(RwLockWriteGuard {
             lock: self,
-            data: Some(self.data.try_write().expect("loom::RwLock state corrupt")),
+            data: Some(self.data().try_write().expect("loom::RwLock state corrupt")),
         })
     }
 
@@ -106,7 +149,7 @@ impl<T: ?Sized> RwLock<T> {
         if self.object.get().try_acquire_write_lock(location!()) {
             Ok(RwLockWriteGuard {
                 lock: self,
-                data: Some(self.data.try_write().expect("loom::RwLock state corrupt")),
+                data: Some(self.data().try_write().expect("loom::RwLock state corrupt")),
             })
         } else {
             Err(TryLockError::WouldBlock)
@@ -115,7 +158,37 @@ impl<T: ?Sized> RwLock<T> {
 
     /// Returns a mutable reference to the underlying data.
     pub fn get_mut(&mut self) -> LockResult<&mut T> {
-        Ok(self.data.get_mut().expect("loom::RwLock state corrupt"))
+        let data: *const std::sync::RwLock<T> = self.data();
+
+        // SAFETY: `&mut self` excludes every guard and every other reference
+        // to the data, inline or instance.
+        Ok(unsafe { &mut *data.cast_mut() }
+            .get_mut()
+            .expect("loom::RwLock state corrupt"))
+    }
+}
+
+impl<T: ?Sized> Drop for RwLock<T> {
+    fn drop(&mut self) {
+        // As `Mutex`'s: a used `const`-built rwlock drops its instance, else
+        // the inline value is the data.
+        if let Some(instance) = self.object.minted().and_then(rt::take_instance) {
+            drop(instance);
+        } else {
+            // SAFETY: dropped once, here, and never used again.
+            unsafe { ManuallyDrop::drop(&mut self.data) }
+        }
+    }
+}
+
+impl<T: ?Sized + fmt::Debug> fmt::Debug for RwLock<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // A `const`-built rwlock's inline value is a template, never locked.
+        if self.object.is_deferred() {
+            f.debug_struct("RwLock").finish_non_exhaustive()
+        } else {
+            f.debug_struct("RwLock").field("data", &&*self.data).finish()
+        }
     }
 }
 

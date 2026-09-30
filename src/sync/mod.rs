@@ -15,7 +15,7 @@ pub use self::barrier::{Barrier, BarrierWaitResult};
 pub use self::condvar::{Condvar, WaitTimeoutResult};
 pub use self::mutex::{Mutex, MutexGuard};
 pub use self::notify::Notify;
-pub use self::once::Once;
+pub use self::once::{Once, OnceState};
 pub use self::rwlock::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 #[doc(no_inline)]

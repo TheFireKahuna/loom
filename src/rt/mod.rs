@@ -38,6 +38,9 @@ pub(crate) use self::num::Numeric;
 #[macro_use]
 pub(crate) mod object;
 
+mod futex;
+pub(crate) use self::futex::Futex;
+
 mod mpsc;
 pub(crate) use self::mpsc::{Channel, TryRecv};
 
@@ -48,7 +51,7 @@ mod path;
 pub(crate) use self::path::Path;
 
 mod registration;
-pub(crate) use self::registration::{Deferred, Registration};
+pub(crate) use self::registration::{instance, take_instance, Deferred, Fresh, Registration};
 
 mod rwlock;
 pub(crate) use self::rwlock::RwLock;

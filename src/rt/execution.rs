@@ -46,6 +46,11 @@ pub(crate) struct Execution {
     /// The same for `const`-built locks and condvars (`rt::Registration`).
     pub(super) deferred_objects: FxHashMap<u64, super::Deferred>,
 
+    /// This execution's instances of `const`-built locks' data, by lock
+    /// identity, in first-touch order (`rt::instance`). Dropped at the end
+    /// of the execution with the lazy statics, in reverse.
+    pub(super) lock_data: Vec<(u64, super::registration::Instance)>,
+
     /// The address space materialized cells live in: committed ranges, the
     /// cells registered in them keyed by address (their identity, since such a
     /// cell carries no identity word and cannot move), and outstanding resets.
@@ -140,6 +145,7 @@ impl Execution {
             arc_objs: FxHashMap::default(),
             deferred_atomics: FxHashMap::default(),
             deferred_objects: FxHashMap::default(),
+            lock_data: Vec::new(),
             vm: super::atomic::Vm::default(),
             check_committed_leaks: false,
             dpor_update: None,
@@ -203,6 +209,8 @@ impl Execution {
         // registrations do not.
         self.deferred_atomics.clear();
         self.deferred_objects.clear();
+        debug_assert!(self.lock_data.is_empty(), "lock data outlived its execution");
+        self.lock_data.clear();
         self.vm.clear();
         self.threads.clear(id);
         self.sleep.clear();
@@ -538,6 +546,12 @@ impl Execution {
         }
 
         report
+    }
+
+    /// Hand out the execution's lock data to be dropped by the caller,
+    /// outside the execution borrow, last-touched first.
+    pub(crate) fn take_lock_data(&mut self) -> Vec<super::registration::Instance> {
+        self.lock_data.drain(..).rev().map(|(_, instance)| instance).collect()
     }
 
     /// Wake every sleeping thread: an operation whose dependence the sleep set
