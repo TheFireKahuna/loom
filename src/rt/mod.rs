@@ -108,17 +108,28 @@ pub(crate) fn symmetry_group() -> usize {
 /// Marks the current thread as blocked until a modeled primitive wakes it
 /// (`thread::Set::wake`). Independent of the `std::thread::park` token.
 pub(crate) fn park(location: Location) {
-    block(location, false);
+    block(location, false, None);
 }
 
-/// Marks the current thread as blocked in a timed wait: the block can end
-/// on its own (the wait's timeout firing), which `Execution::schedule`
-/// models by waking the thread when nothing else can run.
-pub(crate) fn park_timed(location: Location) {
-    block(location, true);
+/// Marks the current thread as blocked in a timed wait on the object
+/// `operation` names: besides a wake, the block can end by its timeout
+/// firing, which `Execution::schedule` offers as the thread's transition —
+/// an operation on that object, so the search orders it against the
+/// object's notifications both ways.
+fn park_timed(location: Location, operation: object::Operation) {
+    block(location, true, Some(operation));
 }
 
-fn block(location: Location, timed: bool) {
+/// `std::thread::sleep`: a timed wait nothing can end early. The sleeper
+/// runs again when its timeout fires, which the search offers at every
+/// point: freely once no other thread can run, and once per execution
+/// before that. Time passed, as for a spin.
+pub(crate) fn sleep(location: Location) {
+    block(location, true, None);
+    execution(|execution| execution.threads.active_mut().see_time_pass());
+}
+
+fn block(location: Location, timed: bool, operation: Option<object::Operation>) {
     let switch = execution(|execution| {
         let thread = execution.threads.active_id();
         let active = execution.threads.active_mut();
@@ -126,7 +137,7 @@ fn block(location: Location, timed: bool) {
         trace!(?thread, ?timed, "block");
 
         active.set_blocked(location, timed);
-        active.operation = None;
+        active.operation = operation;
         execution.schedule()
     });
 
@@ -146,7 +157,8 @@ fn block(location: Location, timed: bool) {
 /// such loop terminates while every call site can still be the one that spurs.
 ///
 /// A `timed` park (`park_timeout`) may also end without the token when its
-/// timeout fires, which `Execution::schedule` does once no thread can run.
+/// timeout fires (`park_timed`), an operation on the park object like any
+/// `unpark` of it.
 pub(crate) fn park_thread(location: Location, timed: bool) {
     let id = execution(|execution| execution.threads.active_id());
 
@@ -175,9 +187,9 @@ pub(crate) fn park_thread(location: Location, timed: bool) {
         return;
     }
 
-    block_parked();
+    block_parked(id, location, timed);
 
-    // Only `unpark` wakes a parked thread; re-check its token as a park-object
+    // Only `unpark` or the timeout wakes a parked thread; re-check its token as a park-object
     // operation of its own, ordered after the unpark that woke it.
     branch_park(id, location);
 
@@ -191,10 +203,12 @@ pub(crate) fn park_thread(location: Location, timed: bool) {
     });
 }
 
-/// Give up the processor after `set_parked`.
-fn block_parked() {
+/// Give up the processor after `set_parked`. A timed park's pending
+/// operation is its timeout firing on the park object.
+fn block_parked(id: thread::Id, location: Location, timed: bool) {
     let switch = execution(|execution| {
-        execution.threads.active_mut().operation = None;
+        execution.threads.active_mut().operation =
+            timed.then(|| object::Operation::park(id, location));
         execution.schedule()
     });
 

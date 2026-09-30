@@ -206,8 +206,10 @@ pub fn park() {
 /// Mock implementation of `std::thread::park_timeout`.
 ///
 /// Blocks unless or until the current thread's token is made available or
-/// the timeout elapses. Loom has no clock: `_dur` is ignored and the timeout
-/// is the timed block the model resolves itself, as for
+/// the timeout elapses. Loom has no clock: `_dur` is ignored, and the timeout
+/// may fire at any point the thread is parked — with nothing else runnable
+/// always, and while other threads can run once per thread per execution —
+/// explored against every `unpark` of the thread both ways, as for
 /// [`Condvar::wait_timeout`](crate::sync::Condvar::wait_timeout).
 #[track_caller]
 pub fn park_timeout(_dur: Duration) {
@@ -216,13 +218,17 @@ pub fn park_timeout(_dur: Duration) {
 
 /// Mock implementation of `std::thread::sleep`.
 ///
-/// Loom has no clock, and a sleep touches no shared state, so it is no
-/// modelled operation at all: every interleaving of the sleeping thread's
-/// surrounding operations is explored regardless. A loop that polls between
-/// sleeps therefore is not bounded by them; make it spin through
-/// [`hint::spin_loop`](crate::hint::spin_loop), which loom schedules as a wait
-/// for another thread's progress.
-pub fn sleep(_dur: Duration) {}
+/// Loom has no clock: `_dur` is ignored, and a sleep is a timed wait that
+/// nothing ends early. The sleeper runs again when its timeout fires, which
+/// loom explores at any point — with nothing else runnable always, and while
+/// other threads can run once per thread per execution (the early-timeout
+/// budget it shares with [`park_timeout`] and
+/// [`Condvar::wait_timeout`](crate::sync::Condvar::wait_timeout)). So a loop
+/// that polls between sleeps lets its peers run and completes.
+#[track_caller]
+pub fn sleep(_dur: Duration) {
+    rt::sleep(location!());
+}
 
 fn spawn_internal<F, T>(
     f: F,

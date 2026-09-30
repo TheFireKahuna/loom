@@ -1,10 +1,10 @@
 #![deny(warnings, rust_2018_idioms)]
 
-use loom::sync::atomic::AtomicUsize;
+use loom::sync::atomic::{AtomicBool, AtomicUsize};
 use loom::sync::{Condvar, Mutex};
 use loom::thread;
 
-use std::sync::atomic::Ordering::SeqCst;
+use std::sync::atomic::Ordering::{Acquire, Release, SeqCst};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -235,4 +235,81 @@ impl Inc {
         drop(self.mutex.lock().unwrap());
         self.condvar.notify_all();
     }
+}
+
+fn bounded() -> loom::model::Builder {
+    let mut builder = loom::model::Builder::new();
+    builder.preemption_bound = Some(3);
+    builder.threads = 1;
+    builder
+}
+
+/// Waiters whose timeouts fire before the notifier runs, counted by the
+/// notifier.
+fn early_timeouts(waiters: usize) -> std::collections::BTreeSet<usize> {
+    let seen: Arc<std::sync::Mutex<std::collections::BTreeSet<usize>>> = Default::default();
+    let out = seen.clone();
+    bounded().check(move || {
+        let s = Arc::new((Mutex::new(false), Condvar::new()));
+        let early = Arc::new(AtomicUsize::new(0));
+        let hs: Vec<_> = (0..waiters)
+            .map(|_| {
+                let (s, early) = (s.clone(), early.clone());
+                thread::spawn(move || {
+                    let g = s.0.lock().unwrap();
+                    if !*g {
+                        let (g, r) = s.1.wait_timeout(g, Duration::from_millis(1)).unwrap();
+                        if r.timed_out() && !*g {
+                            early.fetch_add(1, SeqCst);
+                        }
+                    }
+                })
+            })
+            .collect();
+        {
+            let mut g = s.0.lock().unwrap();
+            out.lock().unwrap().insert(early.load(SeqCst));
+            *g = true;
+            s.1.notify_all();
+        }
+        for h in hs {
+            h.join().unwrap();
+        }
+    });
+    let seen = seen.lock().unwrap().clone();
+    seen
+}
+
+/// One waiter's timeout can fire before the notifier runs.
+#[test]
+fn one_waiter_times_out_early() {
+    assert!(early_timeouts(1).contains(&1));
+}
+
+/// So can each of two waiters': the early timeout is a waiter's, not the
+/// condvar's.
+#[test]
+fn two_waiters_both_time_out_early() {
+    assert!(early_timeouts(2).contains(&2));
+}
+
+/// A peer spinning for a timed waiter's effect is ended by the waiter's
+/// timeouts, however many it waits through.
+#[test]
+fn successive_wait_timeouts_end_a_peers_spin() {
+    bounded().check(|| {
+        let flag = Arc::new(AtomicBool::new(false));
+        let s = Arc::new((Mutex::new(()), Condvar::new()));
+        let (f2, s2) = (flag.clone(), s.clone());
+        let th = thread::spawn(move || {
+            let g = s2.0.lock().unwrap();
+            let (g, _) = s2.1.wait_timeout(g, Duration::from_millis(1)).unwrap();
+            let (_g, _) = s2.1.wait_timeout(g, Duration::from_millis(1)).unwrap();
+            f2.store(true, Release);
+        });
+        while !flag.load(Acquire) {
+            loom::hint::spin_loop();
+        }
+        th.join().unwrap();
+    });
 }

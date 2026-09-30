@@ -49,3 +49,87 @@ fn park_timeout_acquires_through_the_token() {
         assert_eq!(data.with(|p| unsafe { *p }), 7);
     });
 }
+
+fn bounded() -> loom::model::Builder {
+    let mut builder = loom::model::Builder::new();
+    builder.preemption_bound = Some(3);
+    builder.threads = 1;
+    builder
+}
+
+/// A timeout fires on its own, so a peer spinning for the timed thread's
+/// effect is waiting on time, not on a deadlock or an endless spin.
+#[test]
+fn a_timeout_ends_a_peers_spin() {
+    bounded().check(|| {
+        let flag = Arc::new(AtomicBool::new(false));
+        let f2 = flag.clone();
+        let th = thread::spawn(move || {
+            thread::park_timeout(Duration::from_millis(1));
+            f2.store(true, Release);
+        });
+        while !flag.load(Acquire) {
+            loom::hint::spin_loop();
+        }
+        th.join().unwrap();
+    });
+}
+
+/// The same with two timed parks in a row: the second times out as the
+/// first does, however many timeouts came before it.
+#[test]
+fn successive_timeouts_end_a_peers_spin() {
+    bounded().check(|| {
+        let flag = Arc::new(AtomicBool::new(false));
+        let f2 = flag.clone();
+        let th = thread::spawn(move || {
+            thread::park_timeout(Duration::from_millis(1));
+            thread::park_timeout(Duration::from_millis(1));
+            f2.store(true, Release);
+        });
+        while !flag.load(Acquire) {
+            loom::hint::spin_loop();
+        }
+        th.join().unwrap();
+    });
+}
+
+/// `thread::sleep` is a timed wait nothing ends early: a sleeping thread
+/// wakes on its own, and a poll loop that sleeps between polls completes.
+#[test]
+fn a_sleep_poll_loop_completes() {
+    bounded().check(|| {
+        let flag = Arc::new(AtomicBool::new(false));
+        let f2 = flag.clone();
+        let th = thread::spawn(move || f2.store(true, Release));
+        while !flag.load(Acquire) {
+            thread::sleep(Duration::from_millis(1));
+        }
+        th.join().unwrap();
+    });
+}
+
+/// A timeout can fire while its unparker is still runnable: the unpark then
+/// finds the thread already returned, and the token is left.
+#[test]
+fn a_timeout_fires_before_a_runnable_unparker() {
+    use std::sync::atomic::{AtomicBool as StdBool, Ordering::SeqCst};
+    static EARLY: StdBool = StdBool::new(false);
+
+    bounded().check(|| {
+        let unparked = Arc::new(AtomicBool::new(false));
+        let main = thread::current();
+        let u2 = unparked.clone();
+        let th = thread::spawn(move || {
+            u2.store(true, SeqCst);
+            main.unpark();
+        });
+        thread::park_timeout(Duration::from_millis(1));
+        if !unparked.load(SeqCst) {
+            EARLY.store(true, SeqCst);
+        }
+        th.join().unwrap();
+    });
+
+    assert!(EARLY.load(SeqCst), "no timeout fired before the unparker ran");
+}

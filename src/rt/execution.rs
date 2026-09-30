@@ -6,7 +6,7 @@ use rustc_hash::FxHashMap;
 use std::any::Any;
 use std::fmt::{self, Write};
 
-use tracing::info;
+use tracing::{info, trace};
 
 pub(crate) struct Execution {
     /// Uniquely identifies an execution
@@ -267,27 +267,16 @@ impl Execution {
             }
         }
 
-        // A thread blocked in a timed wait can always end its block on its
-        // own — its timeout fires. If no thread can run otherwise, time is
-        // the only mover left: fire every pending timeout instead of
-        // reporting a deadlock the clock would have resolved. The woken
-        // wait tells a timeout apart from a notification by its wait-queue
-        // entry (see `rt::Condvar::wait`).
-        if !self
-            .threads
-            .iter()
-            .any(|(_, th)| th.is_runnable() || th.is_yield())
-        {
-            for (_, th) in self.threads.iter_mut() {
-                if th.is_blocked_timed() {
-                    th.set_runnable();
-                }
-            }
-
-            // Time moved instead of an operation; the commutation argument
-            // sleep rests on says nothing about timeouts, so drop the set.
-            self.sleep.wake_all();
-        }
+        // A thread in a timed wait is schedulable: scheduling it is its
+        // timeout firing, with its pending operation on the object it waits
+        // on, so DPOR orders the firing against that object's notifications
+        // both ways. With nothing else runnable (spinners wait on the others
+        // and do not count) any timeout may fire — time is the only mover
+        // left, never a deadlock. While another thread can run, a thread's
+        // timeout may fire early once per execution, which bounds every
+        // timed-wait loop.
+        let others_runnable = self.threads.iter().any(|(_, th)| th.is_runnable());
+        let timed = self.threads.iter().any(|(_, th)| th.is_blocked_timed());
 
         // Threads symmetry holds back from being scheduled for now
         // (`thread::symmetric`). Shown as disabled below: unschedulable
@@ -298,7 +287,8 @@ impl Execution {
         let mut initial = Some(self.threads.active_id());
 
         // If the thread is not runnable, then we can pick any arbitrary other
-        // runnable thread.
+        // runnable thread; failing that, a timeout fires before a spinner
+        // runs again.
         if !self.threads.active().is_runnable() {
             initial = None;
 
@@ -315,6 +305,21 @@ impl Execution {
                     initial = Some(i)
                 }
             }
+
+            if initial.is_none() {
+                initial = self
+                    .threads
+                    .iter()
+                    .find(|(_, th)| th.may_time_out(others_runnable))
+                    .map(|(i, _)| i);
+            }
+        }
+
+        // Timeouts are not operations the sleep-set commutation argument
+        // covers: a firing's enabledness hangs on what else is runnable. No
+        // thread sleeps across a point where one could fire.
+        if timed {
+            self.sleep.wake_all();
         }
 
         // A sleeping thread must not be *started* here: its next operation is
@@ -362,6 +367,8 @@ impl Execution {
                     Thread::Active
                 } else if th.is_yield() {
                     Thread::Yield
+                } else if th.may_time_out(others_runnable) {
+                    Thread::Skip
                 } else if !th.is_runnable() || is_pinned {
                     Thread::Disabled
                 } else {
@@ -370,7 +377,7 @@ impl Execution {
             })
         });
 
-        if self.sleep_sets {
+        if self.sleep_sets && !timed {
             self.sleep.cover(covered);
 
             // Replay scheduled a thread that is still asleep: everything from
@@ -398,6 +405,11 @@ impl Execution {
 
         if !self.threads.is_active() {
             return true;
+        }
+
+        if self.threads.active().is_blocked_timed() {
+            trace!(thread = ?self.threads.active_id(), ?others_runnable, "timeout fires");
+            self.threads.active_mut().fire_timeout(others_runnable);
         }
 
         // The chosen thread is scheduled now: any symmetry pin waiting on it

@@ -68,6 +68,12 @@ pub(crate) struct Thread {
     /// execution. One spurious return per thread bounds every park loop.
     park_spurred: bool,
 
+    /// Whether a timed wait of this thread has already timed out while
+    /// another thread could run, this execution. One such early timeout per
+    /// thread bounds every timed-wait loop; a timeout with nothing else
+    /// runnable is always available.
+    timeout_spent: bool,
+
     /// Tracks DPOR relations
     pub dpor_vv: VersionVec,
 
@@ -163,9 +169,9 @@ pub(crate) enum State {
     Blocked {
         #[allow(dead_code)]
         location: Location,
-        /// A timed block (`Condvar::wait_timeout`) can always end on its
-        /// own — its timeout fires. `Execution::schedule` wakes such
-        /// threads instead of declaring a deadlock.
+        /// A timed block (`park_timeout`, `Condvar::wait_timeout`, `sleep`)
+        /// can end on its own — its timeout fires, which
+        /// `Execution::schedule` offers as the thread's next transition.
         timed: bool,
     },
     Yield,
@@ -205,6 +211,7 @@ impl Thread {
             park_view: Synchronize::new(),
             parked: false,
             park_spurred: false,
+            timeout_spent: false,
             dpor_vv: VersionVec::new(),
             dpor_prior: None,
             last_yield: None,
@@ -241,8 +248,16 @@ impl Thread {
 
     pub(crate) fn set_yield(&mut self) {
         self.state = State::Yield;
-        self.last_yield = Some(self.causality[self.id]);
+        self.see_time_pass();
         self.yield_count += 1;
+    }
+
+    /// Time passed for this thread while it waited on no one in particular
+    /// (a spin, a sleep): a store it had already seen superseded is no longer
+    /// returned to it (`rt::atomic`'s yield rule), so a poll loop ends once
+    /// the store it polls for lands.
+    pub(crate) fn see_time_pass(&mut self) {
+        self.last_yield = Some(self.causality[self.id]);
     }
 
     pub(crate) fn is_terminated(&self) -> bool {
@@ -318,6 +333,21 @@ impl Thread {
     /// End a park its timeout ended, so a later `unpark` only sets the token.
     pub(crate) fn clear_parked(&mut self) {
         self.parked = false;
+    }
+
+    /// Whether the thread's timeout may fire at a point where `others_runnable`:
+    /// always when nothing else can run, else only while its early timeout
+    /// is unspent.
+    pub(crate) fn may_time_out(&self, others_runnable: bool) -> bool {
+        self.is_blocked_timed() && (!others_runnable || !self.timeout_spent)
+    }
+
+    /// The timeout of the thread's timed block fires: it runs again, having
+    /// spent its early timeout if another thread could have run instead.
+    pub(crate) fn fire_timeout(&mut self, others_runnable: bool) {
+        debug_assert!(self.is_blocked_timed(), "[loom internal bug] no timed block");
+        self.set_runnable();
+        self.timeout_spent |= others_runnable;
     }
 
     /// Whether this execution's one spurious `park` return is still unspent.

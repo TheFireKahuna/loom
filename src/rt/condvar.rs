@@ -17,8 +17,7 @@ pub(super) struct State {
     /// Tracks access to the mutex
     last_access: Option<Access>,
 
-    /// True if a wait on the condvar already woke on its own (spuriously /
-    /// by its timeout) this execution
+    /// True if a wait on the condvar already woke spuriously this execution
     did_spur: bool,
 
     /// Threads waiting on the condvar
@@ -54,12 +53,12 @@ impl Condvar {
     pub(crate) fn wait(&self, mutex: &Mutex, timed: bool, location: Location) -> bool {
         self.state.branch_opaque(location);
 
-        // Decide up front whether this wait wakes on its own: the timeout
-        // firing for a timed wait, a spurious wakeup for an untimed one.
-        // Modeled like `Notify`'s spurious branch — a path branch explored
-        // both ways — and bounded the same way: at most one self-wake per
-        // condvar per execution, which keeps wait loops finite.
-        let wake_self = rt::execution(|execution| {
+        // Decide up front whether this wait wakes spuriously: a path branch
+        // explored both ways, bounded to one spurious wake per condvar per
+        // execution, which keeps wait loops finite. A timed wait's timeout
+        // is not decided here: it fires from the scheduler while the thread
+        // is blocked (`rt::park_timed`).
+        let spurious = rt::execution(|execution| {
             let spurious = if self.state.get(&execution.objects).might_spur() {
                 execution.path.branch_spurious()
             } else {
@@ -73,8 +72,8 @@ impl Condvar {
             spurious
         });
 
-        if wake_self {
-            trace!(state = ?self.state, ?timed, "Condvar::wait: self-wake");
+        if spurious {
+            trace!(state = ?self.state, ?timed, "Condvar::wait: spurious");
 
             // Even a wait that never blocks releases and reacquires the
             // lock: other threads may run (and take it) in between —
@@ -82,20 +81,6 @@ impl Condvar {
             mutex.release_lock();
             mutex.acquire_lock(location);
 
-            // An untimed self-wake is spurious (`false`). A timed self-wake is
-            // EITHER the timeout firing OR a bounded pre-deadline spurious
-            // wake — explored both ways via one extra `branch_spurious` (itself
-            // bounded: this arm runs at most once per condvar per execution).
-            // The spurious arm returns `false` (not timed out), consuming
-            // nothing, so a caller whose timeout and spurious paths diverge — a
-            // futex kernel-wait loop terminates on a timeout but re-checks and
-            // re-parks on a spurious wake — has its re-park arm model-checked.
-            // `std` does not require timed waits to spur and a spurious return
-            // is always caller-legal, so no correct caller breaks; the timeout
-            // stays reachable (this arm's `true`, and the park+rescue path).
-            if timed {
-                return !rt::execution(|execution| execution.path.branch_spurious());
-            }
             return false;
         }
 
@@ -111,19 +96,17 @@ impl Condvar {
         // Release the lock
         mutex.release_lock();
 
-        // Disable the current thread; a timed wait can additionally be
-        // revived by the deadlock rescue in `Execution::schedule` (its
-        // timeout firing when nothing else can run).
+        // Disable the current thread. A timed wait's timeout firing is an
+        // operation on the condvar, ordered against its notifications.
         if timed {
-            rt::park_timed(location);
+            rt::park_timed(location, self.state.opaque(location));
         } else {
             rt::park(location);
         }
 
-        // A notification dequeues its target before waking it; the other
-        // wake (the timeout rescue) leaves the entry behind. Dequeue ourselves
-        // so a later notification is not spent on a thread that already
-        // returned from its wait.
+        // A notification dequeues its target before waking it; a timeout
+        // leaves the entry behind. Dequeue ourselves so a later notification
+        // is not spent on a thread that already returned from its wait.
         let timed_out = rt::execution(|execution| {
             let id = execution.threads.active_id();
             let state = self.state.get_mut(&mut execution.objects);

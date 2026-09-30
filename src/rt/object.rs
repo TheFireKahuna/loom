@@ -666,11 +666,19 @@ impl<T: Object<Entry = Entry>> Ref<T> {
         );
 
         execution.threads.active_mut().operation = Some(Operation {
-            obj: self.erase(),
             action,
+            ..self.opaque(location)
+        });
+    }
+
+    /// An operation on this object with no specialized dependencies.
+    pub(super) fn opaque(self, location: Location) -> Operation {
+        Operation {
+            obj: self.erase(),
+            action: Action::Opaque,
             location,
             sc: false,
-        });
+        }
     }
 }
 
