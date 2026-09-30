@@ -1,4 +1,5 @@
 use crate::rt::object;
+use crate::rt::access::{LockAccesses, LockOp};
 use crate::rt::{thread, Access, Execution, Location, Synchronize, VersionVec};
 
 use std::collections::HashMap;
@@ -44,8 +45,8 @@ pub(super) struct State {
     /// A set of `thread::Id` when Read locked.
     lock: Option<Locked>,
 
-    /// Tracks write access to the rwlock.
-    last_access: Option<Access>,
+    /// Tracks access to the rwlock.
+    accesses: LockAccesses,
 
     /// Causality transfers between threads
     synchronize: Synchronize,
@@ -57,7 +58,7 @@ impl RwLock {
         super::execution(|execution| {
             let state = execution.objects.insert(State {
                 lock: None,
-                last_access: None,
+                accesses: LockAccesses::default(),
                 synchronize: Synchronize::new(),
             });
 
@@ -289,12 +290,22 @@ impl RwLock {
     }
 }
 
+impl Action {
+    fn op(self) -> LockOp {
+        match self {
+            Action::Read | Action::Write => LockOp::Acquire,
+            Action::TryRead | Action::TryWrite => LockOp::Try,
+            Action::Unlock => LockOp::Unlock,
+        }
+    }
+}
+
 impl State {
-    pub(crate) fn last_dependent_access(&self) -> Option<&Access> {
-        self.last_access.as_ref()
+    pub(crate) fn for_each_dependent_access(&self, action: Action, f: impl FnMut(&Access)) {
+        self.accesses.for_each_dependent(action.op(), f)
     }
 
-    pub(crate) fn set_last_access(&mut self, path_id: usize, version: &VersionVec) {
-        Access::set_or_create(&mut self.last_access, path_id, version)
+    pub(crate) fn set_last_access(&mut self, action: Action, path_id: usize, version: &VersionVec) {
+        self.accesses.record(action.op(), path_id, version);
     }
 }
