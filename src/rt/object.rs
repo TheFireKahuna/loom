@@ -524,9 +524,23 @@ impl<T> Ref<T> {
 }
 
 impl<T: Object> Ref<T> {
+    /// Panic unless the object is one of the current execution's: an index at
+    /// or past `live` names a slot the execution has not reincarnated.
+    #[inline]
+    fn check_live(self, live: usize) {
+        if self.index >= live {
+            std::hint::cold_path();
+            panic!(
+                "a loom object was used outside the execution that created it: one created \
+                 at run time in an earlier execution was kept, in a `static` or a leak, \
+                 into this one. Create it in each execution, or `const`-construct it."
+            );
+        }
+    }
+
     /// Get a reference to the object associated with this reference from the store
     pub(super) fn get(self, store: &Store<T::Entry>) -> &T {
-        debug_assert!(self.index < store.live, "[loom internal bug] ref to carcass");
+        self.check_live(store.live);
         T::get_ref(&store.entries[self.index])
             .expect("[loom internal bug] unexpected object stored at reference")
     }
@@ -534,7 +548,7 @@ impl<T: Object> Ref<T> {
     /// Get a mutable reference to the object associated with this reference
     /// from the store
     pub(super) fn get_mut(self, store: &mut Store<T::Entry>) -> &mut T {
-        debug_assert!(self.index < store.live, "[loom internal bug] ref to carcass");
+        self.check_live(store.live);
         T::get_mut(&mut store.entries[self.index])
             .expect("[loom internal bug] unexpected object stored at reference")
     }
