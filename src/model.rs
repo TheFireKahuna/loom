@@ -396,10 +396,10 @@ impl Builder {
             Walk::TimedOut(stats) => (stats, true),
             Walk::Failed(failure) => failure.raise(),
             Walk::Handover(probed, seed) => {
-                let (stats, timed_out) = self.check_parallel(&f, workers, start, seed);
+                let (stats, timed_out) =
+                    self.check_parallel(&f, workers, start, seed, probed.executions);
 
                 let stats = Stats {
-                    executions: stats.executions + probed.executions,
                     pruned: stats.pruned + probed.pruned,
                     conservative: stats.conservative + probed.conservative,
                     ..stats
@@ -586,6 +586,9 @@ impl Builder {
     /// and the frozen prefixes — so each explores exactly as a serial walk
     /// does, one path at a time.
     ///
+    /// `probed` executions already ran before the handover; they count
+    /// against `max_permutations` and are included in the returned stats.
+    ///
     /// Returns the stats and whether the run stopped at `max_duration`.
     fn check_parallel<F>(
         &self,
@@ -593,13 +596,14 @@ impl Builder {
         workers: usize,
         start: Instant,
         mut seed: rt::Path,
+        probed: usize,
     ) -> (Stats, bool)
     where
         F: Fn() + Sync + Send + 'static,
     {
         seed.set_split_depth(self.split_depth);
 
-        let shared = Shared::new(seed);
+        let shared = Shared::new(seed, probed);
 
         // Worker threads do not inherit the caller's `tracing` subscriber.
         let dispatch = tracing::dispatcher::get_default(|d| d.clone());
@@ -828,6 +832,8 @@ impl Drop for Grant {
 struct Shared {
     state: Mutex<QueueState>,
     wake: Condvar,
+    /// Executions the run has explored, the serial probe's included: what
+    /// `max_permutations` is checked against.
     executions: AtomicUsize,
 
     /// Sum of exited workers' sleep-set prunes.
@@ -863,7 +869,8 @@ struct QueueState {
 }
 
 impl Shared {
-    fn new(seed: rt::Path) -> Shared {
+    /// A pool over `seed`, whose run has already spent `executions`.
+    fn new(seed: rt::Path, executions: usize) -> Shared {
         Shared {
             state: Mutex::new(QueueState {
                 tasks: vec![seed],
@@ -872,7 +879,7 @@ impl Shared {
                 failure: None,
             }),
             wake: Condvar::new(),
-            executions: AtomicUsize::new(0),
+            executions: AtomicUsize::new(executions),
             pruned: AtomicUsize::new(0),
             conservative: AtomicUsize::new(0),
             idle: AtomicUsize::new(0),

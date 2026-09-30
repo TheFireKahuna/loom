@@ -239,6 +239,30 @@ fn max_duration_fails_a_sharded_run() {
     check_times_out(4);
 }
 
+/// `max_permutations` caps the whole run: the serial probe's executions count
+/// against it, so a run handed to a pool stops at the cap, give or take the
+/// execution each other worker has in flight.
+#[test]
+fn max_permutations_counts_the_probe() {
+    const CAP: usize = 20_000;
+
+    let mut builder = Builder::new();
+    builder.max_permutations = Some(CAP);
+    builder.max_duration = None;
+    builder.threads = 2;
+    builder.budgeted = false;
+    builder.probe = Duration::from_millis(50);
+    builder.preemption_bound = None;
+
+    let stats = builder.check(unbounded_model);
+
+    assert!(
+        (CAP..=CAP + 1).contains(&stats.executions),
+        "{} executions against a cap of {CAP}",
+        stats.executions
+    );
+}
+
 #[inline(never)]
 fn recurse(depth: usize) -> usize {
     let frame = black_box([depth as u8; 1024]);
