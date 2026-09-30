@@ -46,6 +46,14 @@ macro_rules! atomic_int {
             pub fn get_mut(&mut self) -> &mut $int_type {
                 self.0.get_mut()
             }
+
+            /// Consumes the atomic and returns the contained value.
+            #[track_caller]
+            pub fn into_inner(self) -> $int_type {
+                // SAFETY: ownership guarantees that no other threads are concurrently
+                // accessing the atomic value.
+                unsafe { self.unsync_load() }
+            }
         }
 
         impl Default for $name {
@@ -124,14 +132,6 @@ macro_rules! atomic_int {
             #[track_caller]
             pub unsafe fn unsync_load(&self) -> $int_type {
                 self.0.unsync_load()
-            }
-
-            /// Consumes the atomic and returns the contained value.
-            #[track_caller]
-            pub fn into_inner(self) -> $int_type {
-                // SAFETY: ownership guarantees that no other threads are concurrently
-                // accessing the atomic value.
-                unsafe { self.unsync_load() }
             }
 
             /// Loads a value from the atomic integer.

@@ -34,6 +34,17 @@
 //! [`AtomicU64::new`](crate::sync::atomic::AtomicU64::new) reports an
 //! unsynchronized access to a constructed cell.
 //!
+//! A cell cannot be moved out of its memory, since the address it would move
+//! to was never published, so there is no by-value `into_inner`:
+//!
+//! ```compile_fail
+//! loom::sync::atomic::materialized::AtomicU32::ZEROED.into_inner();
+//! ```
+//!
+//! ```compile_fail
+//! loom::sync::atomic::materialized::AtomicPtr::<u8>::ZEROED.into_inner();
+//! ```
+//!
 //! # Cost
 //!
 //! Every operation resolves its registration through a per-execution table

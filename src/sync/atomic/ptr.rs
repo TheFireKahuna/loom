@@ -46,6 +46,14 @@ macro_rules! atomic_ptr {
             pub fn get_mut(&mut self) -> &mut *mut T {
                 self.0.get_mut()
             }
+
+            /// Consumes the atomic and returns the contained value.
+            #[track_caller]
+            pub fn into_inner(self) -> *mut T {
+                // SAFETY: ownership guarantees that no other threads are
+                // concurrently accessing the atomic value.
+                unsafe { self.unsync_load() }
+            }
         }
 
         impl<T> Default for $name<T> {
@@ -122,14 +130,6 @@ macro_rules! atomic_ptr {
             #[track_caller]
             pub fn with_mut<R>(&mut self, f: impl FnOnce(&mut *mut T) -> R) -> R {
                 self.0.with_mut(f)
-            }
-
-            /// Consumes the atomic and returns the contained value.
-            #[track_caller]
-            pub fn into_inner(self) -> *mut T {
-                // SAFETY: ownership guarantees that no other threads are
-                // concurrently accessing the atomic value.
-                unsafe { self.unsync_load() }
             }
 
             /// Loads a value from the pointer.
