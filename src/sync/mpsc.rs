@@ -31,17 +31,27 @@ impl<T> Sender<T> {
     /// not be sent.
     #[track_caller]
     pub fn send(&self, msg: T) -> Result<(), std::sync::mpsc::SendError<T>> {
-        self.object.send(location!());
-        self.sender.send(msg)
+        let delivered = self.object.send(location!());
+        let result = self.sender.send(msg);
+        assert_eq!(delivered, result.is_ok(), "[loom internal bug] send disagrees with std");
+        result
     }
 }
 
 impl<T> Clone for Sender<T> {
     fn clone(&self) -> Sender<T> {
+        self.object.clone_sender();
         Sender {
             object: std::sync::Arc::clone(&self.object),
             sender: self.sender.clone(),
         }
+    }
+}
+
+impl<T> Drop for Sender<T> {
+    #[track_caller]
+    fn drop(&mut self) {
+        self.object.drop_sender(location!());
     }
 }
 
@@ -57,8 +67,10 @@ impl<T> Receiver<T> {
     /// corresponding channel has hung up.
     #[track_caller]
     pub fn recv(&self) -> Result<T, std::sync::mpsc::RecvError> {
-        self.object.recv(location!());
-        self.receiver.recv()
+        if !self.object.recv(location!()) {
+            return Err(std::sync::mpsc::RecvError);
+        }
+        Ok(self.received())
     }
     /// Attempts to wait for a value on this receiver, returning an error if the
     /// corresponding channel has hung up, or if it waits more than `timeout`.
@@ -70,20 +82,26 @@ impl<T> Receiver<T> {
     }
 
     /// Attempts to return a pending value on this receiver without blocking.
+    #[track_caller]
     pub fn try_recv(&self) -> Result<T, std::sync::mpsc::TryRecvError> {
-        if self.object.is_empty() {
-            return Err(std::sync::mpsc::TryRecvError::Empty);
-        } else {
-            self.recv().map_err(|e| e.into())
+        match self.object.try_recv(location!()) {
+            rt::TryRecv::Msg => Ok(self.received()),
+            rt::TryRecv::Empty => Err(std::sync::mpsc::TryRecvError::Empty),
+            rt::TryRecv::Disconnected => Err(std::sync::mpsc::TryRecvError::Disconnected),
         }
+    }
+
+    /// The message the model just received, which `std`'s channel holds too.
+    fn received(&self) -> T {
+        self.receiver
+            .try_recv()
+            .expect("[loom internal bug] the model received a message std does not hold")
     }
 }
 
 impl<T> Drop for Receiver<T> {
+    #[track_caller]
     fn drop(&mut self) {
-        // Drain the channel.
-        while !self.object.is_empty() {
-            self.recv().unwrap();
-        }
+        self.object.drop_receiver(location!());
     }
 }

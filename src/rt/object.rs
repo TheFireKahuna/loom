@@ -409,11 +409,7 @@ impl Store {
                     f(access);
                 }
             }
-            Entry::Channel(entry) => {
-                if let Some(access) = entry.last_dependent_access(operation.action.into()) {
-                    f(access);
-                }
-            }
+            Entry::Channel(entry) => entry.for_each_dependent_access(operation.action.into(), f),
             obj => panic!(
                 "object is not branchable {:?}; ref = {:?}",
                 obj, operation.obj

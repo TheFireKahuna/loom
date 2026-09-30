@@ -39,7 +39,7 @@ pub(crate) use self::num::Numeric;
 pub(crate) mod object;
 
 mod mpsc;
-pub(crate) use self::mpsc::Channel;
+pub(crate) use self::mpsc::{Channel, TryRecv};
 
 mod mutex;
 pub(crate) use self::mutex::Mutex;
