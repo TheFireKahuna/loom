@@ -35,6 +35,7 @@ macro_rules! atomic_ptr {
             /// Creates a null `AtomicPtr` with registration deferred to first
             /// access whatever the context; see
             /// [`AtomicUsize::const_new`](crate::sync::atomic::AtomicUsize::const_new).
+            #[track_caller]
             pub const fn const_null() -> $name<T> {
                 $name(Atomic::const_new(0))
             }

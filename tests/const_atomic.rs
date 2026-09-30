@@ -571,3 +571,116 @@ fn new_in_a_static_resets_between_executions() {
     });
 }
 
+
+// ===== a `const`-built cell must be in the binary image =====
+
+/// The expected text of the first-touch report for a `const`-built cell
+/// outside the image.
+const OUTSIDE_THE_IMAGE: &str = "outside the writable data of every loaded image";
+
+/// A `const` item copied into memory obtained at run time is not in the binary
+/// image: its pre-execution genesis would hide an unsynchronized publication
+/// of the cell. Its first access reports it.
+#[test]
+#[should_panic(expected = "outside the writable data of every loaded image")]
+fn const_item_copied_to_the_heap_is_reported() {
+    const INIT: AtomicUsize = AtomicUsize::new(0);
+    loom::model(|| {
+        let cell = Box::new(INIT);
+        cell.load(Relaxed);
+    });
+}
+
+/// The same on the stack, through `const_new`, which defers alike in `const`
+/// evaluation.
+#[test]
+#[should_panic(expected = "outside the writable data of every loaded image")]
+fn const_new_item_copied_to_the_stack_is_reported() {
+    const INIT: AtomicBool = AtomicBool::const_new(false);
+    loom::model(|| {
+        let cell = INIT;
+        cell.load(Relaxed);
+    });
+}
+
+/// A null `AtomicPtr` built in `const` evaluation, copied into an array.
+#[test]
+#[should_panic(expected = "outside the writable data of every loaded image")]
+fn const_null_pointer_item_copied_is_reported() {
+    const INIT: AtomicPtr<u8> = AtomicPtr::new(std::ptr::null_mut());
+    loom::model(|| {
+        let cells = [INIT; 2];
+        cells[1].load(Relaxed);
+    });
+}
+
+/// The report names where the cell was built and how to build it instead.
+#[test]
+fn the_report_names_the_creation_site_and_the_fix() {
+    const INIT: AtomicUsize = AtomicUsize::new(0);
+    let line = line!() - 1;
+    let report = std::panic::catch_unwind(|| {
+        loom::model(|| {
+            let cell = Box::new(INIT);
+            cell.store(1, Relaxed);
+        })
+    })
+    .expect_err("a heap copy of a `const` item must be reported");
+    let report = report
+        .downcast_ref::<String>()
+        .cloned()
+        .or_else(|| report.downcast_ref::<&str>().map(|s| s.to_string()))
+        .unwrap();
+    assert!(report.contains(OUTSIDE_THE_IMAGE), "{report}");
+    assert!(report.contains(&format!("const_atomic.rs:{line}:")), "{report}");
+    assert!(report.contains("at run time"), "{report}");
+}
+
+/// The shape the check exists for: a record built from a `const` item on the
+/// heap and published with a relaxed store. Built at run time, the
+/// unsynchronized publication is a reported race; built by copying a `const`
+/// item it would have passed, so the copy itself is reported.
+#[test]
+#[should_panic(expected = "outside the writable data of every loaded image")]
+fn relaxed_publication_of_a_const_copied_record_is_reported() {
+    struct Rec {
+        a: AtomicUsize,
+    }
+    impl Rec {
+        const INIT: Rec = Rec {
+            a: AtomicUsize::new(0),
+        };
+    }
+
+    loom::model(|| {
+        let slot = Arc::new(AtomicPtr::<Rec>::new(std::ptr::null_mut()));
+        let t = {
+            let slot = slot.clone();
+            thread::spawn(move || {
+                let rec = Box::into_raw(Box::new(Rec::INIT));
+                slot.store(rec, Relaxed);
+            })
+        };
+        let rec = slot.load(Relaxed);
+        if !rec.is_null() {
+            // SAFETY: published by `t` and never freed while the model runs.
+            unsafe { (*rec).a.load(Relaxed) };
+        }
+        t.join().unwrap();
+        let rec = slot.load(Relaxed);
+        if !rec.is_null() {
+            // SAFETY: `t` is joined; this is the only reference left.
+            drop(unsafe { Box::from_raw(rec) });
+        }
+    });
+}
+
+/// `const_new` called at run time is the documented deferred genesis for a
+/// runtime cell, not a `const`-built one, and stays wherever it lives.
+#[test]
+fn const_new_at_run_time_is_not_reported() {
+    loom::model(|| {
+        let boxed = Box::new(AtomicUsize::const_new(3));
+        assert_eq!(boxed.load(Relaxed), 3);
+    });
+}

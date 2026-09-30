@@ -282,10 +282,16 @@ pub struct Atomic<T> {
     /// `PhantomData<fn() -> T>` grants it. Unread when `state` is `Some`.
     init: u128,
 
-    /// The creation site of a deferred cell, recorded when its registration
-    /// lands. `None` for an eagerly registered cell, whose `State` carries it
-    /// from construction, and for a deferred cell built with no caller.
+    /// The creation site of a cell built in `const` evaluation, recorded when
+    /// its registration lands; `Some` exactly for such a cell. `None` for an
+    /// eagerly registered cell, whose `State` carries it from construction,
+    /// and for one `const_new` built at run time.
     created: Option<&'static std::panic::Location<'static>>,
+
+    /// The address at which a cell built in `const` evaluation was last found
+    /// in the binary image (`image::holds_static`), or 0: a copy of the cell
+    /// elsewhere is checked afresh.
+    resident: std::sync::atomic::AtomicUsize,
 
     /// A [`Atomic::get_mut`] borrow wrote its value into `shadow`, not yet
     /// into the model. The cell's next access folds it in (`Resolve`) before
@@ -1290,6 +1296,161 @@ fn register(
 
         (state, true)
     })
+}
+
+/// Where a `static` lives: the writable data of a loaded image.
+mod image {
+    /// Whether `[addr, addr + len)` lies in a writable, non-executable data
+    /// section of the loaded image holding `addr` (`.data`, `.bss`): where a
+    /// `static` is, and memory the program obtains at run time is not.
+    #[cfg(windows)]
+    pub(super) fn holds_static(addr: usize, len: usize) -> bool {
+        use std::ffi::c_void;
+
+        #[link(name = "kernel32")]
+        unsafe extern "system" {
+            fn GetModuleHandleExW(flags: u32, name: *const u16, module: *mut *mut c_void) -> i32;
+        }
+        const FROM_ADDRESS: u32 = 0x4;
+        const UNCHANGED_REFCOUNT: u32 = 0x2;
+        const SCN_CNT_DATA: u32 = 0x40 | 0x80;
+        const SCN_MEM_EXECUTE: u32 = 0x2000_0000;
+        const SCN_MEM_WRITE: u32 = 0x8000_0000;
+
+        let mut module = std::ptr::null_mut();
+        // SAFETY: with `FROM_ADDRESS` the name is an address to look up, never
+        // read; `UNCHANGED_REFCOUNT` takes no reference to release.
+        let found = unsafe {
+            GetModuleHandleExW(FROM_ADDRESS | UNCHANGED_REFCOUNT, addr as *const u16, &mut module)
+        };
+        if found == 0 {
+            return false;
+        }
+
+        let base = module as usize;
+        // SAFETY: a module handle is its image base, where the loader maps the
+        // headers readable for as long as the module is loaded, and the cell
+        // at `addr` keeps its module loaded while it is being accessed.
+        let u16_at = |at: usize| unsafe { (at as *const u16).read_unaligned() };
+        let u32_at = |at: usize| unsafe { (at as *const u32).read_unaligned() };
+
+        let nt = base + u32_at(base + 0x3c) as usize;
+        if u32_at(nt) != u32::from_le_bytes(*b"PE\0\0") {
+            return false;
+        }
+        let file = nt + 4;
+        let sections = file + 20 + u16_at(file + 16) as usize;
+        (0..u16_at(file + 2) as usize).any(|i| {
+            let section = sections + i * 40;
+            let lo = base + u32_at(section + 12) as usize;
+            let hi = lo + u32_at(section + 8) as usize;
+            let flags = u32_at(section + 36);
+            flags & SCN_MEM_WRITE != 0
+                && flags & SCN_MEM_EXECUTE == 0
+                && flags & SCN_CNT_DATA != 0
+                && lo <= addr
+                && addr + len <= hi
+        })
+    }
+
+    /// Whether `[addr, addr + len)` lies in a writable, non-executable `PT_LOAD`
+    /// segment of a loaded object (`.data`, `.bss`): where a `static` is, and
+    /// memory the program obtains at run time is not.
+    #[cfg(all(
+        target_pointer_width = "64",
+        any(
+            target_os = "linux",
+            target_os = "android",
+            target_os = "freebsd",
+            target_os = "netbsd",
+            target_os = "openbsd",
+            target_os = "dragonfly",
+            target_os = "illumos",
+            target_os = "solaris",
+        ),
+    ))]
+    pub(super) fn holds_static(addr: usize, len: usize) -> bool {
+        use std::ffi::{c_char, c_int, c_void};
+
+        /// The leading fields of `struct dl_phdr_info`.
+        #[repr(C)]
+        struct PhdrInfo {
+            addr: u64,
+            name: *const c_char,
+            phdr: *const Phdr,
+            phnum: u16,
+        }
+
+        /// `Elf64_Phdr`.
+        #[repr(C)]
+        struct Phdr {
+            kind: u32,
+            flags: u32,
+            offset: u64,
+            vaddr: u64,
+            paddr: u64,
+            filesz: u64,
+            memsz: u64,
+            align: u64,
+        }
+
+        unsafe extern "C" {
+            fn dl_iterate_phdr(
+                callback: unsafe extern "C" fn(*mut PhdrInfo, usize, *mut c_void) -> c_int,
+                data: *mut c_void,
+            ) -> c_int;
+        }
+        const PT_LOAD: u32 = 1;
+        const PF_X: u32 = 1;
+        const PF_W: u32 = 2;
+
+        unsafe extern "C" fn visit(info: *mut PhdrInfo, _: usize, data: *mut c_void) -> c_int {
+            // SAFETY: `dl_iterate_phdr` hands each loaded object's program
+            // headers to the callback, valid for the call, with the `data`
+            // this function was passed.
+            let (info, &(addr, len)) = unsafe { (&*info, &*data.cast::<(usize, usize)>()) };
+            // SAFETY: as above; `phnum` headers start at `phdr`.
+            let phdrs = unsafe { std::slice::from_raw_parts(info.phdr, info.phnum.into()) };
+            phdrs
+                .iter()
+                .any(|p| {
+                    let lo = (info.addr + p.vaddr) as usize;
+                    let hi = lo + p.memsz as usize;
+                    p.kind == PT_LOAD
+                        && p.flags & PF_W != 0
+                        && p.flags & PF_X == 0
+                        && lo <= addr
+                        && addr + len <= hi
+                })
+                .into()
+        }
+
+        let mut range = (addr, len);
+        // SAFETY: `visit` reads `data` only as the `(usize, usize)` it is here.
+        unsafe { dl_iterate_phdr(visit, (&raw mut range).cast()) != 0 }
+    }
+
+    #[cfg(not(any(
+        windows,
+        all(
+            target_pointer_width = "64",
+            any(
+                target_os = "linux",
+                target_os = "android",
+                target_os = "freebsd",
+                target_os = "netbsd",
+                target_os = "openbsd",
+                target_os = "dragonfly",
+                target_os = "illumos",
+                target_os = "solaris",
+            ),
+        ),
+    )))]
+    compile_error!(
+        "loom checks that an atomic built in `const` evaluation is a `static` in the binary \
+         image, and has no image-section lookup for this host: implement \
+         `rt::atomic::image::holds_static` for it"
+    );
 }
 
 /// The C11 model, written once over any [`Resolve`]able cell.
@@ -2617,6 +2778,7 @@ impl<T: Numeric> Atomic<T> {
                 cell_id: std::sync::atomic::AtomicU64::new(0),
                 init: 0,
                 created: None,
+                resident: std::sync::atomic::AtomicUsize::new(0),
                 lent: std::sync::atomic::AtomicBool::new(false),
                 shadow: 0,
                 _p: PhantomData,
@@ -2648,7 +2810,10 @@ impl<T: Numeric> Atomic<T> {
     /// it. The cost is that a cell built here does not carry the
     /// initialization-race check that [`Atomic::new`]'s thread-attributed
     /// genesis provides, which is why `new` keeps that genesis and every
-    /// runtime construction keeps using it.
+    /// runtime construction keeps using it. A cell built in `const` evaluation
+    /// (`created` is `Some`) is held to that: its first access of each
+    /// execution panics unless it lies in the binary image, where a `static`
+    /// does and a copy of a `const` item does not (`image::holds_static`).
     pub(crate) const fn const_new(
         init: u128,
         created: Option<&'static std::panic::Location<'static>>,
@@ -2658,6 +2823,7 @@ impl<T: Numeric> Atomic<T> {
             cell_id: std::sync::atomic::AtomicU64::new(0),
             init,
             created,
+            resident: std::sync::atomic::AtomicUsize::new(0),
             lent: std::sync::atomic::AtomicBool::new(false),
             shadow: 0,
             _p: PhantomData,
@@ -2721,8 +2887,36 @@ impl<T: Numeric> Atomic<T> {
         if fresh {
             // A borrow lent in an earlier execution is not this one's store.
             self.lent.store(false, std::sync::atomic::Ordering::Relaxed);
+            if let Some(created) = self.created {
+                self.check_resident(created);
+            }
         }
         state
+    }
+
+    /// Panic unless this cell, built in `const` evaluation at `created`, lies
+    /// in the binary image: the only place its pre-execution genesis is true.
+    fn check_resident(&self, created: &'static std::panic::Location<'static>) {
+        use std::sync::atomic::Ordering::Relaxed;
+
+        let addr = std::ptr::from_ref(self).addr();
+        if self.resident.load(Relaxed) == addr {
+            return;
+        }
+        if !image::holds_static(addr, size_of::<Self>()) {
+            std::hint::cold_path();
+            panic!(
+                "an atomic built in `const` evaluation at {created} is at {addr:#x}, outside \
+                 the writable data of every loaded image.\n\
+                 A cell built in `const` evaluation takes a genesis that precedes every \
+                 thread, which is true only of a `static` in the binary image. This one is \
+                 in memory obtained at run time, most likely a copy of a `const` item, so an \
+                 unsynchronized publication of it would go unreported. Build it at run \
+                 time instead: call `new`, or a `const fn` that builds it, at run time, not \
+                 by copying a `const` item."
+            );
+        }
+        self.resident.store(addr, Relaxed);
     }
 
 }

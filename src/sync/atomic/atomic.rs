@@ -84,7 +84,16 @@ where
     /// Creates a cell with registration deferred to first access whatever the
     /// context — the deferred genesis for a cell built at *runtime*, which
     /// [`new`](Self::new) would register eagerly. See [`rt::Atomic::const_new`].
+    /// In `const` evaluation it is [`new`](Self::new)'s own deferred arm.
+    #[track_caller]
     pub(crate) const fn const_new(init: u128) -> Atomic<T> {
+        let created = std::panic::Location::caller();
+        core::intrinsics::const_eval_select((init, created), Self::deferred, Self::runtime_deferred)
+    }
+
+    /// The runtime arm of [`const_new`](Self::const_new): deferred, and not
+    /// built in `const` evaluation, so it may live anywhere.
+    fn runtime_deferred(init: u128, _: &'static std::panic::Location<'static>) -> Atomic<T> {
         Atomic {
             state: rt::Atomic::const_new(init, None),
             _p: PhantomData,

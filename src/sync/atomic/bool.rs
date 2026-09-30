@@ -20,6 +20,7 @@ impl AtomicBool {
     /// Creates a new instance of `AtomicBool` with registration deferred to
     /// first access whatever the context; see
     /// [`AtomicUsize::const_new`](crate::sync::atomic::AtomicUsize::const_new).
+    #[track_caller]
     pub const fn const_new(v: bool) -> AtomicBool {
         AtomicBool(Atomic::const_new(v as u128))
     }

@@ -33,8 +33,11 @@ macro_rules! atomic_int {
                  [`new`](Self::new) already defers in `const` evaluation; this is the \
                  deferred genesis for a cell built at *runtime* — modelled as preceding \
                  the execution, so the unsynchronized-publication check `new` performs \
-                 does not apply to it.",
+                 does not apply to it. In `const` evaluation it is `new`'s deferred arm, \
+                 so the cell must end up in the binary image, a `static`: one copied \
+                 into memory obtained at run time is reported at its first access.",
             )]
+            #[track_caller]
             pub const fn const_new(v: $int_type) -> Self {
                 Self(Atomic::const_new(v as u128))
             }
