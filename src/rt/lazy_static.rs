@@ -1,4 +1,5 @@
 use crate::rt::synchronize::Synchronize;
+use crate::rt::thread;
 use std::{any::Any, collections::HashMap};
 
 pub(crate) struct Set {
@@ -7,6 +8,10 @@ pub(crate) struct Set {
     /// does not allocate and free a fresh table every iteration.
     statics: HashMap<StaticKeyId, StaticValue>,
 
+    /// Statics whose initializer is running, each with the threads blocked
+    /// until it is done.
+    running: HashMap<StaticKeyId, Vec<thread::Id>>,
+
     /// False between `drop` and the next `reset`: the execution is tearing
     /// down and the statics are gone even though the table still exists.
     live: bool,
@@ -14,6 +19,16 @@ pub(crate) struct Set {
 
 #[derive(Eq, PartialEq, Hash, Copy, Clone)]
 pub(crate) struct StaticKeyId(usize);
+
+/// What a thread reaching a static must do.
+pub(crate) enum Claim<'a> {
+    /// Use the value.
+    Done(&'a mut StaticValue),
+    /// Block until the running initializer is done; the thread is queued.
+    Wait,
+    /// Run the initializer: the static is now running on this thread.
+    Init,
+}
 
 pub(crate) struct StaticValue {
     pub(crate) sync: Synchronize,
@@ -25,6 +40,7 @@ impl Set {
     pub(crate) fn new() -> Set {
         Set {
             statics: HashMap::new(),
+            running: HashMap::new(),
             live: true,
         }
     }
@@ -38,6 +54,8 @@ impl Set {
             "lazy_static was not dropped during execution"
         );
         debug_assert!(self.statics.is_empty(), "`drop` left statics behind");
+        // A failed execution can end with an initializer still running.
+        self.running.clear();
         self.live = true;
     }
 
@@ -51,27 +69,50 @@ impl Set {
         self.statics.drain().map(|(_, value)| value).collect()
     }
 
-    pub(crate) fn get_static<T: 'static>(
+    /// `thread` reaches `key`: the value if it is initialized, otherwise the
+    /// initializer to run or to wait for.
+    pub(crate) fn claim<T: 'static>(
         &mut self,
         key: &'static crate::lazy_static::Lazy<T>,
-    ) -> Option<&mut StaticValue> {
+        thread: thread::Id,
+    ) -> Claim<'_> {
         assert!(self.live, "attempted to access lazy_static during shutdown");
-        self.statics.get_mut(&StaticKeyId::new(key))
+        let id = StaticKeyId::new(key);
+        if let Some(value) = self.statics.get_mut(&id) {
+            return Claim::Done(value);
+        }
+        match self.running.get_mut(&id) {
+            Some(waiters) => {
+                waiters.push(thread);
+                Claim::Wait
+            }
+            None => {
+                self.running.insert(id, Vec::new());
+                Claim::Init
+            }
+        }
     }
 
+    /// The claimed initializer of `key` returned `value`: the static is
+    /// initialized, and the threads waiting on it are handed back to wake.
     pub(crate) fn init_static<T: 'static>(
         &mut self,
         key: &'static crate::lazy_static::Lazy<T>,
         value: StaticValue,
-    ) -> &mut StaticValue {
+    ) -> (&mut StaticValue, Vec<thread::Id>) {
         assert!(self.live, "attempted to access lazy_static during shutdown");
-        let v = self.statics.entry(StaticKeyId::new(key));
+        let id = StaticKeyId::new(key);
+        let waiters = self
+            .running
+            .remove(&id)
+            .expect("told to init static, but it was not claimed");
+        let v = self.statics.entry(id);
 
         if let std::collections::hash_map::Entry::Occupied(_) = v {
             unreachable!("told to init static, but it was already init'd");
         }
 
-        v.or_insert(value)
+        (v.or_insert(value), waiters)
     }
 }
 

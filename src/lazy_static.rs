@@ -40,48 +40,60 @@ impl<T: 'static> Lazy<T> {
         // users sometimes _rely_ on the returned reference being 'static. If we provided something
         // that used a closure to give the user a non-`'static` reference, we wouldn't be all that
         // much further along.
-        match unsafe { self.try_get() } {
-            Some(v) => v,
-            None => {
-                // Init the value out of the `rt::execution`
-                let sv = crate::rt::lazy_static::StaticValue::new((self.init)());
+        use crate::rt::lazy_static::{Claim, StaticValue};
 
-                // While calling init, we may have yielded to the scheduler, in which case some
-                // _other_ thread may have initialized the static. The real lazy_static does not
-                // have this issue, since it takes a lock before initializing the new value, and
-                // readers wait on that lock if they encounter it. We could implement that here
-                // too, but for simplicity's sake, we just do another try_get here for now.
-                if let Some(v) = unsafe { self.try_get() } {
-                    return v;
-                }
-
-                rt::execution(|execution| {
-                    let sv = execution.lazy_statics.init_static(self, sv);
-
-                    // lazy_static uses std::sync::Once, which does a swap(AcqRel) to set
-                    sv.sync.sync_store(&mut execution.threads, Ordering::AcqRel);
-                });
-
-                unsafe { self.try_get() }.expect("bug")
-            }
-        }
-    }
-
-    unsafe fn try_get(&'static self) -> Option<&'static T> {
+        // SAFETY (both uses): the value is boxed in the execution's statics
+        // table and lives until the execution ends; see above.
         unsafe fn transmute_lt<'a, 'b, T>(t: &'a T) -> &'b T {
             std::mem::transmute::<&'a T, &'b T>(t)
         }
 
-        let sv = rt::execution(|execution| {
-            let sv = execution.lazy_statics.get_static(self)?;
+        enum Step {
+            Value(&'static StaticValue),
+            Wait,
+            Init,
+        }
 
-            // lazy_static uses std::sync::Once, which does a load(Acquire) to get
-            sv.sync.sync_load(&mut execution.threads, Ordering::Acquire);
+        loop {
+            // The initializer runs on the one thread that claims the static; a
+            // thread that finds it running blocks until it is done, as a
+            // `std::sync::Once` waiter does.
+            let step = rt::execution(|execution| {
+                let thread = execution.threads.active_id();
+                match execution.lazy_statics.claim(self, thread) {
+                    Claim::Done(sv) => {
+                        // lazy_static uses std::sync::Once, which does a load(Acquire) to get
+                        sv.sync.sync_load(&mut execution.threads, Ordering::Acquire);
+                        Step::Value(unsafe { transmute_lt(sv) })
+                    }
+                    Claim::Wait => Step::Wait,
+                    Claim::Init => Step::Init,
+                }
+            });
 
-            Some(transmute_lt(sv))
-        })?;
+            match step {
+                Step::Value(sv) => return sv.get::<T>(),
+                Step::Wait => rt::park(location!()),
+                Step::Init => {
+                    // Init the value out of the `rt::execution`
+                    let sv = StaticValue::new((self.init)());
 
-        Some(sv.get::<T>())
+                    let sv = rt::execution(|execution| {
+                        let (sv, waiters) = execution.lazy_statics.init_static(self, sv);
+
+                        // lazy_static uses std::sync::Once, which does a swap(AcqRel) to set
+                        sv.sync.sync_store(&mut execution.threads, Ordering::AcqRel);
+
+                        for thread in waiters {
+                            execution.threads.wake(thread);
+                        }
+
+                        unsafe { transmute_lt(sv) }
+                    });
+                    return sv.get::<T>();
+                }
+            }
+        }
     }
 }
 

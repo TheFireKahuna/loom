@@ -123,3 +123,29 @@ fn fetch_add_atomic() {
         assert_ne!(v1, v2);
     });
 }
+
+std::thread_local! {
+    // Per worker OS thread, which runs one execution at a time.
+    static SLOW_INITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+loom::lazy_static! {
+    static ref SLOW: AtomicUsize = {
+        SLOW_INITS.with(|n| n.set(n.get() + 1));
+        thread::yield_now();
+        AtomicUsize::new(0)
+    };
+}
+
+// A racing reader waits for the initializer in progress rather than running
+// its own: the initializer runs once per execution.
+#[test]
+fn lazy_static_initializer_runs_once() {
+    loom::model(|| {
+        SLOW_INITS.with(|n| n.set(0));
+        let t = thread::spawn(|| SLOW.load(Relaxed));
+        SLOW.load(Relaxed);
+        t.join().unwrap();
+        assert_eq!(SLOW_INITS.with(|n| n.get()), 1, "the initializer ran more than once");
+    });
+}
