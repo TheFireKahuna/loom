@@ -24,7 +24,7 @@ fn unpark_synchronizes_only_through_park() {
             let (data, go) = (data.clone(), go.clone());
             thread::spawn(move || {
                 while go.load(Relaxed) == 0 {
-                    thread::yield_now();
+                    loom::hint::spin_loop();
                 }
                 data.with(|p| unsafe { *p });
             })
@@ -115,7 +115,7 @@ fn park_acquires_the_unparkers_view() {
             let (data, go) = (data.clone(), go.clone());
             thread::spawn(move || {
                 while go.load(Relaxed) == 0 {
-                    thread::yield_now();
+                    loom::hint::spin_loop();
                 }
                 thread::park();
                 assert_eq!(1, data.with(|p| unsafe { *p }));

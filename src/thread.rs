@@ -220,8 +220,8 @@ pub fn park_timeout(_dur: Duration) {
 /// modelled operation at all: every interleaving of the sleeping thread's
 /// surrounding operations is explored regardless. A loop that polls between
 /// sleeps therefore is not bounded by them; make it spin through
-/// [`yield_now`] or [`hint::spin_loop`](crate::hint::spin_loop), which loom
-/// schedules as a wait for another thread's progress.
+/// [`hint::spin_loop`](crate::hint::spin_loop), which loom schedules as a wait
+/// for another thread's progress.
 pub fn sleep(_dur: Duration) {}
 
 fn spawn_internal<F, T>(

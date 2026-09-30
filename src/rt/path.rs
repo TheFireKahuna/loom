@@ -215,11 +215,12 @@ pub(crate) struct Schedule {
     /// moment it was activated. What execution attribution reads.
     entered_conservative: bool,
 
-    /// The seed switched here because the previous thread *yielded*, not
-    /// because it blocked or finished. Alternatives still cost no preemption
-    /// (loom's yield stance: a voluntary switch is free), but a spent bound
-    /// must keep refusing marks here — yield seams recur every spin
-    /// iteration, so ungated they make cyclic state spaces inexhaustible.
+    /// The seed switched here because the previous thread *spun*
+    /// (`hint::spin_loop`), not because it blocked or finished. Alternatives
+    /// still cost no preemption (a spin is a wait for another thread, so the
+    /// switch is free), but a spent bound must keep refusing marks here —
+    /// spin seams recur every spin iteration, so ungated they make cyclic
+    /// state spaces inexhaustible.
     /// This is the fairness-bound seam of Coons et al., carried as a flag
     /// rather than a second bound.
     yield_seam: bool,
@@ -268,7 +269,7 @@ pub(crate) enum Thread {
     /// The thread should not be explored
     Skip,
 
-    /// The thread is in a yield state.
+    /// The thread spun (`hint::spin_loop`) and waits for another's progress.
     Yield,
 
     /// The thread is waiting to be explored
@@ -292,7 +293,8 @@ macro_rules! assert_path_len {
             $branches.len() < $branches.capacity() || std::thread::panicking(),
             "Model exceeded maximum number of branches. This is often caused \
              by an algorithm requiring the processor to make progress, e.g. \
-             spin locks.",
+             spin locks: a loop that waits for another thread must spin through \
+             `loom::hint::spin_loop` (`thread::yield_now` gives it no progress).",
         );
     }};
 }
@@ -533,8 +535,8 @@ impl Path {
                 // being runnable — every alternative here is free
                 // (Definition 2.5: no enabled thread is being preempted; at
                 // the root the seed's pick has yet to run a transition).
-                // Unless it *yielded*: that switch is still free by loom's
-                // yield stance, but the seam is flagged so a spent bound
+                // Unless it *spun*: that switch is still free, since a spin
+                // waits for another thread, but the seam is flagged so a spent bound
                 // keeps refusing marks here (see `Schedule::yield_seam`).
                 yield_seam = displaced
                     .map(|d| schedule_ref.get(&self.branches).threads[d as usize] == Thread::Yield)

@@ -105,14 +105,16 @@ pub struct Builder {
 
     /// Maximum number of thread preemptions to explore
     ///
-    /// A preemption is a switch away from a thread that could have continued.
+    /// A preemption is a switch away from a thread that could have continued,
+    /// including one that called [`thread::yield_now`](crate::thread::yield_now).
     /// A switch after a thread blocks or finishes is free, and so is the
-    /// switch after a thread yields — but once an execution has spent the
-    /// whole bound, the scheduler explores no alternative at a yield either:
-    /// yields recur on every pass of a wait loop, and left open at a spent
-    /// bound they would make such a loop's state space inexhaustible. So a
-    /// bounded search may miss an order reachable only by switching to a
-    /// different thread at a yield after the bound is spent.
+    /// switch after a [`hint::spin_loop`](crate::hint::spin_loop) — but once an
+    /// execution has spent the whole bound, the scheduler explores no
+    /// alternative at a spin either: spins recur on every pass of a wait loop,
+    /// and left open at a spent bound they would make such a loop's state
+    /// space inexhaustible. So a bounded search may miss an order reachable
+    /// only by switching to a different thread at a spin after the bound is
+    /// spent.
     ///
     /// Defaults to `LOOM_MAX_PREEMPTIONS` environment variable.
     pub preemption_bound: Option<usize>,

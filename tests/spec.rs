@@ -71,7 +71,7 @@ fn acq_rel() {
         });
         let t1 = thread::spawn(move || {
             while !x.load(Ordering::Acquire) {
-                loom::thread::yield_now();
+                loom::hint::spin_loop();
             }
             if y.load(Ordering::Acquire) {
                 z.fetch_add(1, Ordering::Relaxed);
@@ -79,7 +79,7 @@ fn acq_rel() {
         });
         let t2 = thread::spawn(move || {
             while !y.load(Ordering::Acquire) {
-                loom::thread::yield_now();
+                loom::hint::spin_loop();
             }
             if x.load(Ordering::Acquire) {
                 z.fetch_add(1, Ordering::Relaxed);
@@ -133,7 +133,7 @@ fn test_seq_cst() {
         });
         let t1 = thread::spawn(move || {
             while !x.load(Ordering::SeqCst) {
-                loom::thread::yield_now();
+                loom::hint::spin_loop();
             }
             if y.load(Ordering::SeqCst) {
                 z.fetch_add(1, Ordering::Relaxed);
@@ -141,7 +141,7 @@ fn test_seq_cst() {
         });
         let t2 = thread::spawn(move || {
             while !y.load(Ordering::SeqCst) {
-                loom::thread::yield_now();
+                loom::hint::spin_loop();
             }
             if x.load(Ordering::SeqCst) {
                 z.fetch_add(1, Ordering::Relaxed);

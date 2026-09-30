@@ -1,5 +1,4 @@
 use crate::rt;
-use crate::thread;
 
 use std::sync::Mutex;
 use std::task::Waker;
@@ -26,7 +25,7 @@ impl AtomicWaker {
         if !self.object.try_acquire_lock(location!()) {
             waker.wake();
             // yield the task and try again... this is a spin lock.
-            thread::yield_now();
+            rt::spin_loop();
             return;
         }
 

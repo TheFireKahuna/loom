@@ -264,100 +264,36 @@ where
     })
 }
 
-/// Yield the thread.
+/// Mock implementation of `std::thread::yield_now`.
 ///
-/// This enables concurrent algorithms that require other threads to make
-/// progress.
+/// A scheduling point and nothing more, as `std`'s is a hint the OS may
+/// ignore: the yielder stays runnable and may run on, and the search
+/// explores switching away here only as it would anywhere else — as a
+/// preemption, counted against [`Builder::preemption_bound`]. A yield makes
+/// no store visible that was not already visible.
 ///
-/// Using this as a hint might be necessary to reduce the number of branches
-/// being investigated by loom. This might be necessary when testing spin locks,
-/// since each iteration constitutes a branch point which might easily cause a
-/// combinatorial explosion.
+/// So a poll loop that yields through `yield_now` is given no progress:
+/// wherever the search spends no preemption on the peer it waits for, it
+/// polls until [`Builder::max_branches`] and the model fails. A loop that
+/// waits for another thread must say so with [`hint::spin_loop`], which
+/// loom models as exactly that wait.
 ///
-/// Note that in loom, [`spin_loop`] and [`spin_loop_hint`] is an alias of this
-/// function.
-///
-/// [`spin_loop`]: crate::hint::spin_loop
-/// [`spin_loop_hint`]: crate::sync::atomic::spin_loop_hint
-///
-/// # Examples
-///
-/// Testing a raw spin lock under loom.
-///
-/// This is only provided as an example for when using [`spin_loop`] and
-/// [`yield_now`] could be appropriate. Using a spin lock is almost always worse
-/// than using a [`Mutex`] directly which spins internally before parking the
-/// thread if contention is detected to save on system resources.
-///
-/// [`Mutex`]: std::sync::Mutex
-/// [`spin_loop_hint`]: crate::sync::atomic::spin_loop_hint
-/// [`spin_loop`]: crate::hint::spin_loop
-///
-/// ```no_run
-/// use loom::sync::atomic::AtomicBool;
-/// use loom::hint;
-/// use loom::thread;
-///
-/// use std::sync::Arc;
-/// use std::sync::atomic::Ordering::{Acquire, Relaxed, SeqCst};
-///
-/// struct Lock {
-///     locked: AtomicBool,
-/// }
-///
-/// impl Lock {
-///     fn new() -> Self {
-///         Lock {
-///             locked: AtomicBool::new(false),
-///         }
-///     }
-///
-///     fn spin(&self) {
-///         while self.locked.load(Relaxed) {
-///             hint::spin_loop();
-///         }
-///     }
-///
-///     fn lock(&self) {
-///         loop {
-///             self.spin();
-///
-///             if self.locked.compare_exchange(false, true, Acquire, Relaxed).is_ok() {
-///                 break;
-///             }
-///
-///             thread::yield_now();
-///         }
-///     }
-///
-///     fn unlock(&self) {
-///         self.locked.store(false, SeqCst);
-///     }
-/// }
-///
-/// # /*
-/// #[test]
-/// # */
-/// fn test_concurrent_logic() {
-///     loom::model(|| {
-///         let v1 = Arc::new(Lock::new());
-///         let v2 = v1.clone();
-///
-///         let t1 = thread::spawn(move || {
-///             v2.lock();
-///             // critical section.
-///             v2.unlock();
-///         });
-///
-///         v1.lock();
-///         // critical section.
-///         v1.unlock();
-///
-///         t1.join().unwrap();
-///     });
-/// }
-/// ```
+/// [`Builder::preemption_bound`]: crate::model::Builder::preemption_bound
+/// [`Builder::max_branches`]: crate::model::Builder::max_branches
+/// [`hint::spin_loop`]: crate::hint::spin_loop
 pub fn yield_now() {
+    branch(|execution| {
+        trace!(thread = ?execution.threads.active_id(), "yield_now");
+        execution.threads.active_mut().operation = None;
+    });
+}
+
+/// `hint::spin_loop`: wait for another thread's progress. The spinner is not
+/// scheduled again while any other thread can run, the switch away is free,
+/// and every store the spinner had already seen superseded becomes
+/// unreadable to it (`rt::atomic`'s yield rule), so a spin loop over atomics
+/// always ends once its peer's store lands.
+pub(crate) fn spin_loop() {
     let switch = execution(|execution| {
         let thread = execution.threads.active_id();
 
@@ -365,7 +301,7 @@ pub fn yield_now() {
         execution.threads.active_mut().operation = None;
         let switch = execution.schedule();
 
-        trace!(?thread, ?switch, "yield_now");
+        trace!(?thread, ?switch, "spin_loop");
 
         switch
     });

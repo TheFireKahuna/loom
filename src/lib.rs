@@ -175,8 +175,10 @@
 //! presents a challenge for loom as its scheduler is, by design, not fair. It is specifically
 //! trying to emulate every _possible_ execution, which may mean that another thread does not get
 //! to run for a very long time (see also [Spinlocks Considered Harmful]). In such cases, loops
-//! must include calls to [`loom::thread::yield_now`](thread::yield_now). This tells loom that
+//! must include calls to [`loom::hint::spin_loop`](hint::spin_loop). This tells loom that
 //! another thread needs to be scheduled in order for the current one to make progress.
+//! [`loom::thread::yield_now`](thread::yield_now) does not: like `std`'s, it is a plain
+//! scheduling point, and a loop that polls through it is given no progress.
 //!
 //! # Running Loom Tests
 //!

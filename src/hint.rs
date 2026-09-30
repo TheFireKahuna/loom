@@ -2,13 +2,20 @@
 
 /// Signals the processor that it is entering a busy-wait spin-loop.
 ///
-/// For loom, this is an alias of [`yield_now`] but is provided as a reflection
-/// of the [`core::hint::spin_loop`] function. See the [`yield_now`]
-/// documentation for more information on what effect this has.
+/// Loom models it as what a spin loop is: a wait for another thread's
+/// progress. The spinner is not scheduled again while any other thread can
+/// run — the switch away costs no preemption — and a store it had already
+/// seen superseded is not returned to it again, so a loop that spins until a
+/// peer's store lands always ends. This is the primitive for every poll loop
+/// in a model; [`thread::yield_now`](crate::thread::yield_now) is a plain
+/// scheduling point and gives a poll loop no progress.
 ///
-/// [`yield_now`]: crate::thread::yield_now
+/// Under [`Builder::preemption_bound`](crate::model::Builder::preemption_bound)
+/// the switch after a spin is free, but once an execution has spent the whole
+/// bound the search explores no other thread at that switch than the one the
+/// scheduler picks, which keeps a spin loop's state space exhaustible.
 pub fn spin_loop() {
-    crate::sync::atomic::spin_loop_hint();
+    crate::rt::spin_loop();
 }
 
 /// Informs the compiler that this point in the code is not reachable, enabling

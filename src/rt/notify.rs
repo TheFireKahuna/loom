@@ -111,7 +111,7 @@ impl Notify {
         });
 
         if spurious {
-            rt::yield_now();
+            rt::spin_loop();
             return;
         }
 

@@ -42,7 +42,7 @@ fn basic_usage() {
                 break;
             }
 
-            thread::yield_now();
+            loom::hint::spin_loop();
         }
     });
 }
@@ -274,7 +274,7 @@ mod std_parity {
                 drop(b);
             });
             while Arc::strong_count(&a) != 1 {
-                thread::yield_now();
+                loom::hint::spin_loop();
             }
             a.with(|p| unsafe { *p });
             t.join().unwrap();
@@ -299,7 +299,7 @@ mod std_parity {
                 f2.store(true, Relaxed);
             });
             while !flag.load(Relaxed) {
-                thread::yield_now();
+                loom::hint::spin_loop();
             }
             let _s = w2.upgrade().unwrap();
             data.with(|p| unsafe { *p });
@@ -324,7 +324,7 @@ mod std_parity {
                 f2.store(true, Relaxed);
             });
             while !flag.load(Relaxed) {
-                thread::yield_now();
+                loom::hint::spin_loop();
             }
             assert!(Arc::try_unwrap(owner).is_err());
             data.with(|p| unsafe { *p });
@@ -351,7 +351,7 @@ mod std_parity {
                 f2.store(true, Relaxed);
             });
             while !flag.load(Relaxed) {
-                thread::yield_now();
+                loom::hint::spin_loop();
             }
             assert!(Arc::get_mut(&mut owner).is_none());
             data.with(|p| unsafe { *p });

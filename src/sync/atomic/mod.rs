@@ -42,14 +42,14 @@ pub use std::sync::atomic::Ordering;
 
 /// Signals the processor that it is entering a busy-wait spin-loop.
 ///
-/// For loom, this is an alias of [`yield_now`] but is provided as a reflection
+/// For loom, this is an alias of [`spin_loop`] but is provided as a reflection
 /// of the deprecated [`core::sync::atomic::spin_loop_hint`] function. See the
-/// [`yield_now`] documentation for more information on what effect using this
+/// [`spin_loop`] documentation for more information on what effect using this
 /// has on loom.
 ///
-/// [`yield_now`]: crate::thread::yield_now
+/// [`spin_loop`]: crate::hint::spin_loop
 pub fn spin_loop_hint() {
-    crate::thread::yield_now();
+    crate::hint::spin_loop();
 }
 
 /// An atomic fence.
