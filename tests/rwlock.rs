@@ -190,3 +190,21 @@ fn try_locks_see_empty_critical_sections_held() {
     assert!(READ_FAILED.load(SeqCst), "try_read never saw the write lock held");
     assert!(WRITE_FAILED.load(SeqCst), "try_write never saw the read lock held");
 }
+
+// A thread's second read guard is counted: dropping it leaves the first one
+// holding the lock, so a writer cannot enter while it is live.
+#[test]
+fn recursive_read_guard_keeps_the_lock() {
+    loom::model(|| {
+        let l = Arc::new(RwLock::new(0u32));
+        let g1 = l.read().unwrap();
+        drop(l.read().unwrap());
+        let l2 = l.clone();
+        let t = thread::spawn(move || *l2.write().unwrap() += 1);
+        thread::yield_now();
+        assert!(l.try_write().is_err());
+        let _v = *g1;
+        drop(g1);
+        t.join().unwrap();
+    });
+}

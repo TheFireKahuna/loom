@@ -1,7 +1,7 @@
 use crate::rt::object;
 use crate::rt::{thread, Access, Execution, Location, Synchronize, VersionVec};
 
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::sync::atomic::Ordering::{Acquire, Release};
 
 #[derive(Debug, Copy, Clone)]
@@ -11,7 +11,9 @@ pub(crate) struct RwLock {
 
 #[derive(Debug, PartialEq)]
 enum Locked {
-    Read(HashSet<thread::Id>),
+    /// Each reader with the count of its live read guards: a thread's second
+    /// guard does not end the read lock when it drops.
+    Read(HashMap<thread::Id, usize>),
     Write(thread::Id),
 }
 
@@ -120,7 +122,13 @@ impl RwLock {
                 _ => panic!("invalid internal loom state"),
             };
 
-            readers.remove(&thread_id);
+            let guards = readers
+                .get_mut(&thread_id)
+                .expect("invalid internal loom state");
+            *guards -= 1;
+            if *guards == 0 {
+                readers.remove(&thread_id);
+            }
 
             if readers.is_empty() {
                 state.lock = None;
@@ -200,13 +208,9 @@ impl RwLock {
             // Set the lock to the current thread
             let mut already_locked = false;
             state.lock = match state.lock.take() {
-                None => {
-                    let mut threads: HashSet<thread::Id> = HashSet::new();
-                    threads.insert(thread_id);
-                    Some(Locked::Read(threads))
-                }
+                None => Some(Locked::Read(HashMap::from([(thread_id, 1)]))),
                 Some(Locked::Read(mut threads)) => {
-                    threads.insert(thread_id);
+                    *threads.entry(thread_id).or_insert(0) += 1;
                     Some(Locked::Read(threads))
                 }
                 Some(Locked::Write(writer)) => {
@@ -220,7 +224,7 @@ impl RwLock {
                 return false;
             }
 
-            dbg!(state.synchronize.sync_load(&mut execution.threads, Acquire));
+            state.synchronize.sync_load(&mut execution.threads, Acquire);
 
             execution.threads.seq_cst();
 

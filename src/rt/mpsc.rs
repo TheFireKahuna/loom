@@ -121,7 +121,7 @@ impl Channel {
                 .checked_sub(1)
                 .expect("expected to be able to read the message");
             let mut synchronize = state.receiver_synchronize.pop_front().unwrap();
-            dbg!(synchronize.sync_load(&mut execution.threads, Acquire));
+            synchronize.sync_load(&mut execution.threads, Acquire);
             if state.msg_cnt == 0 {
                 // Block all **other** threads attempting to read from the channel
                 for (id, thread) in execution.threads.iter_mut() {
