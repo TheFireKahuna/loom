@@ -268,10 +268,15 @@ pub struct Atomic<T> {
     /// from construction, and for a deferred cell built with no caller.
     created: Option<&'static std::panic::Location<'static>>,
 
-    /// A [`Atomic::get_mut`] borrow wrote its value into `init`'s bytes, not
-    /// yet into the model. The cell's next access folds it in (`Resolve`)
-    /// before anything reads the store the borrow created.
+    /// A [`Atomic::get_mut`] borrow wrote its value into `shadow`, not yet
+    /// into the model. The cell's next access folds it in (`Resolve`) before
+    /// anything reads the store the borrow created. Meaningful only within the
+    /// execution that set it: a deferred cell's fresh registration clears it.
     lent: std::sync::atomic::AtomicBool,
+
+    /// The bytes a [`Atomic::get_mut`] borrow lends out as a `T`. Apart from
+    /// `init`, which is a deferred cell's genesis in every execution.
+    shadow: u128,
 
     _p: PhantomData<fn() -> T>,
 }
@@ -1167,15 +1172,16 @@ fn mint_id(slot: &std::sync::atomic::AtomicU64) -> u64 {
 }
 
 /// Resolve — and on first access of this execution, create — the registration
-/// of the cell with identity `id`, whose value before any store is `init`.
+/// of the cell with identity `id`, whose value before any store is `init`;
+/// true when this call created it.
 fn register(
     id: u64,
     init: u128,
     created: Option<&'static std::panic::Location<'static>>,
-) -> object::Ref<State> {
+) -> (object::Ref<State>, bool) {
     rt::execution(|execution| {
         if let Some(&state) = execution.deferred_atomics.get(&id) {
-            return state;
+            return (state, false);
         }
 
         let state = execution.objects.insert_with(State::shell, State::recycle);
@@ -1192,7 +1198,7 @@ fn register(
 
         trace!(?state, id, "atomic::register");
 
-        state
+        (state, true)
     })
 }
 
@@ -2430,6 +2436,7 @@ impl<T: Numeric> Atomic<T> {
                 init: 0,
                 created: None,
                 lent: std::sync::atomic::AtomicBool::new(false),
+                shadow: 0,
                 _p: PhantomData,
             }
         })
@@ -2470,6 +2477,7 @@ impl<T: Numeric> Atomic<T> {
             init,
             created,
             lent: std::sync::atomic::AtomicBool::new(false),
+            shadow: 0,
             _p: PhantomData,
         }
     }
@@ -2493,22 +2501,20 @@ impl<T: Numeric> Atomic<T> {
             value
         });
         *self.lent.get_mut() = true;
-        // `init` is unread once the cell is registered, which `resolve` made
-        // it; its bytes hold the borrowed `T` until the fill.
-        let place = std::ptr::from_mut(&mut self.init).cast::<T>();
+        let place = std::ptr::from_mut(&mut self.shadow).cast::<T>();
         // SAFETY: `u128` is at least `T`'s size and alignment (`Numeric`), and
-        // `place` is derived from a unique borrow of `init`.
+        // `place` is derived from a unique borrow of `shadow`.
         unsafe {
             place.write(T::from_u128(value));
             &mut *place
         }
     }
 
-    /// The `T` a `get_mut` borrow left in `init`'s bytes.
+    /// The `T` a `get_mut` borrow left in `shadow`.
     fn shadow(&self) -> T {
         // SAFETY: only read while `lent` is set, after `get_mut` wrote a `T`
         // there; `u128` is at least `T`'s size and alignment.
-        unsafe { std::ptr::from_ref(&self.init).cast::<T>().read() }
+        unsafe { std::ptr::from_ref(&self.shadow).cast::<T>().read() }
     }
 
     /// This cell's registration in the *current* execution, registering it
@@ -2529,7 +2535,12 @@ impl<T: Numeric> Atomic<T> {
     /// Resolve — and on first access of this execution, create — the
     /// registration of a deferred cell.
     fn register_deferred(&self) -> object::Ref<State> {
-        register(mint_id(&self.cell_id), self.init, self.created)
+        let (state, fresh) = register(mint_id(&self.cell_id), self.init, self.created);
+        if fresh {
+            // A borrow lent in an earlier execution is not this one's store.
+            self.lent.store(false, std::sync::atomic::Ordering::Relaxed);
+        }
+        state
     }
 
 }

@@ -55,3 +55,30 @@ fn get_mut_value_is_the_borrowers_store() {
         }
     });
 }
+
+// A `const`-built cell presents its initial value at the start of every
+// execution: a `get_mut` in one execution does not become the next one's
+// genesis.
+#[test]
+fn get_mut_on_a_const_cell_does_not_leak_into_the_next_execution() {
+    static S: std::sync::Mutex<AtomicUsize> = std::sync::Mutex::new(AtomicUsize::new(5));
+    static EXECUTIONS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let mut b = loom::model::Builder::new();
+    // One worker: a `static` shared by concurrent executions is its own hazard.
+    b.threads = 1;
+    b.check(|| {
+        EXECUTIONS.fetch_add(1, SeqCst);
+        let other = Arc::new(AtomicUsize::new(0));
+        let o2 = other.clone();
+        let t = thread::spawn(move || o2.store(1, Relaxed));
+        other.load(Relaxed);
+        {
+            let mut g = S.lock().unwrap();
+            assert_eq!(g.load(SeqCst), 5, "a get_mut value leaked into a later execution");
+            // The execution's last access: the borrow is still lent when it ends.
+            *g.get_mut() = 7;
+        }
+        t.join().unwrap();
+    });
+    assert!(EXECUTIONS.load(SeqCst) > 1);
+}
