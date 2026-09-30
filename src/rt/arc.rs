@@ -1,5 +1,5 @@
 use crate::rt::object;
-use crate::rt::{self, Access, Location, Synchronize, VersionVec};
+use crate::rt::{self, thread, Access, Location, Synchronize, VersionVec, MAX_THREADS};
 
 use std::sync::atomic::Ordering::{self, Acquire, Relaxed, Release};
 
@@ -30,17 +30,18 @@ pub(super) struct State {
     /// the step that ends the strong count releases.
     weak: Synchronize,
 
-    /// Tracks access to the arc object
-    last_ref_inc: Option<Access>,
-    last_ref_dec: Option<Access>,
-    last_ref_inspect: Option<Access>,
-    last_ref_modification: Option<RefModify>,
+    /// Each thread's latest access of each kind. Per thread, as an atomic's
+    /// are: the kinds are not all mutually dependent, so one thread's later
+    /// access must not shadow a peer's concurrent one.
+    last_ref_inc: [Option<Access>; MAX_THREADS],
+    last_ref_dec: [Option<Access>; MAX_THREADS],
+    last_ref_inspect: [Option<Access>; MAX_THREADS],
 }
 
 /// Actions performed on the Arc
 ///
-/// Clones are only dependent with inspections. Drops are dependent between each
-/// other.
+/// A clone is dependent only with inspections; a drop with drops and
+/// inspections; an inspection with clones and drops.
 #[derive(Debug, Copy, Clone, PartialEq)]
 pub(super) enum Action {
     /// Clone the arc
@@ -53,18 +54,6 @@ pub(super) enum Action {
     Inspect,
 }
 
-/// Actions which modify the Arc's reference count
-///
-/// This is used to ascertain dependence for Action::Inspect
-#[derive(Debug, Copy, Clone, PartialEq)]
-enum RefModify {
-    /// Corresponds to Action::RefInc
-    RefInc,
-
-    /// Corresponds to Action::RefDec
-    RefDec,
-}
-
 impl Arc {
     pub(crate) fn new(location: Location) -> Arc {
         rt::execution(|execution| {
@@ -74,10 +63,9 @@ impl Arc {
                 allocated: location,
                 strong: Synchronize::new(),
                 weak: Synchronize::new(),
-                last_ref_inc: None,
-                last_ref_dec: None,
-                last_ref_inspect: None,
-                last_ref_modification: None,
+                last_ref_inc: Default::default(),
+                last_ref_dec: Default::default(),
+                last_ref_inspect: Default::default(),
             });
 
             trace!(?state, %location, "Arc::new");
@@ -339,30 +327,27 @@ impl State {
         }
     }
 
-    pub(super) fn last_dependent_access(&self, action: Action) -> Option<&Access> {
-        match action {
-            // RefIncs are not dependent w/ RefDec, only inspections
-            Action::RefInc => self.last_ref_inspect.as_ref(),
-            Action::RefDec => self.last_ref_dec.as_ref(),
-            Action::Inspect => match self.last_ref_modification {
-                Some(RefModify::RefInc) => self.last_ref_inc.as_ref(),
-                Some(RefModify::RefDec) => self.last_ref_dec.as_ref(),
-                None => None,
-            },
-        }
+    pub(super) fn for_each_dependent_access(&self, action: Action, f: impl FnMut(&Access)) {
+        let (a, b): (&[Option<Access>], &[Option<Access>]) = match action {
+            Action::RefInc => (&self.last_ref_inspect, &[]),
+            Action::RefDec => (&self.last_ref_dec, &self.last_ref_inspect),
+            Action::Inspect => (&self.last_ref_inc, &self.last_ref_dec),
+        };
+        a.iter().chain(b).flatten().for_each(f);
     }
 
-    pub(super) fn set_last_access(&mut self, action: Action, path_id: usize, version: &VersionVec) {
-        match action {
-            Action::RefInc => {
-                self.last_ref_modification = Some(RefModify::RefInc);
-                Access::set_or_create(&mut self.last_ref_inc, path_id, version)
-            }
-            Action::RefDec => {
-                self.last_ref_modification = Some(RefModify::RefDec);
-                Access::set_or_create(&mut self.last_ref_dec, path_id, version)
-            }
-            Action::Inspect => Access::set_or_create(&mut self.last_ref_inspect, path_id, version),
-        }
+    pub(super) fn set_last_access(
+        &mut self,
+        action: Action,
+        thread: thread::Id,
+        path_id: usize,
+        version: &VersionVec,
+    ) {
+        let slots = match action {
+            Action::RefInc => &mut self.last_ref_inc,
+            Action::RefDec => &mut self.last_ref_dec,
+            Action::Inspect => &mut self.last_ref_inspect,
+        };
+        Access::set_or_create(&mut slots[thread.as_usize()], path_id, version);
     }
 }

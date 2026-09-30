@@ -385,3 +385,94 @@ mod std_parity {
         });
     }
 }
+
+/// DPOR over an `Arc`'s counts: an inspection must be reversed against every
+/// count change concurrent with it, not only the latest of one kind.
+mod dependence {
+    use loom::sync::{Arc, Mutex};
+    use loom::thread;
+    use std::collections::BTreeSet;
+    use std::sync::Mutex as StdMutex;
+
+    fn counts<F>(bound: Option<usize>, sleep_sets: bool, f: F) -> BTreeSet<usize>
+    where
+        F: Fn() -> usize + Send + Sync + 'static,
+    {
+        let seen: std::sync::Arc<StdMutex<BTreeSet<usize>>> = Default::default();
+        let out = seen.clone();
+        let mut builder = loom::model::Builder::new();
+        builder.threads = 1;
+        builder.preemption_bound = bound;
+        builder.sleep_sets = sleep_sets;
+        builder.check(move || {
+            let n = f();
+            out.lock().unwrap().insert(n);
+        });
+        let seen = seen.lock().unwrap().clone();
+        seen
+    }
+
+    const CONFIGS: [(Option<usize>, bool); 4] =
+        [(None, false), (None, true), (Some(2), false), (Some(3), false)];
+
+    /// A clone in one thread, then a drop in another that is joined before
+    /// main inspects: the drop must not hide the clone, which main may read
+    /// either side of.
+    #[test]
+    fn a_later_drop_does_not_hide_a_concurrent_clone() {
+        let model = || {
+            let a = Arc::new(0usize);
+            let gate = Arc::new(Mutex::new(()));
+            let held = gate.lock().unwrap();
+
+            let cloner = {
+                let (a1, gate) = (a.clone(), gate.clone());
+                thread::spawn(move || {
+                    let a2 = a1.clone();
+                    drop(gate.lock().unwrap());
+                    drop(a2);
+                    drop(a1);
+                })
+            };
+            let dropper = {
+                let b1 = a.clone();
+                thread::spawn(move || drop(b1))
+            };
+            dropper.join().unwrap();
+            let n = Arc::strong_count(&a);
+            drop(held);
+            cloner.join().unwrap();
+            n
+        };
+
+        for (bound, sleep_sets) in CONFIGS {
+            assert_eq!(
+                counts(bound, sleep_sets, model),
+                BTreeSet::from([2, 3]),
+                "bound = {bound:?}, sleep_sets = {sleep_sets}"
+            );
+        }
+    }
+
+    /// An inspection before a concurrent drop: the drop must be reversed
+    /// against it, so main reads the count before and after the drop.
+    #[test]
+    fn a_drop_is_reversed_against_an_earlier_inspection() {
+        let model = || {
+            let a = Arc::new(0usize);
+            let b1 = a.clone();
+            let dropper = thread::spawn(move || drop(b1));
+            let n = Arc::strong_count(&a);
+            dropper.join().unwrap();
+            n
+        };
+
+        for (bound, sleep_sets) in CONFIGS {
+            assert_eq!(
+                counts(bound, sleep_sets, model),
+                BTreeSet::from([1, 2]),
+                "bound = {bound:?}, sleep_sets = {sleep_sets}"
+            );
+        }
+    }
+}

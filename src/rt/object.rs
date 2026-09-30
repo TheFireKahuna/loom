@@ -350,10 +350,11 @@ impl<T> Store<T> {
 impl Store {
     /// Calls `f` with every dependent access of the operation.
     ///
-    /// Atomics track dependent accesses per thread (see `atomic::State` —
-    /// a single shared slot lets a thread's own access shadow a peer's,
-    /// silently dropping the DPOR reorder owed to that conflict); the other
-    /// object types keep their single last-access slot and yield it here.
+    /// Atomics and `Arc`s track dependent accesses per thread (see
+    /// `atomic::State` — a single shared slot lets a thread's own access
+    /// shadow a peer's, silently dropping the DPOR reorder owed to that
+    /// conflict); the other object types, whose operations are all mutually
+    /// dependent, keep a single last-access slot and yield it here.
     pub(super) fn for_each_dependent_access(&self, operation: Operation, mut f: impl FnMut(&Access)) {
         let virt = &*self.virtual_accesses;
 
@@ -384,11 +385,7 @@ impl Store {
 
         match &self.entries[operation.obj.index] {
             Entry::Atomic(entry) => entry.for_each_dependent_access(operation.action.into(), f),
-            Entry::Arc(entry) => {
-                if let Some(access) = entry.last_dependent_access(operation.action.into()) {
-                    f(access);
-                }
-            }
+            Entry::Arc(entry) => entry.for_each_dependent_access(operation.action.into(), f),
             Entry::Mutex(entry) => {
                 if let Some(access) = entry.last_dependent_access() {
                     f(access);
@@ -447,7 +444,9 @@ impl Store {
         }
 
         match &mut self.entries[operation.obj.index] {
-            Entry::Arc(entry) => entry.set_last_access(operation.action.into(), path_id, dpor_vv),
+            Entry::Arc(entry) => {
+                entry.set_last_access(operation.action.into(), thread_id, path_id, dpor_vv)
+            }
             Entry::Atomic(entry) => {
                 entry.set_last_access(operation.action.into(), thread_id, path_id, dpor_vv)
             }
