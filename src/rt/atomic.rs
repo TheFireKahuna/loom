@@ -96,6 +96,16 @@
 //! explored. The rules below key on the region (per-location) and never create
 //! happens-before between SeqCst operations.
 //!
+//! S therefore extends happens-before, where C++20 [atomics.order] p4 asks
+//! only that it extend *strongly* happens-before (P0668R5): an SC operation
+//! reaching another through a release/acquire pair outside S (RC11's Z6.U) is
+//! always before it here. That strengthening is sound for x86-64 and AArch64,
+//! the targets loom stands in for: both order a `SeqCst` access before every
+//! later release and after every earlier acquire (a locked or `xchg` SC store
+//! drains the store buffer and loads stay in order; `STLR`/`LDAR` are ordered
+//! against each other by `bob`), so neither reorders SC operations along such
+//! a path.
+//!
 //! A store is *SC-ranked* (`Store::sc_rank` is `Some`) when an operation in S
 //! bars every later one from being coherence-ordered before it. That is so in
 //! three ways:

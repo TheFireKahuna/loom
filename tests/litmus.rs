@@ -4,7 +4,7 @@ use loom::sync::atomic::AtomicUsize;
 use loom::thread;
 
 use std::collections::HashSet;
-use std::sync::atomic::Ordering::{Relaxed, SeqCst};
+use std::sync::atomic::Ordering::{Relaxed, Release, SeqCst};
 use std::sync::{Arc, Mutex};
 
 // Loom currently does not support load buffering.
@@ -327,4 +327,47 @@ fn sc_loads_take_either_order_in_s() {
             );
         }
     }
+}
+
+// S is the order SC operations commit in, so it extends happens-before, where
+// C++20 [atomics.order] p4 asks only that it extend strongly-happens-before.
+// RC11's Z6.U (Lahav et al., PLDI'17 §2.1) separates the two: C++20 allows
+// (a, b, c) = (0, 1, 3), with S = FAI, y=3, a, x=1. x86-64 and AArch64 both
+// forbid it (on AArch64 `STLR x; STLR y ->rfe LDADDAL ->coe STLR y3; LDAR x
+// ->fre` is an `ob` cycle), so the model, which stands in for those, does too.
+#[test]
+fn z6u_is_unreachable_as_s_extends_happens_before() {
+    let values = Arc::new(Mutex::new(HashSet::new()));
+    let values_ = values.clone();
+    let mut builder = loom::model::Builder::new();
+    builder.preemption_bound = None;
+    builder.check(move || {
+        let x = Arc::new(AtomicUsize::new(0));
+        let y = Arc::new(AtomicUsize::new(0));
+
+        let t1 = {
+            let (x, y) = (x.clone(), y.clone());
+            thread::spawn(move || {
+                x.store(1, SeqCst);
+                y.store(1, Release);
+            })
+        };
+        let t2 = {
+            let y = y.clone();
+            thread::spawn(move || {
+                let b = y.fetch_add(1, SeqCst);
+                (b, y.load(Relaxed))
+            })
+        };
+
+        y.store(3, SeqCst);
+        let a = x.load(SeqCst);
+
+        t1.join().unwrap();
+        let (b, c) = t2.join().unwrap();
+        values.lock().unwrap().insert((a, b, c));
+    });
+    let values = values_.lock().unwrap();
+    assert!(!values.contains(&(0, 1, 3)), "{values:?}");
+    assert!(values.contains(&(1, 1, 3)), "{values:?}");
 }
