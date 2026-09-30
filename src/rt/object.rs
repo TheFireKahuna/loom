@@ -389,7 +389,11 @@ impl Store {
                     f(access);
                 }
             }
-            Entry::Mutex(entry) => entry.for_each_dependent_access(operation.action.into(), f),
+            Entry::Mutex(entry) => {
+                if let Some(access) = entry.last_dependent_access() {
+                    f(access);
+                }
+            }
             Entry::Condvar(entry) => {
                 if let Some(access) = entry.last_dependent_access() {
                     f(access);
@@ -400,7 +404,11 @@ impl Store {
                     f(access);
                 }
             }
-            Entry::RwLock(entry) => entry.for_each_dependent_access(operation.action.into(), f),
+            Entry::RwLock(entry) => {
+                if let Some(access) = entry.last_dependent_access() {
+                    f(access);
+                }
+            }
             Entry::Channel(entry) => entry.for_each_dependent_access(operation.action.into(), f),
             obj => panic!(
                 "object is not branchable {:?}; ref = {:?}",
@@ -443,10 +451,10 @@ impl Store {
             Entry::Atomic(entry) => {
                 entry.set_last_access(operation.action.into(), thread_id, path_id, dpor_vv)
             }
-            Entry::Mutex(entry) => entry.set_last_access(operation.action.into(), path_id, dpor_vv),
+            Entry::Mutex(entry) => entry.set_last_access(path_id, dpor_vv),
             Entry::Condvar(entry) => entry.set_last_access(path_id, dpor_vv),
             Entry::Notify(entry) => entry.set_last_access(path_id, dpor_vv),
-            Entry::RwLock(entry) => entry.set_last_access(operation.action.into(), path_id, dpor_vv),
+            Entry::RwLock(entry) => entry.set_last_access(path_id, dpor_vv),
             Entry::Channel(entry) => {
                 entry.set_last_access(operation.action.into(), path_id, dpor_vv)
             }
@@ -753,24 +761,6 @@ impl From<Action> for rt::atomic::Action {
     fn from(action: Action) -> Self {
         match action {
             Action::Atomic(action) => action,
-            _ => unreachable!(),
-        }
-    }
-}
-
-impl From<Action> for rt::mutex::Action {
-    fn from(action: Action) -> Self {
-        match action {
-            Action::Mutex(action) => action,
-            _ => unreachable!(),
-        }
-    }
-}
-
-impl From<Action> for rt::rwlock::Action {
-    fn from(action: Action) -> Self {
-        match action {
-            Action::RwLock(action) => action,
             _ => unreachable!(),
         }
     }

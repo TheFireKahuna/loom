@@ -1,6 +1,5 @@
 use crate::rt::object;
-use crate::rt::access::{LockAccesses, LockOp};
-use crate::rt::{thread, Location, Synchronize, VersionVec};
+use crate::rt::{thread, Access, Location, Synchronize, VersionVec};
 
 use std::sync::atomic::Ordering::{Acquire, Release};
 
@@ -19,8 +18,13 @@ pub(super) struct State {
     /// references the thread that currently holds the mutex.
     lock: Option<thread::Id>,
 
-    /// Tracks access to the mutex
-    accesses: LockAccesses,
+    /// Tracks access to the mutex.
+    ///
+    /// Every op on the lock, unlock included, races the last one. A blocking
+    /// acquire must race the unlock that admits it although it cannot run
+    /// first: a bounded search reaches some schedules only by switching, at
+    /// the unlock, to a thread that then blocks there, at no preemption cost.
+    last_access: Option<Access>,
 
     /// Causality transfers between threads
     synchronize: Synchronize,
@@ -42,7 +46,7 @@ impl Mutex {
             let state = execution.objects.insert(State {
                 seq_cst,
                 lock: None,
-                accesses: LockAccesses::default(),
+                last_access: None,
                 synchronize: Synchronize::new(),
             });
 
@@ -168,22 +172,12 @@ impl Mutex {
     }
 }
 
-impl Action {
-    fn op(self) -> LockOp {
-        match self {
-            Action::Lock => LockOp::Acquire,
-            Action::TryLock => LockOp::Try,
-            Action::Unlock => LockOp::Unlock,
-        }
-    }
-}
-
 impl State {
-    pub(crate) fn for_each_dependent_access(&self, action: Action, f: impl FnMut(&crate::rt::Access)) {
-        self.accesses.for_each_dependent(action.op(), f)
+    pub(crate) fn last_dependent_access(&self) -> Option<&Access> {
+        self.last_access.as_ref()
     }
 
-    pub(crate) fn set_last_access(&mut self, action: Action, path_id: usize, version: &VersionVec) {
-        self.accesses.record(action.op(), path_id, version);
+    pub(crate) fn set_last_access(&mut self, path_id: usize, version: &VersionVec) {
+        Access::set_or_create(&mut self.last_access, path_id, version);
     }
 }

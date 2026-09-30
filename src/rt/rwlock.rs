@@ -1,5 +1,4 @@
 use crate::rt::object;
-use crate::rt::access::{LockAccesses, LockOp};
 use crate::rt::{thread, Access, Execution, Location, Synchronize, VersionVec};
 
 use std::collections::HashMap;
@@ -46,7 +45,12 @@ pub(super) struct State {
     lock: Option<Locked>,
 
     /// Tracks access to the rwlock.
-    accesses: LockAccesses,
+    ///
+    /// Every op on the lock, unlock included, races the last one. A blocking
+    /// acquire must race the unlock that admits it although it cannot run
+    /// first: a bounded search reaches some schedules only by switching, at
+    /// the unlock, to a thread that then blocks there, at no preemption cost.
+    last_access: Option<Access>,
 
     /// Causality transfers between threads
     synchronize: Synchronize,
@@ -58,7 +62,7 @@ impl RwLock {
         super::execution(|execution| {
             let state = execution.objects.insert(State {
                 lock: None,
-                accesses: LockAccesses::default(),
+                last_access: None,
                 synchronize: Synchronize::new(),
             });
 
@@ -290,22 +294,12 @@ impl RwLock {
     }
 }
 
-impl Action {
-    fn op(self) -> LockOp {
-        match self {
-            Action::Read | Action::Write => LockOp::Acquire,
-            Action::TryRead | Action::TryWrite => LockOp::Try,
-            Action::Unlock => LockOp::Unlock,
-        }
-    }
-}
-
 impl State {
-    pub(crate) fn for_each_dependent_access(&self, action: Action, f: impl FnMut(&Access)) {
-        self.accesses.for_each_dependent(action.op(), f)
+    pub(crate) fn last_dependent_access(&self) -> Option<&Access> {
+        self.last_access.as_ref()
     }
 
-    pub(crate) fn set_last_access(&mut self, action: Action, path_id: usize, version: &VersionVec) {
-        self.accesses.record(action.op(), path_id, version);
+    pub(crate) fn set_last_access(&mut self, path_id: usize, version: &VersionVec) {
+        Access::set_or_create(&mut self.last_access, path_id, version)
     }
 }

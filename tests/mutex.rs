@@ -111,3 +111,52 @@ fn try_lock_sees_an_empty_critical_section_held() {
     });
     assert!(FAILED.load(SeqCst), "try_lock never saw the lock held");
 }
+
+// A blocking acquire races the unlock that would let it in, even while it is
+// disabled: at bound 1, main is preempted at its first unlock, the peer stores
+// and then blocks on the lock, and main runs on without a second preemption,
+// reading the store with the peer's acquisition still to come. Every other
+// schedule of this outcome takes two preemptions.
+#[test]
+fn a_blocked_acquire_races_the_unlock_that_admits_it() {
+    use loom::sync::atomic::AtomicUsize as LoomUsize;
+    use loom::sync::atomic::Ordering::Acquire;
+    use loom::sync::Arc;
+    use std::collections::BTreeSet;
+
+    for bound in [Some(1), None] {
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(BTreeSet::new()));
+        let seen_ = seen.clone();
+        let mut b = loom::model::Builder::new();
+        b.preemption_bound = bound;
+        b.threads = 1;
+        b.check(move || {
+            let m = Arc::new(Mutex::new(0usize));
+            let c = Arc::new(LoomUsize::new(0));
+            let (m2, c2) = (m.clone(), c.clone());
+            let t = thread::spawn(move || {
+                c2.store(1, SeqCst);
+                let mut g = m2.lock().unwrap();
+                *g += 1;
+                *g
+            });
+            let first = {
+                let mut g = m.lock().unwrap();
+                *g += 1;
+                *g
+            };
+            let read = c.load(Acquire);
+            let second = {
+                let mut g = m.lock().unwrap();
+                *g += 2;
+                *g
+            };
+            let peer = t.join().unwrap();
+            seen_.lock().unwrap().insert((first, read, second, peer));
+        });
+        assert!(
+            seen.lock().unwrap().contains(&(1, 1, 3, 4)),
+            "bound {bound:?}: the peer's store before main's read, with its lock after main's second, was never explored"
+        );
+    }
+}
