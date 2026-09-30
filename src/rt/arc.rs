@@ -34,20 +34,28 @@ pub(super) struct State {
     /// are: the kinds are not all mutually dependent, so one thread's later
     /// access must not shadow a peer's concurrent one.
     last_ref_inc: [Option<Access>; MAX_THREADS],
+    last_ref_drop: [Option<Access>; MAX_THREADS],
     last_ref_dec: [Option<Access>; MAX_THREADS],
     last_ref_inspect: [Option<Access>; MAX_THREADS],
 }
 
 /// Actions performed on the Arc
 ///
-/// A clone is dependent only with inspections; a drop with drops and
-/// inspections; an inspection with clones and drops.
+/// A clone is dependent only with inspections. A drop is dependent with
+/// every other decrement-class op and inspection, and with other drops only
+/// when it is the final one. Every other decrement-class op is dependent with
+/// all decrement-class ops and inspections; an inspection with everything
+/// but inspections.
 #[derive(Debug, Copy, Clone, PartialEq)]
 pub(super) enum Action {
     /// Clone the arc
     RefInc,
 
-    /// Drop the Arc
+    /// Drop a strong reference.
+    Drop,
+
+    /// Any other op that reads or lowers a count: `upgrade`, a `Weak` drop,
+    /// `get_mut`, `try_unwrap`, `make_mut`.
     RefDec,
 
     /// Read a count with `Relaxed`, or `Acquire` for `Weak::weak_count`.
@@ -64,6 +72,7 @@ impl Arc {
                 strong: Synchronize::new(),
                 weak: Synchronize::new(),
                 last_ref_inc: Default::default(),
+                last_ref_drop: Default::default(),
                 last_ref_dec: Default::default(),
                 last_ref_inspect: Default::default(),
             });
@@ -262,7 +271,7 @@ impl Arc {
 
     /// Returns true if the memory should be dropped.
     pub(crate) fn ref_dec(&self, location: Location) -> bool {
-        self.branch(Action::RefDec, location);
+        self.branch(Action::Drop, location);
 
         rt::execution(|execution| {
             let state = self.state.get_mut(&mut execution.objects);
@@ -328,12 +337,30 @@ impl State {
     }
 
     pub(super) fn for_each_dependent_access(&self, action: Action, f: impl FnMut(&Access)) {
-        let (a, b): (&[Option<Access>], &[Option<Access>]) = match action {
-            Action::RefInc => (&self.last_ref_inspect, &[]),
-            Action::RefDec => (&self.last_ref_dec, &self.last_ref_inspect),
-            Action::Inspect => (&self.last_ref_inc, &self.last_ref_dec),
+        const NONE: &[Option<Access>] = &[];
+
+        // Two drops that leave the count positive commute: each only joins
+        // its view into `strong` and decrements, and a thread drops only a
+        // reference it holds, so reordering two such drops never makes
+        // either final. Decided per pending drop, with every thread's drop.
+        let final_drop = self.ref_cnt == 1;
+
+        let [a, b, c]: [&[Option<Access>]; 3] = match action {
+            Action::RefInc => [&self.last_ref_inspect, NONE, NONE],
+            Action::Drop if final_drop => [
+                &self.last_ref_drop,
+                &self.last_ref_dec,
+                &self.last_ref_inspect,
+            ],
+            Action::Drop => [&self.last_ref_dec, &self.last_ref_inspect, NONE],
+            Action::RefDec => [
+                &self.last_ref_drop,
+                &self.last_ref_dec,
+                &self.last_ref_inspect,
+            ],
+            Action::Inspect => [&self.last_ref_inc, &self.last_ref_drop, &self.last_ref_dec],
         };
-        a.iter().chain(b).flatten().for_each(f);
+        a.iter().chain(b).chain(c).flatten().for_each(f);
     }
 
     pub(super) fn set_last_access(
@@ -345,6 +372,7 @@ impl State {
     ) {
         let slots = match action {
             Action::RefInc => &mut self.last_ref_inc,
+            Action::Drop => &mut self.last_ref_drop,
             Action::RefDec => &mut self.last_ref_dec,
             Action::Inspect => &mut self.last_ref_inspect,
         };

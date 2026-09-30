@@ -522,3 +522,82 @@ mod dependence {
         }
     }
 }
+
+/// Drops that do not end the strong count commute: only the final drop
+/// conflicts with the others, and every drop with every count read.
+mod drop_independence {
+    use loom::sync::Arc;
+    use loom::thread;
+    use std::collections::BTreeSet;
+    use std::sync::Mutex as StdMutex;
+
+    /// Records which thread ran the value's destructor: the final dropper.
+    struct Last(std::sync::Arc<StdMutex<Option<String>>>);
+
+    impl Drop for Last {
+        fn drop(&mut self) {
+            *self.0.lock().unwrap() = Some(format!("{:?}", thread::current().id()));
+        }
+    }
+
+    /// Two threads drop their clones while main keeps its own: neither drop
+    /// is final, so the drops add no order to explore beyond what the same
+    /// threads doing nothing already have.
+    #[test]
+    fn non_final_drops_are_explored_once() {
+        let executions = |drop_clones: bool| {
+            loom::model::Builder::new()
+                .check(move || {
+                    let a = Arc::new(());
+                    let clones = [a.clone(), a.clone()];
+                    let mut kept = Vec::new();
+                    let hs: Vec<_> = clones
+                        .into_iter()
+                        .map(|c| {
+                            let c = if drop_clones { Some(c) } else { kept.push(c); None };
+                            thread::spawn(move || drop(c))
+                        })
+                        .collect();
+                    for h in hs {
+                        h.join().unwrap();
+                    }
+                    // Without the racing drops, main drops the clones itself.
+                    drop(kept);
+                    drop(a);
+                })
+                .executions
+        };
+        assert_eq!(executions(true), executions(false));
+    }
+
+    /// Three holders race to drop: every thread can be the final dropper, at
+    /// every bound, though non-final drops no longer reorder among themselves.
+    #[test]
+    fn every_thread_can_drop_last() {
+        for bound in [None, Some(1), Some(2), Some(3)] {
+            let seen: std::sync::Arc<StdMutex<BTreeSet<String>>> = Default::default();
+            let out = seen.clone();
+            let mut builder = loom::model::Builder::new();
+            builder.threads = 1;
+            builder.preemption_bound = bound;
+            builder.check(move || {
+                let who = std::sync::Arc::new(StdMutex::new(None));
+                let a = Arc::new(Last(who.clone()));
+                let hs: Vec<_> = (0..2)
+                    .map(|_| {
+                        let c = a.clone();
+                        thread::spawn(move || drop(c))
+                    })
+                    .collect();
+                drop(a);
+                for h in hs {
+                    h.join().unwrap();
+                }
+                let last = who.lock().unwrap().take().unwrap();
+                out.lock().unwrap().insert(last);
+            });
+            let seen = seen.lock().unwrap().clone();
+            assert_eq!(seen.len(), 3, "bound = {bound:?}: {seen:?}");
+        }
+    }
+}
