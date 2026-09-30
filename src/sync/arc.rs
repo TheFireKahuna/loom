@@ -2,6 +2,7 @@ use crate::rt;
 
 use std::borrow::Borrow;
 use std::pin::Pin;
+use std::sync::atomic::Ordering::{Acquire, Relaxed};
 use std::{mem, ops, ptr};
 
 /// Mock implementation of `std::sync::Arc`.
@@ -52,14 +53,11 @@ impl<T> Arc<T> {
     /// Returns the inner value, if the `Arc` has exactly one strong reference.
     #[track_caller]
     pub fn try_unwrap(this: Arc<T>) -> Result<T, Arc<T>> {
-        if !this.obj.sole_strong(location!()) {
+        if !this.obj.try_unwrap(location!()) {
             return Err(this);
         }
 
         assert_eq!(1, std::sync::Arc::strong_count(&this.value));
-        // work around our inability to destruct the object normally,
-        // because of the `Drop` presense.
-        this.obj.ref_dec(location!());
         this.unregister();
 
         // Use the same pattern of unwrapping as `std` does.
@@ -120,32 +118,31 @@ impl<T: Clone> Arc<T> {
     /// Makes the value unique and returns it mutably, as `std`'s: in place when
     /// this is the only reference; moved into a fresh allocation, leaving the
     /// `Weak`s dangling, when only `Weak`s share it; otherwise cloned.
+    ///
+    /// The model takes `std`'s two steps: the strong count goes to 0, which
+    /// fails every upgrade, and then the weak count decides whether the value
+    /// stays or moves. `std`'s own `make_mut` then takes the arm the model
+    /// took, since every `Weak` op the model saw was applied to it too.
     #[track_caller]
     pub fn make_mut(this: &mut Arc<T>) -> &mut T {
-        if !this.obj.get_mut(location!()) {
-            if this.obj.sole_strong(location!()) {
-                // Only `Weak`s share it, and none can upgrade while this holds
-                // the one strong reference: `std` moves the value out, which
-                // ends the old allocation's strong life here.
-                let old = std::sync::Arc::as_ptr(&this.value);
-                std::sync::Arc::make_mut(&mut this.value);
-                assert!(this.obj.ref_dec(location!()), "[loom internal bug] strong reference raced");
-                rt::execution(|e| {
-                    e.arc_objs
-                        .remove(&old.cast())
-                        .expect("Arc object was removed before dropping last Arc");
-                });
-                let obj = std::sync::Arc::new(rt::Arc::new(location!()));
-                rt::execution(|e| {
-                    e.arc_objs
-                        .insert(std::sync::Arc::as_ptr(&this.value) as *const (), obj.clone());
-                });
-                this.obj = obj;
-            } else {
-                *this = Arc::new((**this).clone());
-            }
+        if !this.obj.make_mut_take(location!()) {
+            *this = Arc::new((**this).clone());
+        } else if !this.obj.make_mut_settle(location!()) {
+            let old = std::sync::Arc::as_ptr(&this.value);
+            std::sync::Arc::make_mut(&mut this.value);
+            rt::execution(|e| {
+                e.arc_objs
+                    .remove(&old.cast())
+                    .expect("Arc object was removed before dropping last Arc");
+            });
+            let obj = std::sync::Arc::new(rt::Arc::new(location!()));
+            rt::execution(|e| {
+                e.arc_objs
+                    .insert(std::sync::Arc::as_ptr(&this.value) as *const (), obj.clone());
+            });
+            this.obj = obj;
         }
-        Arc::get_mut(this).expect("[loom internal bug] a fresh Arc is shared")
+        std::sync::Arc::get_mut(&mut this.value).expect("[loom internal bug] a unique Arc is shared")
     }
 }
 
@@ -163,7 +160,7 @@ impl<T: ?Sized> Arc<T> {
     /// Gets the number of `Weak` pointers to this allocation.
     #[track_caller]
     pub fn weak_count(this: &Self) -> usize {
-        this.obj.counts().1
+        this.obj.weak_count(Relaxed)
     }
 
     /// Converts `std::sync::Arc` to `loom::sync::Arc`.
@@ -437,16 +434,20 @@ impl<T: ?Sized> Weak<T> {
     /// Gets the number of strong (`Arc`) pointers to this allocation.
     #[track_caller]
     pub fn strong_count(&self) -> usize {
-        self.obj.as_ref().map_or(0, |obj| obj.counts().0)
+        self.obj.as_ref().map_or(0, |obj| obj.strong_count())
     }
 
     /// Gets the number of `Weak` pointers to this allocation, or 0 once no
-    /// strong pointer remains, as `std`'s.
+    /// strong pointer remains, as `std`'s: an `Acquire` read of the weak
+    /// count, then a `Relaxed` read of the strong count.
     #[track_caller]
     pub fn weak_count(&self) -> usize {
-        self.obj.as_ref().map_or(0, |obj| match obj.counts() {
-            (0, _) => 0,
-            (_, weak) => weak,
+        self.obj.as_ref().map_or(0, |obj| {
+            let weak = obj.weak_count(Acquire);
+            match obj.strong_count() {
+                0 => 0,
+                _ => weak,
+            }
         })
     }
 

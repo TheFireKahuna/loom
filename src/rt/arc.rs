@@ -1,7 +1,7 @@
 use crate::rt::object;
 use crate::rt::{self, Access, Location, Synchronize, VersionVec};
 
-use std::sync::atomic::Ordering::{Acquire, Release, SeqCst};
+use std::sync::atomic::Ordering::{self, Acquire, Relaxed, Release};
 
 use tracing::trace;
 #[derive(Debug)]
@@ -20,10 +20,15 @@ pub(super) struct State {
     /// Location where the arc was allocated
     allocated: Location,
 
-    /// Causality transfers between threads
-    ///
-    /// Only updated on on ref dec and acquired before drop
-    synchronize: Synchronize,
+    /// The strong count's release sequence: every decrement releases into it,
+    /// and an acquiring read or fence after a read of it acquires it.
+    strong: Synchronize,
+
+    /// The weak count's, which `std` keeps in a separate atomic: nothing
+    /// released here reaches an acquire of `strong`, nor the reverse. The
+    /// strong references collectively hold one implicit weak reference, which
+    /// the step that ends the strong count releases.
+    weak: Synchronize,
 
     /// Tracks access to the arc object
     last_ref_inc: Option<Access>,
@@ -44,8 +49,7 @@ pub(super) enum Action {
     /// Drop the Arc
     RefDec,
 
-    /// Inspect internals (such as get ref count). This is done with SeqCst
-    /// causality
+    /// Read a count with `Relaxed`, or `Acquire` for `Weak::weak_count`.
     Inspect,
 }
 
@@ -68,7 +72,8 @@ impl Arc {
                 ref_cnt: 1,
                 weak_cnt: 0,
                 allocated: location,
-                synchronize: Synchronize::new(),
+                strong: Synchronize::new(),
+                weak: Synchronize::new(),
                 last_ref_inc: None,
                 last_ref_dec: None,
                 last_ref_inspect: None,
@@ -101,12 +106,14 @@ impl Arc {
     }
 
     /// The first strong reference of a `new_cyclic` object, once its value
-    /// exists.
+    /// exists: `std`'s `Release` increment, which a successful upgrade
+    /// acquires.
     pub(crate) fn strong_init(&self) {
         rt::execution(|execution| {
             let state = self.state.get_mut(&mut execution.objects);
             assert_eq!(state.ref_cnt, 0, "[loom internal bug] cyclic Arc already live");
             state.ref_cnt = 1;
+            state.strong.sync_store(&mut execution.threads, Release);
         })
     }
 
@@ -121,59 +128,126 @@ impl Arc {
         })
     }
 
-    /// Dropping a `Weak`: a release, as a strong drop is, which a later
-    /// `get_mut` acquires.
+    /// Dropping a `Weak`: `std`'s `Release` decrement of the weak count, and
+    /// the `Acquire` fence of the one that ends the allocation.
     pub(crate) fn weak_dec(&self, location: Location) {
         self.branch(Action::RefDec, location);
         rt::execution(|execution| {
             let state = self.state.get_mut(&mut execution.objects);
             assert!(state.weak_cnt >= 1, "Weak is already released");
             state.weak_cnt -= 1;
-            state.synchronize.sync_store(&mut execution.threads, Release);
+            state.weak.sync_store(&mut execution.threads, Release);
+            if state.weak_cnt == 0 && state.ref_cnt == 0 {
+                state.weak.sync_load(&mut execution.threads, Acquire);
+            }
         })
     }
 
-    /// `Weak::upgrade`: one more strong reference if any is left, acquiring
-    /// every earlier release when it succeeds, as `std`'s `Acquire` increment
-    /// does. Dependent with the drops: whether it succeeds is the race.
+    /// `Weak::upgrade`: `std`'s increment of a nonzero strong count, `Acquire`
+    /// on success and `Relaxed` on failure. Dependent with the drops: whether
+    /// it succeeds is the race.
     pub(crate) fn upgrade(&self, location: Location) -> bool {
         self.branch(Action::RefDec, location);
         rt::execution(|execution| {
             let state = self.state.get_mut(&mut execution.objects);
             if state.ref_cnt == 0 {
+                state.strong.sync_load(&mut execution.threads, Relaxed);
                 return false;
             }
             state.ref_cnt += 1;
-            state.synchronize.sync_load(&mut execution.threads, Acquire);
+            state.strong.sync_load(&mut execution.threads, Acquire);
+            state.strong.sync_store(&mut execution.threads, Acquire);
             true
         })
     }
 
-    /// `(strong, weak)` counts, observed like `strong_count`.
+    /// The strong count, read `Relaxed` as `std`'s `strong_count`s read it.
     #[track_caller]
-    pub(crate) fn counts(&self) -> (usize, usize) {
+    pub(crate) fn strong_count(&self) -> usize {
         self.branch(Action::Inspect, location!());
         rt::execution(|execution| {
             let state = self.state.get_mut(&mut execution.objects);
-            state.synchronize.sync_load(&mut execution.threads, SeqCst);
-            (state.ref_cnt, state.weak_cnt)
+            state.strong.sync_load(&mut execution.threads, Relaxed);
+            state.ref_cnt
         })
     }
 
-    /// `try_unwrap`'s test: the only strong reference, whatever `Weak`s remain
-    /// (they fail to upgrade once it is taken).
-    pub(crate) fn sole_strong(&self, location: Location) -> bool {
+    /// The count of `Weak` handles, read with `order`: `Relaxed` for
+    /// `Arc::weak_count`, `Acquire` for `Weak::weak_count`.
+    #[track_caller]
+    pub(crate) fn weak_count(&self, order: Ordering) -> usize {
+        self.branch(Action::Inspect, location!());
+        rt::execution(|execution| {
+            let state = self.state.get_mut(&mut execution.objects);
+            state.weak.sync_load(&mut execution.threads, order);
+            state.weak_cnt
+        })
+    }
+
+    /// `try_unwrap`'s `Relaxed` CAS of the strong count from 1 to 0, with the
+    /// `Acquire` fence and the implicit weak drop of its success. One step, so
+    /// an upgrade precedes it, and it fails, or follows it and fails itself.
+    pub(crate) fn try_unwrap(&self, location: Location) -> bool {
         self.branch(Action::RefDec, location);
         rt::execution(|execution| {
             let state = self.state.get_mut(&mut execution.objects);
             assert!(state.ref_cnt >= 1, "Arc is released");
-            state.synchronize.sync_load(&mut execution.threads, Acquire);
-            state.ref_cnt == 1
+            state.strong.sync_load(&mut execution.threads, Relaxed);
+            if state.ref_cnt != 1 {
+                return false;
+            }
+            state.ref_cnt = 0;
+            state.strong.sync_store(&mut execution.threads, Relaxed);
+            state.strong.sync_load(&mut execution.threads, Acquire);
+            state.release_implicit_weak(&mut execution.threads);
+            true
         })
     }
 
-    /// Validate a `get_mut` call: unique when this is the only strong
-    /// reference and no `Weak` could upgrade to a second.
+    /// `make_mut`'s first step, its `Acquire` CAS of the strong count from 1
+    /// to 0 (`Relaxed` on failure, when it clones). Until
+    /// [`make_mut_settle`](Self::make_mut_settle) no upgrade succeeds.
+    pub(crate) fn make_mut_take(&self, location: Location) -> bool {
+        self.branch(Action::RefDec, location);
+        rt::execution(|execution| {
+            let state = self.state.get_mut(&mut execution.objects);
+            assert!(state.ref_cnt >= 1, "Arc is released");
+            if state.ref_cnt != 1 {
+                state.strong.sync_load(&mut execution.threads, Relaxed);
+                return false;
+            }
+            state.ref_cnt = 0;
+            state.strong.sync_load(&mut execution.threads, Acquire);
+            state.strong.sync_store(&mut execution.threads, Acquire);
+            true
+        })
+    }
+
+    /// `make_mut`'s second step, its `Relaxed` read of the weak count: with no
+    /// `Weak` left, the `Release` store that restores the strong reference
+    /// (true: the value stays in place); otherwise the drop of the implicit
+    /// weak reference, and the value moves out (false).
+    pub(crate) fn make_mut_settle(&self, location: Location) -> bool {
+        self.branch(Action::RefDec, location);
+        rt::execution(|execution| {
+            let state = self.state.get_mut(&mut execution.objects);
+            assert_eq!(state.ref_cnt, 0, "[loom internal bug] make_mut lost its take");
+            state.weak.sync_load(&mut execution.threads, Relaxed);
+            if state.weak_cnt == 0 {
+                state.ref_cnt = 1;
+                state.strong.sync_store(&mut execution.threads, Release);
+                true
+            } else {
+                state.release_implicit_weak(&mut execution.threads);
+                false
+            }
+        })
+    }
+
+    /// `get_mut`'s uniqueness test, as `std`'s: an `Acquire` CAS locking a
+    /// weak count with no `Weak` (`Relaxed` when it fails), an `Acquire` read
+    /// of the strong count, and the `Release` store that unlocks. The weak
+    /// lock keeps every `Weak` op out of the window, so one step is exact.
     pub(crate) fn get_mut(&self, location: Location) -> bool {
         self.branch(Action::RefDec, location);
 
@@ -182,10 +256,15 @@ impl Arc {
 
             assert!(state.ref_cnt >= 1, "Arc is released");
 
-            // Synchronize the threads
-            state.synchronize.sync_load(&mut execution.threads, Acquire);
+            if state.weak_cnt != 0 {
+                state.weak.sync_load(&mut execution.threads, Relaxed);
+                return false;
+            }
+            state.weak.sync_load(&mut execution.threads, Acquire);
+            state.strong.sync_load(&mut execution.threads, Acquire);
+            state.weak.sync_store(&mut execution.threads, Release);
 
-            let is_only_ref = state.ref_cnt == 1 && state.weak_cnt == 0;
+            let is_only_ref = state.ref_cnt == 1;
 
             trace!(state = ?self.state, ?is_only_ref, %location, "Arc::get_mut");
 
@@ -208,35 +287,19 @@ impl Arc {
             trace!(state = ?self.state, ref_cnt = ?state.ref_cnt, %location, "Arc::ref_dec");
 
             // Synchronize the threads.
-            state
-                .synchronize
-                .sync_store(&mut execution.threads, Release);
+            state.strong.sync_store(&mut execution.threads, Release);
 
             if state.ref_cnt == 0 {
                 // Final ref count, the arc will be dropped. This requires
                 // acquiring the causality
                 //
                 // In the real implementation, this is done with a fence.
-                state.synchronize.sync_load(&mut execution.threads, Acquire);
+                state.strong.sync_load(&mut execution.threads, Acquire);
+                state.release_implicit_weak(&mut execution.threads);
                 true
             } else {
                 false
             }
-        })
-    }
-
-    #[track_caller]
-    pub(crate) fn strong_count(&self) -> usize {
-        self.branch(Action::Inspect, location!());
-
-        rt::execution(|execution| {
-            let state = self.state.get_mut(&mut execution.objects);
-            assert!(state.ref_cnt > 0, "Arc is already released");
-
-            // Synchronize the threads.
-            state.synchronize.sync_load(&mut execution.threads, SeqCst);
-
-            state.ref_cnt
         })
     }
 
@@ -253,6 +316,16 @@ impl Arc {
 }
 
 impl State {
+    /// The strong references' implicit weak reference, dropped when the strong
+    /// count ends: a `Release` decrement of the weak count, and the `Acquire`
+    /// fence that frees the allocation when no `Weak` remains.
+    fn release_implicit_weak(&mut self, threads: &mut rt::thread::Set) {
+        self.weak.sync_store(threads, Release);
+        if self.weak_cnt == 0 {
+            self.weak.sync_load(threads, Acquire);
+        }
+    }
+
     pub(super) fn check_for_leaks(&self, index: usize) {
         if self.ref_cnt != 0 || self.weak_cnt != 0 {
             if self.allocated.is_captured() {
