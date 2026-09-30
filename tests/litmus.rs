@@ -279,3 +279,52 @@ fn sc_load_still_sees_every_racing_store() {
         );
     }
 }
+
+// Two SC loads of one cell may take either order in S, and the one ordered
+// first may read the older store. T0: x=1; x=2; y=1 (relaxed). T2: y (relaxed)
+// then x (SC) = l2. Main: x (SC) = l1. `(ry, l2, l1)` of (1,1,2), (1,0,1) and
+// (1,0,2) needs l2 before l1 in S: C++20-legal, and AArch64-legal (`LDR y`
+// does not order the `LDAR x` after it). Both orders of the loads must be
+// explored, under every bound that reaches the schedule.
+#[test]
+fn sc_loads_take_either_order_in_s() {
+    for bound in [None, Some(2), Some(3)] {
+        let values = Arc::new(Mutex::new(HashSet::new()));
+        let values_ = values.clone();
+        let mut builder = loom::model::Builder::new();
+        builder.preemption_bound = bound;
+        builder.check(move || {
+            let x = Arc::new(AtomicUsize::new(0));
+            let y = Arc::new(AtomicUsize::new(0));
+
+            let t0 = {
+                let (x, y) = (x.clone(), y.clone());
+                thread::spawn(move || {
+                    x.store(1, Relaxed);
+                    x.store(2, Relaxed);
+                    y.store(1, Relaxed);
+                })
+            };
+            let t2 = {
+                let (x, y) = (x.clone(), y.clone());
+                thread::spawn(move || {
+                    let ry = y.load(Relaxed);
+                    (ry, x.load(SeqCst))
+                })
+            };
+
+            let l1 = x.load(SeqCst);
+
+            t0.join().unwrap();
+            let (ry, l2) = t2.join().unwrap();
+            values.lock().unwrap().insert((ry, l2, l1));
+        });
+        let values = values_.lock().unwrap();
+        for expected in [(1, 1, 2), (1, 0, 1), (1, 0, 2)] {
+            assert!(
+                values.contains(&expected),
+                "bound {bound:?}: {expected:?} unreachable, saw {values:?}",
+            );
+        }
+    }
+}

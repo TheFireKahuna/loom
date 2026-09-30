@@ -158,6 +158,9 @@
 //!
 //! A fence is an operation on S itself, DPOR-dependent with every other SC
 //! fence and SC access, so every order of them S could take is explored.
+//! Two `SeqCst` reads of shared bits are dependent with each other as well:
+//! each ranks the store it returns at its own position (`rank_sc_read`), so
+//! which comes first in S decides what the other may return.
 //!
 //! - RMW Atomicity:
 //!
@@ -1036,7 +1039,7 @@ pub(crate) fn reset(base: usize, len: usize, location: Location) {
 
             let dpor_vv = &execution.threads.active().dpor_vv;
             let mut joined = *dpor_vv;
-            state.for_each_dependent_access(Action::Store(FULL_MASK), |access| {
+            state.for_each_dependent_access(Action::Store(FULL_MASK), false, |access| {
                 if !access.happens_before(dpor_vv) {
                     execution.path.backtrack(access.path_id(), thread);
                 }
@@ -1923,6 +1926,11 @@ struct Region {
     /// Last time each thread accessed this region with a store or rmw.
     last_non_load_access: Box<[Option<Access>; MAX_THREADS]>,
 
+    /// Last time each thread read this region, and wrote none of it, in an
+    /// operation that takes a place in S: another such read is dependent with
+    /// it (`Action::conflicts_with`).
+    last_sc_read: Box<[Option<Access>; MAX_THREADS]>,
+
     /// Wide ops that compared these bits and wrote them back verbatim
     /// ([`PreservedOp`]) — the store-less stand-ins for the identity writes
     /// they replace. A record stays while it can still bind a read
@@ -2006,10 +2014,22 @@ impl Action {
     /// wherever an RMW reads and writes the same bits; a preserving RMW's
     /// preserved lane commutes with that lane's readers, exactly as a load
     /// of it would.
-    pub(super) fn conflicts_with(self, other: Action) -> bool {
+    ///
+    /// `both_sc` is whether both operations take a place in S. Two `SeqCst`
+    /// reads of shared bits are then dependent too: a `SeqCst` read ranks the
+    /// store it returns at its own S position (`Region::rank_sc_read`), which
+    /// bars the later one from reading anything older, so their order is
+    /// observable.
+    pub(super) fn conflicts_with(self, other: Action, both_sc: bool) -> bool {
+        let sc_reads = if both_sc {
+            self.read_mask() & other.read_mask()
+        } else {
+            0
+        };
         (self.write_mask() & other.read_mask())
             | (self.read_mask() & other.write_mask())
             | (self.write_mask() & other.write_mask())
+            | sc_reads
             != 0
     }
 }
@@ -4526,10 +4546,13 @@ impl State {
     /// The op's kind is decided **per region**, not once: a preserving RMW is a
     /// writer in the regions its `write` mask covers and a reader in the ones
     /// only its `read` mask does, so its preserved lane raises no backtrack
-    /// point against that lane's readers.
+    /// point against that lane's readers. `sc` marks an op that takes a place
+    /// in S; where it only reads, it depends on the other threads' `SeqCst`
+    /// reads there too (`Action::conflicts_with`).
     pub(super) fn for_each_dependent_access<'a>(
         &'a self,
         action: Action,
+        sc: bool,
         mut f: impl FnMut(&'a Access),
     ) {
         let mask = action.mask();
@@ -4537,7 +4560,8 @@ impl State {
 
         for region in &self.regions {
             if region.mask & mask != 0 {
-                region.for_each_dependent_access(region.mask & write == 0, &mut f);
+                let is_load = region.mask & write == 0;
+                region.for_each_dependent_access(is_load, is_load && sc, &mut f);
             }
         }
     }
@@ -4546,6 +4570,7 @@ impl State {
     pub(super) fn set_last_access(
         &mut self,
         action: Action,
+        sc: bool,
         thread_id: thread::Id,
         path_id: usize,
         version: &VersionVec,
@@ -4556,7 +4581,8 @@ impl State {
 
         for region in &mut self.regions {
             if region.mask & mask != 0 {
-                region.set_last_access(region.mask & write == 0, index, path_id, version);
+                let is_load = region.mask & write == 0;
+                region.set_last_access(is_load, is_load && sc, index, path_id, version);
             }
         }
     }
@@ -4573,6 +4599,7 @@ impl Region {
             cnt: 0,
             last_access: Default::default(),
             last_non_load_access: Default::default(),
+            last_sc_read: Default::default(),
             preserved: Vec::new(),
             preserved_cnt: 0,
             unrouted_readers: 0,
@@ -4590,6 +4617,7 @@ impl Region {
         self.cnt = 0;
         *self.last_access = Default::default();
         *self.last_non_load_access = Default::default();
+        *self.last_sc_read = Default::default();
         self.preserved.clear();
         self.preserved_cnt = 0;
         self.unrouted_readers = 0;
@@ -4623,6 +4651,7 @@ impl Region {
                 region
                     .last_non_load_access
                     .clone_from(&self.last_non_load_access);
+                region.last_sc_read.clone_from(&self.last_sc_read);
                 region.preserved.clone_from(&self.preserved);
                 region.preserved_cnt = self.preserved_cnt;
                 region.unrouted_readers = self.unrouted_readers;
@@ -4638,6 +4667,7 @@ impl Region {
                 cnt: self.cnt,
                 last_access: self.last_access.clone(),
                 last_non_load_access: self.last_non_load_access.clone(),
+                last_sc_read: self.last_sc_read.clone(),
                 preserved: self.preserved.clone(),
                 preserved_cnt: self.preserved_cnt,
                 unrouted_readers: self.unrouted_readers,
@@ -4648,9 +4678,15 @@ impl Region {
         }
     }
 
-    /// Report this region's dependent accesses (a load depends on this thread's
-    /// last store/rmw; a store/rmw on any last access).
-    fn for_each_dependent_access<'a>(&'a self, is_load: bool, f: &mut impl FnMut(&'a Access)) {
+    /// Report this region's dependent accesses (a load depends on each thread's
+    /// last store/rmw, and a `SeqCst` load, `sc_read`, on each thread's last
+    /// `SeqCst` read too; a store/rmw on any last access).
+    fn for_each_dependent_access<'a>(
+        &'a self,
+        is_load: bool,
+        sc_read: bool,
+        f: &mut impl FnMut(&'a Access),
+    ) {
         let slots = if is_load {
             &self.last_non_load_access
         } else {
@@ -4660,12 +4696,18 @@ impl Region {
         for access in slots.iter().flatten() {
             f(access);
         }
+        if sc_read {
+            for access in self.last_sc_read.iter().flatten() {
+                f(access);
+            }
+        }
     }
 
     /// Record a thread's last access to this region.
     fn set_last_access(
         &mut self,
         is_load: bool,
+        sc_read: bool,
         thread_id: usize,
         path_id: usize,
         version: &VersionVec,
@@ -4674,6 +4716,9 @@ impl Region {
 
         if !is_load {
             Access::set_or_create(&mut self.last_non_load_access[thread_id], path_id, version);
+        }
+        if sc_read {
+            Access::set_or_create(&mut self.last_sc_read[thread_id], path_id, version);
         }
     }
 

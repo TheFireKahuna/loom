@@ -388,7 +388,9 @@ impl Store {
         }
 
         match &self.entries[operation.obj.index] {
-            Entry::Atomic(entry) => entry.for_each_dependent_access(operation.action.into(), f),
+            Entry::Atomic(entry) => {
+                entry.for_each_dependent_access(operation.action.into(), operation.sc, f)
+            }
             Entry::Arc(entry) => entry.for_each_dependent_access(operation.action.into(), f),
             Entry::Mutex(entry) => {
                 if let Some(access) = entry.last_dependent_access() {
@@ -457,7 +459,8 @@ impl Store {
                 entry.set_last_access(operation.action.into(), thread_id, path_id, dpor_vv)
             }
             Entry::Atomic(entry) => {
-                entry.set_last_access(operation.action.into(), thread_id, path_id, dpor_vv)
+                let action = operation.action.into();
+                entry.set_last_access(action, operation.sc, thread_id, path_id, dpor_vv)
             }
             Entry::Mutex(entry) => entry.set_last_access(path_id, dpor_vv),
             Entry::Condvar(entry) => entry.set_last_access(path_id, dpor_vv),
@@ -744,7 +747,8 @@ impl Operation {
     }
 
     /// DPOR dependence with another operation, decided from the operations
-    /// alone. Same-object only; atomics refine by lane mask and access kind;
+    /// alone. Same-object only; atomics refine by lane mask and access kind,
+    /// and two `SeqCst` reads of shared bits are dependent through S;
     /// every other object type is conservatively dependent. For the sleep-set
     /// wake rule an over-approximation only wakes threads earlier — pruning
     /// less, never unsoundly more.
@@ -754,7 +758,7 @@ impl Operation {
         }
 
         match (self.action, other.action) {
-            (Action::Atomic(a), Action::Atomic(b)) => a.conflicts_with(b),
+            (Action::Atomic(a), Action::Atomic(b)) => a.conflicts_with(b, self.sc && other.sc),
             (Action::Unpark, Action::Unpark) => false,
             _ => true,
         }
