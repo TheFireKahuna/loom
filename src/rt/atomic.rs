@@ -419,7 +419,7 @@ macro_rules! materialized_cell {
         impl Resolve for $name {
             fn resolve(&self) -> object::Ref<State> {
                 rt::execution(|execution| {
-                    resolve_materialized(execution, self as *const $name as usize)
+                    resolve_materialized(execution, self as *const $name as usize, $bytes)
                 })
             }
 
@@ -431,7 +431,7 @@ macro_rules! materialized_cell {
                 let addr = self as *const $name as usize;
                 if let Some(location) = unscheduled {
                     let (state, on_reset_page) = rt::execution(|execution| {
-                        let state = resolve_materialized(execution, addr);
+                        let state = resolve_materialized(execution, addr, $bytes);
                         (state, execution.vm.reset_page(addr).is_some())
                     });
                     if on_reset_page {
@@ -442,7 +442,7 @@ macro_rules! materialized_cell {
                     }
                 }
                 rt::execution(|execution| {
-                    let state = resolve_materialized(execution, addr);
+                    let state = resolve_materialized(execution, addr, $bytes);
                     fault_materialized(execution, addr, write);
                     state
                 })
@@ -518,6 +518,11 @@ pub(crate) struct Vm {
 #[derive(Debug)]
 struct VmCell {
     state: object::Ref<State>,
+
+    /// The cell's size in bytes. No other cell of the execution overlaps
+    /// `[addr, addr + width)`: one location reached at two widths is a
+    /// mixed-size access, which two cells cannot model.
+    width: usize,
 
     /// The cell's `op_clock` when its page was reset — or 0, registered on a
     /// page already reset — while the reset is pending. A store since is a
@@ -607,6 +612,63 @@ impl Vm {
                 self.committed.insert(i + 1, tail);
             }
         }
+    }
+
+    /// Panic unless every byte of `[lo, hi)` is committed, naming the first
+    /// that is not.
+    fn assert_committed(&self, lo: usize, hi: usize, what: &str) {
+        let mut at = lo;
+        while at < hi {
+            match self.committed_at(at) {
+                Some(r) => at = r.hi,
+                None => self.uncommitted(at, what),
+            }
+        }
+    }
+
+    /// The genesis of a cell over `[addr, addr + width)`: the commits that
+    /// establish zero for all of its bytes. A lane's commit covers the cell
+    /// only where it covers every part, and then from the latest of its
+    /// commits of them on.
+    fn cell_genesis(&self, addr: usize, width: usize) -> (Epochs, Location) {
+        let Some(first) = self.committed_at(addr) else {
+            self.uncommitted(addr, "materialized atomic access");
+        };
+        let (mut commits, location) = (first.commits, first.location);
+        let mut at = first.hi;
+        while at < addr + width {
+            let Some(r) = self.committed_at(at) else {
+                if self.decommitted.iter().any(|&(lo, hi)| lo <= at && at < hi) {
+                    self.uncommitted(at, "materialized atomic access");
+                }
+                panic!(
+                    "materialized atomic of {width} bytes at {addr:#x} runs past the end of \
+                     its published region: byte {at:#x} is not in any published region. Every \
+                     byte of a cell must be declared with \
+                     `loom::sync::atomic::materialized::publish(ptr, len)`."
+                );
+            };
+            for (c, &t) in commits.iter_mut().zip(&r.commits) {
+                *c = if *c == 0 || t == 0 { 0 } else { (*c).max(t) };
+            }
+            at = r.hi;
+        }
+        (commits, location)
+    }
+
+    /// Panic naming the registered cell at `other` that a `width`-byte cell at
+    /// `addr` overlaps.
+    #[cold]
+    fn overlap(&self, addr: usize, width: usize, other: usize) -> ! {
+        panic!(
+            "materialized atomic of {width} bytes at {addr:#x} overlaps the {}-byte cell at \
+             {other:#x} registered in this execution. One location reached at two widths is a \
+             mixed-size access, which the model cannot represent as two cells: reach the \
+             narrower part through a lane view of the wider cell (`lane_u32`/`lane_u64`), or \
+             `unpublish` the memory and `publish` it again before reusing it under another \
+             layout.",
+            self.cells[&other].width,
+        );
     }
 
     /// Panic naming why `addr` has no committed memory under it.
@@ -829,6 +891,9 @@ const _: () = {
 pub(crate) fn zero_exclusive(base: usize, len: usize, location: Location) {
     let (lo, hi) = (base, base + len);
 
+    // A write to memory that is not committed faults.
+    rt::execution(|execution| execution.vm.assert_committed(lo, hi, "zero_exclusive"));
+
     // Writing a reset page is a page event, and a page event is a scheduling
     // point.
     let on_reset_page = rt::execution(|execution| reset_pages_in(&execution.vm, lo, hi).len() != 0);
@@ -959,13 +1024,7 @@ pub(crate) fn reset(base: usize, len: usize, location: Location) {
     rt::execution(|execution| {
         trace!(base, len, "atomic::reset");
 
-        let mut at = lo;
-        while at < hi {
-            match execution.vm.committed_at(at) {
-                Some(r) => at = r.hi,
-                None => execution.vm.uncommitted(at, "reset"),
-            }
-        }
+        execution.vm.assert_committed(lo, hi, "reset");
 
         // A write to every cell of the pages: dependent with every earlier
         // access to one, and racing any non-atomic one it does not follow.
@@ -1025,16 +1084,28 @@ pub(crate) fn reset(base: usize, len: usize, location: Location) {
 /// pool re-commits the fringe pages a chunk shares with its neighbours as a
 /// matter of course), and re-committing must not hand a live cell a fresh
 /// registration and drop its history.
-fn resolve_materialized(execution: &mut Execution, addr: usize) -> object::Ref<State> {
+fn resolve_materialized(execution: &mut Execution, addr: usize, width: usize) -> object::Ref<State> {
     let vm = &mut execution.vm;
     if let Some(cell) = vm.cells.get(&addr) {
+        if cell.width != width {
+            vm.overlap(addr, width, addr);
+        }
         return cell.state;
     }
 
-    let Some(committed) = vm.committed_at(addr) else {
-        vm.uncommitted(addr, "materialized atomic access");
-    };
-    let genesis = (committed.commits, committed.location);
+    let genesis = vm.cell_genesis(addr, width);
+
+    let at = vm.order.partition_point(|&a| a < addr);
+    if let Some(&prev) = at.checked_sub(1).map(|i| &vm.order[i]) {
+        if prev + vm.cells[&prev].width > addr {
+            vm.overlap(addr, width, prev);
+        }
+    }
+    if let Some(&next) = vm.order.get(at) {
+        if next < addr + width {
+            vm.overlap(addr, width, next);
+        }
+    }
 
     let state = execution.objects.insert_with(State::shell, State::recycle);
     state
@@ -1048,11 +1119,11 @@ fn resolve_materialized(execution: &mut Execution, addr: usize) -> object::Ref<S
         addr,
         VmCell {
             state,
+            width,
             reset,
             discard_op: 0,
         },
     );
-    let at = vm.order.partition_point(|&a| a < addr);
     vm.order.insert(at, addr);
 
     trace!(?state, addr, "atomic::resolve_materialized");

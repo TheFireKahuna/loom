@@ -497,3 +497,124 @@ fn decommitted_range_at_exit_is_clean() {
         r.decommit();
     });
 }
+
+mod layout {
+    use loom::sync::atomic::materialized::{
+        publish, unpublish, zero_exclusive, AtomicU128, AtomicU32, AtomicU64,
+    };
+    use loom::sync::atomic::Ordering::SeqCst;
+
+    /// A zeroed, 16-byte-aligned block, leaked: a cell's identity is its address.
+    fn block() -> *mut u8 {
+        Box::leak(Box::new(0u128)) as *mut u128 as *mut u8
+    }
+
+    // A narrow cell inside a registered wide one is a mixed-size access to one
+    // location, which the lane views model and a second cell cannot.
+    #[test]
+    #[should_panic(expected = "overlaps")]
+    fn a_cell_inside_a_registered_wider_cell_is_refused() {
+        loom::model(|| {
+            let p = block();
+            publish(p, 8);
+            let wide = unsafe { &*(p as *const AtomicU64) };
+            let hi = unsafe { &*(p.add(4) as *const AtomicU32) };
+            wide.store(0x3_0000_0002, SeqCst);
+            hi.load(SeqCst);
+        });
+    }
+
+    // The same address at a different width is the same mixed-size access.
+    #[test]
+    #[should_panic(expected = "overlaps")]
+    fn a_narrower_cell_at_a_registered_address_is_refused() {
+        loom::model(|| {
+            let p = block();
+            publish(p, 8);
+            let wide = unsafe { &*(p as *const AtomicU64) };
+            let lo = unsafe { &*(p as *const AtomicU32) };
+            wide.store(0x3_0000_0002, SeqCst);
+            lo.store(5, SeqCst);
+        });
+    }
+
+    // A wide cell over a registered narrow one, from below.
+    #[test]
+    #[should_panic(expected = "overlaps")]
+    fn a_wider_cell_over_a_registered_narrow_cell_is_refused() {
+        loom::model(|| {
+            let p = block();
+            publish(p, 16);
+            let hi = unsafe { &*(p.add(8) as *const AtomicU32) };
+            let wide = unsafe { &*(p as *const AtomicU128) };
+            hi.store(1, SeqCst);
+            wide.load(SeqCst);
+        });
+    }
+
+    // Adjacent cells of different widths do not overlap.
+    #[test]
+    fn adjacent_cells_of_different_widths_are_independent() {
+        loom::model(|| {
+            let p = block();
+            publish(p, 16);
+            let a = unsafe { &*(p as *const AtomicU64) };
+            let b = unsafe { &*(p.add(8) as *const AtomicU32) };
+            let c = unsafe { &*(p.add(12) as *const AtomicU32) };
+            a.store(1, SeqCst);
+            b.store(2, SeqCst);
+            c.store(3, SeqCst);
+            assert_eq!((a.load(SeqCst), b.load(SeqCst), c.load(SeqCst)), (1, 2, 3));
+        });
+    }
+
+    // Every byte of a cell must be committed, not only its first.
+    #[test]
+    #[should_panic(expected = "not in any published region")]
+    fn a_cell_past_the_end_of_its_commit_is_refused() {
+        loom::model(|| {
+            let p = block();
+            publish(p, 8);
+            let c = unsafe { &*(p as *const AtomicU128) };
+            c.store(1, SeqCst);
+        });
+    }
+
+    // A cell over two adjacent commits is committed memory.
+    #[test]
+    fn a_cell_over_two_adjacent_commits_is_committed() {
+        loom::model(|| {
+            let p = block();
+            publish(p, 8);
+            publish(unsafe { p.add(8) }, 8);
+            let c = unsafe { &*(p as *const AtomicU128) };
+            c.store(1, SeqCst);
+            assert_eq!(c.load(SeqCst), 1);
+        });
+    }
+
+    // Zeroing decommitted memory is a write to memory that faults.
+    #[test]
+    #[should_panic(expected = "use after decommit")]
+    fn zero_exclusive_over_decommitted_memory_is_refused() {
+        loom::model(|| {
+            let p = block();
+            publish(p, 8);
+            let c = unsafe { &*(p as *const AtomicU64) };
+            c.store(1, SeqCst);
+            unpublish(p, 8);
+            zero_exclusive(p, 8);
+        });
+    }
+
+    // ... and zeroing memory never committed.
+    #[test]
+    #[should_panic(expected = "not in any published region")]
+    fn zero_exclusive_over_uncommitted_memory_is_refused() {
+        loom::model(|| {
+            let p = block();
+            publish(p, 8);
+            zero_exclusive(p, 16);
+        });
+    }
+}
