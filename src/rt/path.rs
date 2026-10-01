@@ -1,5 +1,5 @@
 use crate::rt::dpor::{Reversal, Wakeup};
-use crate::rt::{execution, object, snapshot, thread, MAX_ATOMIC_HISTORY, MAX_THREADS};
+use crate::rt::{execution, object, snapshot, thread, world, MAX_ATOMIC_HISTORY, MAX_THREADS};
 
 use std::sync::atomic::{
     AtomicU16, AtomicU32, Ordering::AcqRel, Ordering::Acquire, Ordering::Relaxed,
@@ -140,6 +140,10 @@ impl Frozen {
 }
 
 /// An execution path
+///
+/// The exploration's record, which a snapshot restore keeps: none of its
+/// storage may be world memory (`rt::world`), so every method that grows it
+/// runs with routing off.
 #[derive(Debug, Clone)]
 #[cfg_attr(feature = "checkpoint", derive(Serialize, Deserialize))]
 pub(crate) struct Path {
@@ -457,6 +461,13 @@ impl Path {
         format!("{:?}", self.branches)
     }
 
+    /// Assert that none of the path's storage is world memory, which a
+    /// snapshot restore would rewind under it (`LOOM_SNAPSHOT_CHECK`).
+    pub(crate) fn assert_outside(&self) {
+        let inside = self.branches.storage().is_some_and(|p| world::is_world(p as *mut u8));
+        assert!(!inside, "loom: the path's branch storage is in a snapshotted world");
+    }
+
     /// Resume at a snapshot's position.
     pub(crate) fn set_cursor(&mut self, cursor: Cursor) {
         self.pos = cursor.pos;
@@ -554,6 +565,9 @@ impl Path {
 
     /// Push a new atomic-load branch
     pub(super) fn push_load(&mut self, seed: &[u8]) {
+        // The path outlives every snapshot restore: it grows outside the world.
+        let _outside = world::leave();
+
         assert_path_len!(self.branches);
 
         let load_ref = self.branches.insert(Load {
@@ -603,6 +617,9 @@ impl Path {
 
     /// Branch on spurious notifications
     pub(super) fn branch_spurious(&mut self) -> bool {
+        // The path outlives every snapshot restore: it grows outside the world.
+        let _outside = world::leave();
+
         if self.is_traversed() {
             assert_path_len!(self.branches);
 
@@ -651,6 +668,9 @@ impl Path {
         seed: impl ExactSizeIterator<Item = Thread>,
         asleep: u16,
     ) -> (Option<thread::Id>, u16) {
+        // The path outlives every snapshot restore: it grows outside the world.
+        let _outside = world::leave();
+
         if self.is_traversed() {
             assert_path_len!(self.branches);
 
@@ -1246,6 +1266,8 @@ impl Path {
     /// 2. Fresh branches, frozen on the spot. Freezing fixes the choice here,
     ///    which is what lets the branch be named by more than one task at once.
     pub(crate) fn split_off(&mut self, wanted: usize) -> Vec<Path> {
+        let _outside = world::leave();
+
         let mut tasks = Vec::new();
 
         for point in 0..self.floor() {

@@ -185,7 +185,7 @@ fn reservation() -> Option<usize> {
 
 /// Whether `ptr` lies in some arena.
 #[inline]
-fn is_world(ptr: *mut u8) -> bool {
+pub(crate) fn is_world(ptr: *mut u8) -> bool {
     let base = BASE.load(Relaxed);
     base != 0 && (ptr as usize).wrapping_sub(base) < SLOT * SLOTS
 }
@@ -274,8 +274,13 @@ pub(crate) fn is_routed() -> bool {
 
 /// Run `f` with routing off: for runtime state that must survive a restore.
 pub(crate) fn outside<R>(f: impl FnOnce() -> R) -> R {
-    let _back = Route(ROUTE.replace(std::ptr::null_mut()));
+    let _back = leave();
     f()
+}
+
+/// Turn routing off until the guard drops.
+pub(crate) fn leave() -> Route {
+    Route(ROUTE.replace(std::ptr::null_mut()))
 }
 
 /// A layout's block: a small class index, or a large block's length.

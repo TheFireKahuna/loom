@@ -918,6 +918,7 @@ where
     let before = world.inner().execution.path.duplicate();
     let (result, resumed) = run_snapshot(world, snapshots, f);
     result?;
+    world.inner().execution.path.assert_outside();
     if !resumed {
         return Ok(());
     }

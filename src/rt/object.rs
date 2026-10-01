@@ -238,6 +238,11 @@ impl<T> Store<T> {
         self.entries.capacity()
     }
 
+    /// The entries' heap storage, if any.
+    pub(super) fn storage(&self) -> Option<*const u8> {
+        (self.entries.capacity() != 0).then(|| self.entries.as_ptr().cast())
+    }
+
     pub(super) fn reserve_exact(&mut self, additional: usize) {
         self.entries.reserve_exact(additional);
     }
