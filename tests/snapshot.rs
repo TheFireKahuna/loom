@@ -62,7 +62,13 @@ fn hash(values: &[usize]) -> u64 {
     h.finish()
 }
 
-fn explore<M>(threads: usize, bound: Option<usize>, snapshot: Option<usize>, model: M) -> (BTreeSet<u64>, usize)
+fn explore<M>(
+    threads: usize,
+    bound: Option<usize>,
+    sleep_sets: bool,
+    snapshot: Option<usize>,
+    model: M,
+) -> (BTreeSet<u64>, usize)
 where
     M: Fn() -> Vec<usize> + Send + Sync + 'static,
 {
@@ -72,6 +78,7 @@ where
     let mut builder = loom::model::Builder::new();
     builder.threads = threads;
     builder.preemption_bound = bound;
+    builder.sleep_sets = sleep_sets;
     builder.max_permutations = None;
     builder.max_duration = None;
     builder.log = false;
@@ -91,20 +98,33 @@ fn assert_snapshots_preserve_exploration<M>(name: &str, model: M)
 where
     M: Fn() -> Vec<usize> + Send + Sync + Clone + 'static,
 {
-    for bound in [Some(1), Some(2), Some(3)] {
-        let (base, base_n) = explore(1, bound, None, model.clone());
+    // Bounded, then unbounded (source sets and wakeup trees) with and
+    // without sleep sets. Sharded unbounded runs settle frozen branches
+    // through the claim record in whatever order workers reach them, so
+    // their execution count is not fixed; their behaviours are.
+    let configs = [
+        (Some(1), true),
+        (Some(2), true),
+        (Some(3), true),
+        (None, true),
+        (None, false),
+    ];
+    for (bound, sleep_sets) in configs {
+        let (base, base_n) = explore(1, bound, sleep_sets, None, model.clone());
         for threads in [1, 4] {
             for spacing in [1, 3, 8] {
-                let (seen, n) = explore(threads, bound, Some(spacing), model.clone());
-                assert_eq!(
-                    n, base_n,
-                    "{name}: bound {bound:?}, {threads} worker(s), spacing {spacing}: \
-                     {n} executions against {base_n} replayed"
-                );
+                let (seen, n) = explore(threads, bound, sleep_sets, Some(spacing), model.clone());
+                if threads == 1 || bound.is_some() {
+                    assert_eq!(
+                        n, base_n,
+                        "{name}: bound {bound:?}, sleep sets {sleep_sets}, {threads} worker(s), \
+                         spacing {spacing}: {n} executions against {base_n} replayed"
+                    );
+                }
                 assert_eq!(
                     seen, base,
-                    "{name}: bound {bound:?}, {threads} worker(s), spacing {spacing}: \
-                     behaviours differ from replay"
+                    "{name}: bound {bound:?}, sleep sets {sleep_sets}, {threads} worker(s), \
+                     spacing {spacing}: behaviours differ from replay"
                 );
             }
         }

@@ -82,7 +82,7 @@ pub(crate) struct Execution {
 
     /// The steps of the execution and the races each took part in, for the
     /// unbounded search to reverse once the execution ends (`rt::dpor`).
-    pub(super) steps: Log,
+    pub(crate) steps: Log,
 
     /// Prune sleep-set-redundant executions (`Builder::sleep_sets`, gated off
     /// under a preemption bound).
@@ -189,12 +189,7 @@ impl Execution {
     /// Resets the execution state for the next execution run. Returns `false`
     /// when the path is fully explored.
     pub(crate) fn step(&mut self) -> bool {
-        if !self.path.is_bounded() {
-            let (steps, path) = (&mut self.steps, &mut self.path);
-            steps.reverse_races(path.fresh(), |index, rev| path.reverse(index, rev));
-        }
-
-        if !self.path.step() {
+        if !self.step_path() {
             return false;
         }
 
@@ -202,9 +197,15 @@ impl Execution {
         true
     }
 
-    /// Step the path to the next execution without resetting the rest: the
-    /// next execution resumes from a snapshot, or resets when it starts over.
+    /// Reverse the finished execution's races and step the path to the next
+    /// execution, without resetting the rest: the next execution resumes
+    /// from a snapshot, or resets when it starts over.
     pub(crate) fn step_path(&mut self) -> bool {
+        if !self.path.is_bounded() {
+            let (steps, path) = (&mut self.steps, &mut self.path);
+            steps.reverse_races(path.fresh(), |index, rev| path.reverse(index, rev));
+        }
+
         self.path.step()
     }
 

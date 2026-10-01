@@ -77,6 +77,24 @@ impl Wakeup {
         self.kids.clear();
     }
 
+    /// Pass `f` the start of every heap block the tree owns.
+    pub(crate) fn storage(&self, f: &mut impl FnMut(*const u8)) {
+        if self.kids.capacity() != 0 {
+            f(self.kids.as_ptr().cast());
+        }
+        for kid in &self.kids {
+            if kid.subs.capacity() != 0 {
+                f(kid.subs.as_ptr().cast());
+            }
+            for (key, sub) in &kid.subs {
+                if !key.is_empty() {
+                    f(key.as_ptr().cast());
+                }
+                sub.storage(f);
+            }
+        }
+    }
+
     /// The children's threads, in exploration order.
     pub(crate) fn threads(&self) -> impl Iterator<Item = usize> + '_ {
         self.kids.iter().map(|kid| kid.thread as usize)
@@ -352,6 +370,15 @@ impl Log {
         let event = self.events.last_mut().unwrap();
         event.clock = *clock;
         event.key.1 = end;
+    }
+
+    /// The log as a comparable record, less the clocks the reversals derive
+    /// from it.
+    pub(crate) fn record(&self) -> String {
+        format!(
+            "{:?} {:?} {:?} {} {:?} {:?}",
+            self.events, self.races, self.keys, self.open, self.scout, self.woken
+        )
     }
 
     fn key(&self, event: u32) -> &[u64] {

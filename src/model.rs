@@ -267,9 +267,7 @@ pub struct Builder {
     ///
     /// Takes effect only in a binary that installs
     /// [`alloc::Model`](crate::alloc::Model) as its global allocator, whose
-    /// contract the model must keep, and only while sleep sets are inert (a
-    /// preemption bound is set): a sleep set at a branch depends on siblings
-    /// explored since a snapshot of it was taken.
+    /// contract the model must keep.
     ///
     /// Defaults to the `LOOM_SNAPSHOT` environment variable; unset, off.
     pub snapshot: Option<usize>,
@@ -508,9 +506,7 @@ impl Builder {
         // A tracing subscriber's spans count references outside the world,
         // which a restore would replay.
         let spacing = self.snapshot.filter(|_| {
-            rt::snapshot::available()
-                && !self.log
-                && !(self.sleep_sets && self.preemption_bound.is_none())
+            rt::snapshot::available() && !self.log
         });
 
         let world = spacing.and_then(|spacing| {
@@ -881,7 +877,12 @@ impl Engine {
     fn step(&mut self) -> bool {
         match self {
             Engine::Replay { execution, .. } => execution.step(),
-            Engine::Snapshot { world, .. } => world.inner().execution.step_path(),
+            Engine::Snapshot { world, .. } => {
+                let execution: *mut Execution = &mut world.inner().execution;
+                // SAFETY: the world outlives the call. The step log the
+                // reversals extend is world state; the path stays outside.
+                world.routed(|| unsafe { (*execution).step_path() })
+            }
         }
     }
 
@@ -924,19 +925,25 @@ where
     }
 
     let restored = world.inner().execution.path.record();
+    let restored_steps = world.inner().execution.steps.record();
     let restored_observed = observed(&world.inner().execution);
     let after = std::mem::replace(&mut world.inner().execution.path, before);
 
     start(world, f, usize::MAX);
     drive(world, snapshots, |_, _| unreachable!("[loom internal bug] snapshot during a check replay"))?;
 
+    world.inner().execution.path.assert_outside();
     let replayed = world.inner().execution.path.record();
+    let replayed_steps = world.inner().execution.steps.record();
     let replayed_observed = observed(&world.inner().execution);
     assert!(
-        restored == replayed && restored_observed == replayed_observed,
+        restored == replayed
+            && restored_steps == replayed_steps
+            && restored_observed == replayed_observed,
         "loom: an execution resumed from a snapshot differs from its replay \
-         (branch records equal: {}, observations equal: {})",
+         (path records equal: {}, step logs equal: {}, observations equal: {})",
         restored == replayed,
+        restored_steps == replayed_steps,
         restored_observed == replayed_observed,
     );
 

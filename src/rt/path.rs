@@ -226,13 +226,16 @@ pub(crate) struct Path {
 /// Where an execution stands in its path: everything about the path that a
 /// snapshot rewinds. The branches themselves are the exploration's record
 /// and survive a restore.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub(crate) struct Cursor {
     /// Spurious outcomes so far, keyed by position (`Path::observed`).
     observed: u64,
     pos: usize,
     exploring: bool,
     skipping: bool,
+    /// The running step's key so far (`Path::step_key`): a snapshot can fall
+    /// between a step's own branches.
+    step_key: Vec<u64>,
 }
 
 impl Cursor {
@@ -406,6 +409,7 @@ impl Path {
     /// (`rt::atomic::Store::key`).
     pub(crate) fn note_read(&mut self, key: u64) {
         if self.preemption_bound.is_none() {
+            let _outside = world::leave();
             self.step_key.push(key);
         }
     }
@@ -417,6 +421,7 @@ impl Path {
             pos: self.pos,
             exploring: self.exploring,
             skipping: self.skipping,
+            step_key: self.step_key.clone(),
         }
     }
 
@@ -454,26 +459,55 @@ impl Path {
         copy
     }
 
-    /// The branches as a comparable record: what an execution chose and saw
-    /// at each, and the alternatives it left. Two runs of one execution from
-    /// one path must leave identical records.
+    /// The path as a comparable record: what an execution chose and saw at
+    /// each branch, the alternatives and wakeup trees it left, and its
+    /// per-step state. Two runs of one execution from one path must leave
+    /// identical records.
     pub(crate) fn record(&self) -> String {
-        format!("{:?}", self.branches)
+        format!("{:?} {:?} {}", self.branches, self.step_key, self.fresh)
     }
 
     /// Assert that none of the path's storage is world memory, which a
     /// snapshot restore would rewind under it (`LOOM_SNAPSHOT_CHECK`).
     pub(crate) fn assert_outside(&self) {
-        let inside = self.branches.storage().is_some_and(|p| world::is_world(p as *mut u8));
-        assert!(!inside, "loom: the path's branch storage is in a snapshotted world");
+        let mut check = |what: &str, ptr: *const u8| {
+            assert!(
+                !world::is_world(ptr as *mut u8),
+                "loom: the path's {what} is in a snapshotted world"
+            );
+        };
+
+        if let Some(ptr) = self.branches.storage() {
+            check("branch store", ptr);
+        }
+        if self.step_key.capacity() != 0 {
+            check("step key", self.step_key.as_ptr().cast());
+        }
+        if self.frozen.capacity() != 0 {
+            check("frozen branch list", self.frozen.as_ptr().cast());
+        }
+        for frozen in &self.frozen {
+            check("frozen branch", Arc::as_ptr(frozen).cast());
+        }
+        for index in 0..self.branches.len() {
+            if let Some(schedule) = object::Ref::from_usize(index).downcast::<Schedule>(&self.branches) {
+                schedule
+                    .get(&self.branches)
+                    .wut
+                    .storage(&mut |ptr| check("wakeup tree", ptr));
+            }
+        }
     }
 
     /// Resume at a snapshot's position.
-    pub(crate) fn set_cursor(&mut self, cursor: Cursor) {
+    pub(crate) fn set_cursor(&mut self, cursor: &Cursor) {
+        let _outside = world::leave();
         self.pos = cursor.pos;
         self.observed = cursor.observed;
         self.exploring = cursor.exploring;
         self.skipping = cursor.skipping;
+        self.step_key.clear();
+        self.step_key.extend_from_slice(&cursor.step_key);
     }
 
     /// Ask for a snapshot once the execution has consumed `pos` branches.
@@ -892,6 +926,9 @@ impl Path {
     /// leaves the trace as it is; when they are blocked, nothing can run
     /// `e'` before `e`, and nothing is owed.
     pub(super) fn reverse(&mut self, index: usize, rev: &Reversal<'_>) {
+        // The path outlives every snapshot restore: it grows outside the world.
+        let _outside = world::leave();
+
         let schedule_ref = object::Ref::from_usize(index)
             .downcast::<Schedule>(&self.branches)
             .expect("[loom internal bug] a race reversed at a branch that is not a schedule");
@@ -1094,6 +1131,9 @@ impl Path {
     /// This function will also trim the object store, dropping any objects that
     /// are created in pruned sections of the path.
     pub(super) fn step(&mut self) -> bool {
+        // The path outlives every snapshot restore: it grows outside the world.
+        let _outside = world::leave();
+
         // Reset the position to zero, the path will start traversing from the
         // beginning
         self.pos = 0;

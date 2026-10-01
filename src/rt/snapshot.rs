@@ -560,7 +560,7 @@ impl Snapshots {
 
             std::ptr::write(&mut (*execution).path, path);
             (*execution).pruned = pruned;
-            (*execution).path.set_cursor(snapshot.cursor);
+            (*execution).path.set_cursor(&snapshot.cursor);
         }
 
         stats::add(&stats::SYNCED, (synced * PAGE) as u64);
