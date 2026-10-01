@@ -5,9 +5,11 @@
 //! An execution's whole future is a function of its state at a branch point:
 //! the worker's arena ([`super::world`]) — model state, the scheduler and its
 //! coroutines' contexts, the user heap — plus the live part of each coroutine
-//! stack. A snapshot copies exactly that. The exploration's record, the
-//! [`Path`](super::Path), is not part of it: a restore keeps the current path
-//! and rewinds only its [`Cursor`].
+//! stack. A snapshot images exactly that, page by page, holding only the
+//! pages that differ from the snapshot below it on the path and sharing the
+//! rest; a restore writes back only the cache lines the world changed since.
+//! The exploration's record, the [`Path`](super::Path), is not part of it: a
+//! restore keeps the current path and rewinds only its [`Cursor`].
 //!
 //! A snapshot is taken at the entry of the runtime's next access after the
 //! path passes its snapshot position (a spacing of branches on, or the
@@ -20,6 +22,7 @@ use crate::rt::path::Cursor;
 use crate::rt::world::{self, Arena};
 use crate::rt::{Execution, Scheduler};
 
+use std::alloc::Layout;
 use std::cell::Cell;
 use std::ptr::NonNull;
 use std::sync::OnceLock;
@@ -112,7 +115,9 @@ impl World {
     }
 
     fn arena(&self) -> &Arena {
-        self.arena.as_ref().expect("[loom internal bug] world without arena")
+        self.arena
+            .as_ref()
+            .expect("[loom internal bug] world without arena")
     }
 
     /// The execution and scheduler. Calls into either that can allocate run
@@ -149,18 +154,83 @@ impl Drop for World {
     }
 }
 
-/// One snapshot: the arena's used range, each coroutine's live stack, and
-/// the path cursor.
+/// Bytes per page of a snapshot image.
+const PAGE: usize = 4096;
+
+/// Pages the pool carves from the allocator at a time.
+const CHUNK: usize = 16;
+
+/// One page of saved bytes.
+#[repr(C, align(4096))]
+struct Page([u8; PAGE]);
+
+/// Marks a live page whose saved copy is not yet chosen.
+const PENDING: *const Page = std::ptr::dangling();
+
+/// Where a snapshot keeps each page of one range: a page of its own or of a
+/// snapshot below it, null where the range holds nothing.
+type Table = Vec<*const Page>;
+
+/// The pages a worker's snapshots hold, carved in chunks and recycled one by
+/// one; the chunks go back to the allocator with the worker.
+#[derive(Debug, Default)]
+struct Pool {
+    chunks: Vec<NonNull<Page>>,
+    free: Vec<NonNull<Page>>,
+}
+
+impl Pool {
+    fn layout() -> Layout {
+        Layout::from_size_align(PAGE * CHUNK, PAGE).unwrap()
+    }
+
+    fn get(&mut self) -> NonNull<Page> {
+        if let Some(page) = self.free.pop() {
+            return page;
+        }
+
+        // SAFETY: a nonzero size.
+        let chunk = NonNull::new(unsafe { std::alloc::alloc(Self::layout()) }.cast::<Page>())
+            .unwrap_or_else(|| std::alloc::handle_alloc_error(Self::layout()));
+        self.chunks.push(chunk);
+        // SAFETY: every index is inside the chunk.
+        self.free
+            .extend((1..CHUNK).map(|i| unsafe { chunk.add(i) }));
+        stats::max(&stats::HELD, (self.chunks.len() * CHUNK * PAGE) as u64);
+        chunk
+    }
+}
+
+impl Drop for Pool {
+    fn drop(&mut self) {
+        for &chunk in &self.chunks {
+            // SAFETY: allocated in `get` with this layout.
+            unsafe { std::alloc::dealloc(chunk.as_ptr().cast(), Self::layout()) };
+        }
+    }
+}
+
+/// One snapshot: the path cursor, and an image of the world as page tables
+/// over the arena and each live coroutine stack.
+///
+/// A page byte-equal to the same page of the snapshot below this one is
+/// shared with it rather than copied, so a snapshot holds only the pages its
+/// stretch of the execution changed. The snapshots below outlive this one
+/// (they are a stack), so a shared page outlives every table naming it.
 #[derive(Debug)]
 struct Snapshot {
     cursor: Cursor,
-    /// The arena's live ranges, concatenated, and each range's offset and
-    /// length.
-    heap: Vec<u8>,
-    ranges: Vec<(usize, usize)>,
-    stacks: Vec<(usize, Vec<u8>)>,
+    /// The arena's pages, from its base.
+    arena: Table,
+    /// Each live coroutine stack's pages, from its top down, keyed by its top.
+    stacks: Vec<(usize, Table)>,
+    /// The pages this snapshot holds itself.
+    own: Vec<NonNull<Page>>,
     /// Executions resumed from it.
     uses: u64,
+    /// Under `LOOM_SNAPSHOT_CHECK`, a dense copy of the live ranges, which
+    /// the world must equal after every restore of this snapshot.
+    dense: Option<Vec<(usize, Vec<u8>)>>,
 }
 
 /// The snapshots along a worker's current path, shallowest first.
@@ -168,9 +238,9 @@ struct Snapshot {
 pub(crate) struct Snapshots {
     spacing: usize,
     taken: Vec<Snapshot>,
-    spare: Vec<Vec<u8>>,
-    spare_stacks: Vec<Vec<u8>>,
-    spare_ranges: Vec<Vec<(usize, usize)>>,
+    pool: Pool,
+    spare_tables: Vec<Table>,
+    spare_own: Vec<Vec<NonNull<Page>>>,
 }
 
 /// Snapshot activity, for the `LOOM_STATS` report.
@@ -180,7 +250,15 @@ pub(crate) mod stats {
     pub(crate) static TAKEN: AtomicU64 = AtomicU64::new(0);
     pub(crate) static RESTORED: AtomicU64 = AtomicU64::new(0);
     pub(crate) static STARTED: AtomicU64 = AtomicU64::new(0);
+    /// Bytes snapshots copied.
     pub(crate) static BYTES: AtomicU64 = AtomicU64::new(0);
+    /// Bytes snapshot images cover.
+    pub(crate) static IMAGE: AtomicU64 = AtomicU64::new(0);
+    /// Bytes restores compared, and the bytes they wrote.
+    pub(crate) static SYNCED: AtomicU64 = AtomicU64::new(0);
+    pub(crate) static WRITTEN: AtomicU64 = AtomicU64::new(0);
+    /// The most pool memory one worker's snapshots held.
+    pub(crate) static HELD: AtomicU64 = AtomicU64::new(0);
     pub(crate) static UNUSED: AtomicU64 = AtomicU64::new(0);
     pub(crate) static ON_TARGET: AtomicU64 = AtomicU64::new(0);
     pub(crate) static CHECKED: AtomicU64 = AtomicU64::new(0);
@@ -189,11 +267,17 @@ pub(crate) mod stats {
         counter.fetch_add(n, Relaxed);
     }
 
+    pub(crate) fn max(counter: &AtomicU64, n: u64) {
+        counter.fetch_max(n, Relaxed);
+    }
+
     /// Print and clear, if anything was snapshotted.
     pub(crate) fn report(executions: u64) {
         let take = |c: &AtomicU64| c.swap(0, Relaxed);
         let (taken, restored, started) = (take(&TAKEN), take(&RESTORED), take(&STARTED));
-        let bytes = take(&BYTES);
+        let (bytes, image, synced, written) =
+            (take(&BYTES), take(&IMAGE), take(&SYNCED), take(&WRITTEN));
+        let held = take(&HELD);
         let unused = take(&UNUSED);
         let on_target = take(&ON_TARGET);
         let checked = take(&CHECKED);
@@ -204,17 +288,84 @@ pub(crate) mod stats {
             return;
         }
         let n = executions.max(1) as f64;
+        let kib = |b: u64, of: u64| b as f64 / of.max(1) as f64 / 1024.0;
         eprintln!(
-            "loom snapshot: {:.2} taken/exec ({:.0} KiB each), {:.2} restored/exec, \
-             {:.3} started from the root/exec; {:.0}% dropped unused, {:.0}% at the divergence",
+            "loom snapshot: {:.2} taken/exec ({:.0} KiB image, {:.0} KiB copied), \
+             {:.2} restored/exec ({:.0} KiB compared, {:.0} KiB written), \
+             {:.3} started from the root/exec; {:.0}% dropped unused, {:.0}% at the divergence; \
+             at most {:.0} KiB held by one worker",
             taken as f64 / n,
-            bytes as f64 / taken as f64 / 1024.0,
+            kib(image, taken),
+            kib(bytes, taken),
             restored as f64 / n,
+            kib(synced, restored),
+            kib(written, restored),
             started as f64 / n,
             100.0 * unused as f64 / taken as f64,
             100.0 * on_target as f64 / taken as f64,
+            kib(held, 1),
         );
     }
+}
+
+/// Point every pending entry of `table` at a page byte-equal to the live page
+/// `at` gives for its index: `parent`'s same page when it is, else a fresh
+/// copy pushed to `own`. Returns the pages copied.
+///
+/// # Safety
+/// Every pending entry's live page is committed and nothing writes it, and
+/// `parent`'s entries are live pages of the pool.
+unsafe fn capture(
+    table: &mut Table,
+    parent: Option<&Table>,
+    at: impl Fn(usize) -> *const Page,
+    pool: &mut Pool,
+    own: &mut Vec<NonNull<Page>>,
+) -> usize {
+    let mut copied = 0;
+    for (i, entry) in table.iter_mut().enumerate() {
+        if *entry != PENDING {
+            continue;
+        }
+        let live = at(i);
+        let shared = parent
+            .and_then(|parent| parent.get(i).copied())
+            .filter(|page| !page.is_null() && (**page).0 == (*live).0);
+        *entry = match shared {
+            Some(page) => page,
+            None => {
+                let page = pool.get();
+                std::ptr::copy_nonoverlapping(live, page.as_ptr(), 1);
+                own.push(page);
+                copied += 1;
+                page.as_ptr()
+            }
+        };
+    }
+    copied
+}
+
+/// Make the page at `dst` equal to `src`, writing only the cache lines that
+/// differ. Returns the lines written.
+///
+/// # Safety
+/// Both are committed pages, and nothing else accesses `dst`.
+unsafe fn sync(dst: *mut Page, src: *const Page) -> usize {
+    let (dst, src) = (dst.cast::<[u64; 8]>(), src.cast::<[u64; 8]>());
+    let mut written = 0;
+    for line in 0..PAGE / 64 {
+        let want = src.add(line).read();
+        if dst.add(line).read() != want {
+            dst.add(line).write(want);
+            written += 1;
+        }
+    }
+    written
+}
+
+/// The page of a stack whose top is `top`, counting down from it.
+fn stack_page(top: usize, i: usize) -> *mut Page {
+    (top - (i + 1) * PAGE) as *mut Page
 }
 
 impl Snapshots {
@@ -222,9 +373,9 @@ impl Snapshots {
         Snapshots {
             spacing,
             taken: Vec::new(),
-            spare: Vec::new(),
-            spare_stacks: Vec::new(),
-            spare_ranges: Vec::new(),
+            pool: Pool::default(),
+            spare_tables: Vec::new(),
+            spare_own: Vec::new(),
         }
     }
 
@@ -236,10 +387,12 @@ impl Snapshots {
         if snapshot.uses == 0 {
             stats::add(&stats::UNUSED, 1);
         }
-        self.spare.push(snapshot.heap);
-        self.spare_ranges.push(snapshot.ranges);
-        self.spare_stacks
-            .extend(snapshot.stacks.into_iter().map(|(_, bytes)| bytes));
+        let mut own = snapshot.own;
+        self.pool.free.extend(own.drain(..));
+        self.spare_own.push(own);
+        self.spare_tables.push(snapshot.arena);
+        self.spare_tables
+            .extend(snapshot.stacks.into_iter().map(|(_, table)| table));
     }
 
     /// Drop every snapshot.
@@ -262,71 +415,147 @@ impl Snapshots {
         None
     }
 
-    fn buffer(spare: &mut Vec<Vec<u8>>, bytes: &[u8]) -> Vec<u8> {
-        let mut buffer = spare.pop().unwrap_or_default();
-        buffer.clear();
-        buffer.extend_from_slice(bytes);
-        buffer
+    fn table(&mut self, len: usize) -> Table {
+        let mut table = self.spare_tables.pop().unwrap_or_default();
+        table.clear();
+        table.resize(len, std::ptr::null());
+        table
     }
 
-    /// Copy the world as it stands, every coroutine suspended.
+    /// Image the world as it stands, every coroutine suspended, sharing each
+    /// page the snapshot below holds unchanged. Returns the bytes copied.
     pub(crate) fn take(&mut self, world: &mut World) -> usize {
+        // The image's own bookkeeping must survive restores.
+        world::outside(|| self.take_outside(world))
+    }
+
+    fn take_outside(&mut self, world: &mut World) -> usize {
         let base = world.arena().base();
-        let mut ranges = self.spare_ranges.pop().unwrap_or_default();
-        ranges.clear();
-        let mut heap = self.spare.pop().unwrap_or_default();
-        heap.clear();
+
+        // The arena's pages that hold anything: every page a live range
+        // touches. A page wholly inside a hole holds nothing.
+        let mut arena = self.table(0);
         world.arena().live(|offset, len| {
-            // SAFETY: a live range is committed, and nothing runs on it.
-            heap.extend_from_slice(unsafe { std::slice::from_raw_parts(base.add(offset), len) });
-            ranges.push((offset, len));
+            if len == 0 {
+                return;
+            }
+            let (first, last) = (offset / PAGE, (offset + len - 1) / PAGE);
+            if arena.len() <= last {
+                arena.resize(last + 1, std::ptr::null());
+            }
+            arena[first..=last].fill(PENDING);
         });
 
-        let inner = world.inner();
-        let live_stacks: Vec<(usize, usize)> = inner.scheduler.stacks().collect();
+        let live_stacks: Vec<(usize, usize)> = world.inner().scheduler.stacks().collect();
         let mut stacks = Vec::with_capacity(live_stacks.len());
-        for (low, high) in live_stacks {
-            // SAFETY: a suspended coroutine's stack between its saved stack
-            // pointer (less the margin) and its top is committed.
-            let bytes = unsafe { std::slice::from_raw_parts(low as *const u8, high - low) };
-            stacks.push((low, Self::buffer(&mut self.spare_stacks, bytes)));
+        for &(low, top) in &live_stacks {
+            assert!(
+                top % PAGE == 0,
+                "[loom internal bug] a stack top off a page boundary"
+            );
+            let mut table = self.table((top - (low & !(PAGE - 1))) / PAGE);
+            table.fill(PENDING);
+            stacks.push((top, table));
         }
 
-        let cursor = inner.execution.path.cursor();
-        let bytes = heap.len() + stacks.iter().map(|(_, b)| b.len()).sum::<usize>();
+        let dense = check().then(|| dense(world, &live_stacks));
+
+        let mut own = self.spare_own.pop().unwrap_or_default();
+        let parent = self.taken.last();
+        let mut copied = 0;
+        // SAFETY: the live ranges are committed, a suspended coroutine's
+        // stack from the margin below its saved stack pointer to its top is
+        // committed, and nothing runs. The parent's pages are the pool's
+        // until it is recycled, which is after this snapshot is.
+        unsafe {
+            copied += capture(
+                &mut arena,
+                parent.map(|parent| &parent.arena),
+                |i| base.add(i * PAGE).cast(),
+                &mut self.pool,
+                &mut own,
+            );
+            for (top, table) in &mut stacks {
+                let top = *top;
+                let parent = parent.and_then(|parent| {
+                    parent
+                        .stacks
+                        .iter()
+                        .find(|(t, _)| *t == top)
+                        .map(|(_, table)| table)
+                });
+                copied += capture(
+                    table,
+                    parent,
+                    |i| stack_page(top, i),
+                    &mut self.pool,
+                    &mut own,
+                );
+            }
+        }
+
+        let image = arena
+            .iter()
+            .chain(stacks.iter().flat_map(|(_, t)| t))
+            .filter(|p| !p.is_null())
+            .count();
+        stats::add(&stats::IMAGE, (image * PAGE) as u64);
+
+        let cursor = world.inner().execution.path.cursor();
         self.taken.push(Snapshot {
             cursor,
-            heap,
-            ranges,
+            arena,
             stacks,
+            own,
             uses: 0,
+            dense,
         });
-        bytes
+        copied * PAGE
     }
 
     /// Rewind the world to the deepest snapshot, keeping the current path.
     pub(crate) fn restore(&mut self, world: &mut World) -> usize {
-        let snapshot = self.taken.last_mut().expect("[loom internal bug] nothing to restore");
+        let snapshot = self
+            .taken
+            .last_mut()
+            .expect("[loom internal bug] nothing to restore");
         snapshot.uses += 1;
         let snapshot = &*snapshot;
         let base = world.arena().base();
         let execution: *mut Execution = &mut world.inner().execution;
 
+        let mut synced = 0;
+        let mut written = 0;
         // SAFETY: the path's own storage is outside the world, so the bytes
         // read here own it across the copy, which overwrites the field with a
         // stale copy that is never dropped. Every coroutine is suspended, and
-        // the copies land exactly where they were taken from.
+        // every page the image names was committed when it was taken and is
+        // never decommitted while the arena lives.
         unsafe {
             let path = std::ptr::read(&(*execution).path);
             let pruned = (*execution).pruned;
 
-            let mut from = snapshot.heap.as_ptr();
-            for &(offset, len) in &snapshot.ranges {
-                std::ptr::copy_nonoverlapping(from, base.add(offset), len);
-                from = from.add(len);
+            for (i, &page) in snapshot.arena.iter().enumerate() {
+                if !page.is_null() {
+                    written += sync(base.add(i * PAGE).cast(), page);
+                    synced += 1;
+                }
             }
-            for (low, bytes) in &snapshot.stacks {
-                std::ptr::copy_nonoverlapping(bytes.as_ptr(), *low as *mut u8, bytes.len());
+            for (top, table) in &snapshot.stacks {
+                for (i, &page) in table.iter().enumerate() {
+                    written += sync(stack_page(*top, i), page);
+                    synced += 1;
+                }
+            }
+
+            if let Some(dense) = &snapshot.dense {
+                for (at, bytes) in dense {
+                    assert!(
+                        std::slice::from_raw_parts(*at as *const u8, bytes.len()) == &bytes[..],
+                        "loom: a snapshot restore left the world differing from a dense copy \
+                         taken with the snapshot, at {at:#x}",
+                    );
+                }
             }
 
             std::ptr::write(&mut (*execution).path, path);
@@ -334,6 +563,29 @@ impl Snapshots {
             (*execution).path.set_cursor(snapshot.cursor);
         }
 
+        stats::add(&stats::SYNCED, (synced * PAGE) as u64);
+        stats::add(&stats::WRITTEN, (written * 64) as u64);
         snapshot.cursor.pos()
     }
+}
+
+/// The world's live ranges and live stacks, copied byte for byte.
+fn dense(world: &World, stacks: &[(usize, usize)]) -> Vec<(usize, Vec<u8>)> {
+    let base = world.arena().base();
+    let mut ranges = Vec::new();
+    // SAFETY: as `take`'s.
+    world.arena().live(|offset, len| {
+        let at = base as usize + offset;
+        ranges.push((
+            at,
+            unsafe { std::slice::from_raw_parts(at as *const u8, len) }.to_vec(),
+        ));
+    });
+    for &(low, top) in stacks {
+        ranges.push((
+            low,
+            unsafe { std::slice::from_raw_parts(low as *const u8, top - low) }.to_vec(),
+        ));
+    }
+    ranges
 }
