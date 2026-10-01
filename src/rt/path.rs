@@ -633,12 +633,16 @@ impl Path {
         if self.preemption_bound.is_some() {
             loop {
                 // Preemption bounded DPOR requires conservatively adding
-                // another backtrack point to cover cases missed by the bounds.
+                // another backtrack point to cover cases missed by the bounds:
+                // at the latest branch whose choice is not the naturally
+                // continuing thread. That is a context switch, or a free
+                // branch where the displaced thread could not run and resumed
+                // anyway (its own timeout firing): scheduling another thread
+                // there costs no preemption either.
                 if let Some(prev) = curr.get(&self.branches).prev {
-                    let active_a = curr.get(&self.branches).active_thread_index();
-                    let active_b = prev.get(&self.branches).active_thread_index();
+                    let branch = curr.get(&self.branches);
 
-                    if active_a != active_b && curr.get(&self.branches).exploring {
+                    if branch.initial_active != branch.active_thread_index() && branch.exploring {
                         self.mark(curr, thread_id, true);
                         return;
                     }

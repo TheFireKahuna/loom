@@ -133,3 +133,35 @@ fn a_timeout_fires_before_a_runnable_unparker() {
 
     assert!(EARLY.load(SeqCst), "no timeout fired before the unparker ran");
 }
+
+/// A sleeper resumed by its own timeout sits at a free branch: another thread
+/// may run there at no preemption. At bound 0 the sleeper still sees a peer's
+/// store made during the sleep before a second peer runs.
+#[test]
+fn a_sleep_resumed_by_its_timeout_frees_the_switch() {
+    let seen: std::sync::Arc<std::sync::Mutex<std::collections::BTreeSet<(bool, bool)>>> =
+        Default::default();
+    let out = seen.clone();
+    let mut builder = loom::model::Builder::new();
+    builder.preemption_bound = Some(0);
+    builder.threads = 1;
+    builder.check(move || {
+        let first = Arc::new(AtomicBool::new(false));
+        let second = Arc::new(AtomicBool::new(false));
+        let f1 = first.clone();
+        let t1 = thread::spawn(move || f1.store(true, Relaxed));
+        let f2 = second.clone();
+        let t2 = thread::spawn(move || f2.store(true, Relaxed));
+        thread::sleep(Duration::from_millis(1));
+        out.lock()
+            .unwrap()
+            .insert((first.load(Relaxed), second.load(Relaxed)));
+        t1.join().unwrap();
+        t2.join().unwrap();
+    });
+    assert!(
+        seen.lock().unwrap().contains(&(false, true)),
+        "the sleeper never saw the second store alone: {:?}",
+        seen.lock().unwrap()
+    );
+}

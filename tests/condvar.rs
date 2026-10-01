@@ -4,7 +4,7 @@ use loom::sync::atomic::{AtomicBool, AtomicUsize};
 use loom::sync::{Condvar, Mutex};
 use loom::thread;
 
-use std::sync::atomic::Ordering::{Acquire, Release, SeqCst};
+use std::sync::atomic::Ordering::{Acquire, Relaxed, Release, SeqCst};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -312,4 +312,42 @@ fn successive_wait_timeouts_end_a_peers_spin() {
         }
         th.join().unwrap();
     });
+}
+
+/// A wait that times out before a runnable notifier gets the lock sees a third
+/// thread's store made while it was blocked. Bound 0 reaches it: the waiter
+/// blocking frees the switch to the storer, the storer finishing frees the
+/// waiter's timeout, and the notifier runs last.
+#[test]
+fn timeout_after_a_free_switch_sees_the_store() {
+    let seen: Arc<std::sync::Mutex<std::collections::BTreeSet<(usize, bool, usize)>>> =
+        Default::default();
+    let out = seen.clone();
+    let mut builder = loom::model::Builder::new();
+    builder.preemption_bound = Some(0);
+    builder.threads = 1;
+    builder.check(move || {
+        let cell = Arc::new(AtomicUsize::new(0));
+        let s = Arc::new((Mutex::new(0), Condvar::new()));
+        let s1 = s.clone();
+        let notifier = thread::spawn(move || {
+            *s1.0.lock().unwrap() += 1;
+            s1.1.notify_one();
+        });
+        let c2 = cell.clone();
+        let storer = thread::spawn(move || c2.store(1, Relaxed));
+        let g = s.0.lock().unwrap();
+        let (g, r) = s.1.wait_timeout(g, Duration::from_millis(1)).unwrap();
+        out.lock()
+            .unwrap()
+            .insert((*g, r.timed_out(), cell.load(Relaxed)));
+        drop(g);
+        notifier.join().unwrap();
+        storer.join().unwrap();
+    });
+    assert!(
+        seen.lock().unwrap().contains(&(0, true, 1)),
+        "no early timeout saw the store: {:?}",
+        seen.lock().unwrap()
+    );
 }
