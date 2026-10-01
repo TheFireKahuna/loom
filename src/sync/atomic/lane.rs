@@ -223,6 +223,19 @@ macro_rules! lane_type {
                 self.rmw(order, |v| v.min(val))
             }
         }
+
+        // A lane's monitor watches the lane's bits alone: a store to a
+        // disjoint lane of the cell never wakes it.
+        #[allow(private_bounds)]
+        impl<'a, B: crate::rt::ModelOps> crate::hint::sealed::Arm for $name<'a, B> {
+            #[track_caller]
+            fn arm(&self, timed: bool) -> crate::hint::MonitorWake {
+                self.cell.monitor_wait_masked(self.mask(), timed)
+            }
+        }
+
+        #[allow(private_bounds)]
+        impl<'a, B: crate::rt::ModelOps> crate::hint::Monitored for $name<'a, B> {}
     };
 }
 

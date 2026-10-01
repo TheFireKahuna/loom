@@ -585,11 +585,12 @@ impl Execution {
                         Some((self.objects.kind(obj)?, obj.index()))
                     });
 
-                    match object {
-                        Some((kind, index)) => {
+                    match (th.monitor, object) {
+                        (Some(monitor), _) => report.push_str(&monitor.describe(&self.objects)),
+                        (None, Some((kind, index))) => {
                             let _ = write!(report, "blocked on {kind} #{index}");
                         }
-                        None => report.push_str("parked"),
+                        (None, None) => report.push_str("parked"),
                     }
 
                     if timed {

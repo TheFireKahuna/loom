@@ -311,12 +311,24 @@ pub fn yield_now() {
     });
 }
 
-/// `hint::spin_loop`: wait for another thread's progress. The spinner is not
-/// scheduled again while any other thread can run, the switch away is free,
-/// and every store the spinner had already seen superseded becomes
-/// unreadable to it (`rt::atomic`'s yield rule), so a spin loop over atomics
-/// always ends once its peer's store lands.
-pub(crate) fn spin_loop() {
+/// Signals the processor that it is entering a busy-wait spin-loop.
+///
+/// Loom models it as what a spin loop is: a wait for another thread's
+/// progress. The spinner is not scheduled again while any other thread can
+/// run — the switch away costs no preemption — and every store it had already
+/// seen superseded becomes unreadable to it (`rt::atomic`'s yield rule), so a
+/// loop that spins until a peer's store lands always ends. It models user code
+/// that calls `core::hint::spin_loop`; a loop that waits for a store to one
+/// location is [`monitor_wait`](crate::hint::monitor_wait), which wakes on
+/// exactly that store and leaves every other location's history alone.
+/// [`thread::yield_now`](crate::thread::yield_now) is a plain scheduling
+/// point and gives a poll loop no progress.
+///
+/// Under [`Builder::preemption_bound`](crate::model::Builder::preemption_bound)
+/// the switch after a spin is free, but once an execution has spent the whole
+/// bound the search explores no other thread at that switch than the one the
+/// scheduler picks, which keeps a spin loop's state space exhaustible.
+pub fn spin_loop() {
     let switch = execution(|execution| {
         let thread = execution.threads.active_id();
 

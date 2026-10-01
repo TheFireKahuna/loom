@@ -1,4 +1,5 @@
 use crate::rt::execution;
+use crate::rt::atomic::Monitor;
 use crate::rt::object::Operation;
 use crate::rt::synchronize::{ScView, Synchronize};
 use crate::rt::vv::VersionVec;
@@ -87,6 +88,10 @@ pub(crate) struct Thread {
     /// for a lock's release, since what orders a lock's acquirers is their
     /// acquires.
     pub(crate) woken: bool,
+
+    /// The hardware monitor this thread is armed on (`hint::monitor_wait`),
+    /// from arming until its wait returns.
+    pub(crate) monitor: Option<Monitor>,
 
     /// Whether a timed wait of this thread has already timed out while
     /// another thread could run, this execution. One such early timeout per
@@ -232,6 +237,7 @@ impl Thread {
             park_view: Synchronize::new(),
             parked: false,
             park_spurred: false,
+            monitor: None,
             timeout_spent: false,
             woken: false,
             dpor_vv: VersionVec::new(),
@@ -397,6 +403,7 @@ impl fmt::Debug for Thread {
             .field("sc", &self.sc)
             .field("released", &self.released)
             .field("dpor_vv", &self.dpor_vv)
+            .field("monitor", &self.monitor)
             .field("last_yield", &self.last_yield)
             .field("yield_count", &self.yield_count)
             .field("locals", &format_args!("[..locals..]"))

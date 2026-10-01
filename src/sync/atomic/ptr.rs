@@ -108,6 +108,15 @@ macro_rules! atomic_ptr {
             }
         }
 
+        impl<T> crate::hint::sealed::Arm for $name<T> {
+            #[track_caller]
+            fn arm(&self, timed: bool) -> crate::hint::MonitorWake {
+                self.0.monitor_wait(timed)
+            }
+        }
+
+        impl<T> crate::hint::Monitored for $name<T> {}
+
         impl<T> std::fmt::Pointer for $name<T> {
             fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
                 self.0.fmt_peek(f, stringify!($name), std::fmt::Pointer::fmt)

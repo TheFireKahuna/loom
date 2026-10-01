@@ -212,6 +212,7 @@
 //! op can bind no read. A region holding `MAX_ATOMIC_HISTORY` stores no thread
 //! has passed fails loudly: each is a value a pending load may return.
 
+use crate::hint::MonitorWake;
 use crate::rt::execution::Execution;
 use crate::rt::location::{self, Location, LocationSet};
 use crate::rt::object;
@@ -1560,6 +1561,43 @@ pub(crate) trait ModelOps {
     /// explored. The value is the newest in modification order, which the
     /// calling thread need not be able to load. `None` outside a model.
     fn peek(&self) -> Option<u128>;
+
+    /// Arm a hardware monitor on the bits under `mask` and sleep until a store
+    /// or RMW to them lands modification-order-after everything the thread
+    /// has seen there, or, if `timed`, until the timeout fires
+    /// (`hint::monitor_wait`).
+    fn monitor_wait(&self, location: Location, mask: u128, timed: bool) -> MonitorWake;
+}
+
+/// A thread's armed hardware monitor (`hint::monitor_wait`).
+///
+/// What the monitor arms on is the thread's coherence view of the watched
+/// regions, which holds still while the thread sleeps; every store not yet
+/// placed against it is placed when the monitor arms or when the store lands
+/// (`Region::place_unplaced`), so whether a store wakes the thread is fixed
+/// by the store alone.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Monitor {
+    cell: object::Ref<State>,
+    mask: u128,
+
+    /// A store landed beyond the frontier while the thread slept.
+    woken: bool,
+}
+
+impl Monitor {
+    /// The watched location, as a deadlock report names it.
+    pub(super) fn describe(&self, objects: &object::Store) -> String {
+        let created = self.cell.get(objects).created_location;
+        let mut out = format!("waiting for a store to atomic #{}", self.cell.index());
+        if self.mask != FULL_MASK {
+            out.push_str(&format!(" bits {:#x}", self.mask));
+        }
+        if created.is_captured() {
+            out.push_str(&format!(" (created at {created})"));
+        }
+        out
+    }
 }
 
 #[derive(Debug)]
@@ -3063,6 +3101,8 @@ impl<C: Resolve + ?Sized> ModelOps for C {
                     floors[ri],
                 );
             }
+
+            state.wake_monitors(state_ref, mask, &mut execution.threads, &mut execution.path);
         })
     }
 
@@ -3201,6 +3241,67 @@ impl<C: Resolve + ?Sized> ModelOps for C {
         rt::Scheduler::try_with_execution(|execution| match self.registered(execution) {
             Ok(state) => state.get(&execution.objects).newest_value(),
             Err(unregistered) => unregistered,
+        })
+    }
+
+    /// Arming is a read of the watched bits at their scheduling point; the
+    /// sleep that may follow ends on a store beyond what the thread had seen
+    /// (`State::wake_monitors`) or on the timeout, and the thread's next step
+    /// is again a read of those bits, the wake's coherence observation
+    /// (`State::observe_wake`).
+    fn monitor_wait(&self, location: Location, mask: u128, timed: bool) -> MonitorWake {
+        let state_ref = self.resolve();
+        ensure_partition(state_ref, mask);
+        branch(self, state_ref, Action::Load(mask), false, location);
+
+        let sleeps = super::synchronize(|execution| {
+            let state = state_ref.get_mut(&mut execution.objects);
+
+            state.loaded_locations.track(location, &execution.threads);
+            state.track_load(&execution.threads);
+
+            trace!(state = ?state_ref, ?mask, timed, "Atomic::monitor_wait");
+
+            let covered = state.covered(mask);
+            let view = execution.threads.active().coherence_view();
+            let mut fires = false;
+            for &ri in &covered {
+                let region = &mut state.regions[ri];
+                region.place_unplaced(&view, &mut execution.path);
+                fires |= region.beyond(region.passed(&view)) != 0;
+            }
+
+            if fires {
+                state.observe_wake(&mut execution.path, &execution.threads, &covered);
+                return false;
+            }
+
+            execution.threads.active_mut().monitor = Some(Monitor {
+                cell: state_ref,
+                mask,
+                woken: false,
+            });
+            true
+        });
+
+        if !sleeps {
+            return MonitorWake::Stored;
+        }
+
+        super::block(location, timed, Some(state_ref.operation(Action::Load(mask), location)));
+
+        super::synchronize(|execution| {
+            let monitor = execution.threads.active_mut().monitor.take();
+            let monitor = monitor.expect("[loom internal bug] monitor disarmed during its sleep");
+            if !monitor.woken {
+                trace!(state = ?state_ref, "Atomic::monitor_wait: timed out");
+                return MonitorWake::TimedOut;
+            }
+
+            let state = state_ref.get_mut(&mut execution.objects);
+            let covered = state.covered(mask);
+            state.observe_wake(&mut execution.path, &execution.threads, &covered);
+            MonitorWake::Stored
         })
     }
 }
@@ -3407,6 +3508,10 @@ where
                 execution.threads.active_id().as_usize(),
             );
         }
+
+        // Only the written regions gained a store: a preserved lane wakes no
+        // monitor, as no other read of it would change.
+        state.wake_monitors(state_ref, write_mask, &mut execution.threads, &mut execution.path);
 
         Ok(current)
     })
@@ -3743,6 +3848,92 @@ impl State {
             .filter(|(_, r)| r.mask & mask != 0)
             .map(|(i, _)| i)
             .collect()
+    }
+
+    /// A store or RMW of the active thread just wrote the bits under
+    /// `written` of this cell, `me`: every thread asleep on a monitor of
+    /// those bits for which a store now lies beyond its frontier wakes. The
+    /// new store is placed against each sleeper's frontier first, which is
+    /// what makes the wake a function of the store alone.
+    fn wake_monitors(
+        &mut self,
+        me: object::Ref<State>,
+        written: u128,
+        threads: &mut thread::Set,
+        path: &mut Path,
+    ) {
+        for (id, th) in threads.iter_mut() {
+            let Some(monitor) = th.monitor else {
+                continue;
+            };
+            if !monitor.cell.ref_eq(me)
+                || monitor.mask & written == 0
+                || monitor.woken
+                || !th.is_blocked()
+            {
+                continue;
+            }
+
+            let view = th.coherence_view();
+            let mut fires = false;
+            for ri in self.covered(monitor.mask & written) {
+                let region = &mut self.regions[ri];
+                region.place_unplaced(&view, path);
+                fires |= region.beyond(region.passed(&view)) != 0;
+            }
+
+            if fires {
+                trace!(thread = ?id, "Atomic::monitor_wait: woken");
+                th.monitor = Some(Monitor { woken: true, ..monitor });
+                th.wake();
+            }
+        }
+    }
+
+    /// The wake of the active thread's monitor of `covered`: a coherence
+    /// observation of a store beyond its frontier, with no value and no
+    /// synchronization. The store taken is a first one beyond, as the first
+    /// to reach the line is, chosen by a branch where several are; the
+    /// thread's reads of the region return nothing older from here on.
+    fn observe_wake(&mut self, path: &mut Path, threads: &thread::Set, covered: &[usize]) {
+        let view = threads.active().coherence_view();
+        let mut firsts: SmallVec<[(usize, usize); 4]> = SmallVec::new();
+
+        for &ri in covered {
+            let region = &self.regions[ri];
+            let beyond = region.beyond(region.passed(&view));
+            for i in slots(beyond) {
+                if region.stores[i].before & beyond == 0 {
+                    firsts.push((ri, i));
+                }
+            }
+        }
+
+        assert!(
+            !firsts.is_empty() && firsts.len() <= MAX_ATOMIC_HISTORY,
+            "[loom internal bug] a monitor woke with {} first stores beyond its frontier",
+            firsts.len()
+        );
+
+        let k = if firsts.len() == 1 {
+            0
+        } else {
+            if path.is_traversed() {
+                let mut seed = [0; MAX_ATOMIC_HISTORY];
+                for (k, slot) in seed.iter_mut().enumerate().take(firsts.len()) {
+                    *slot = k as u8;
+                }
+                path.push_load(&seed[..firsts.len()]);
+            }
+            path.branch_load()
+        };
+
+        let (ri, i) = firsts[k];
+        let region = &mut self.regions[ri];
+        let passed = region.passed(&view);
+        region.order_all(passed, i);
+        region.stores[i].first_seen.touch(threads);
+        self.touched_by |= 1 << threads.active_id().as_usize();
     }
 
     /// The composed newest value, changing nothing: in each region the latest
@@ -5726,6 +5917,74 @@ impl Region {
         }
 
         readable
+    }
+
+    /// The stores a thread whose coherence view is `view` has passed: those it
+    /// has seen, and the genesis store, which precedes every store.
+    fn passed(&self, view: &VersionVec) -> Slots {
+        self.seen_mask(view) | self.genesis_mask()
+    }
+
+    /// The stores of `passed` with no successor in it: what a monitor armed
+    /// with that view arms on.
+    fn frontier(&self, passed: Slots) -> Slots {
+        let mut frontier = 0;
+        for i in slots(passed) {
+            if self.stores[i].after & passed == 0 {
+                frontier |= bit(i);
+            }
+        }
+        frontier
+    }
+
+    /// The stores beyond the frontier of `passed`: mo-after every store of it.
+    /// One of these is what wakes a monitor.
+    fn beyond(&self, passed: Slots) -> Slots {
+        let frontier = self.frontier(passed);
+        let mut beyond = 0;
+        for i in slots(self.all_slots() & !passed) {
+            let s = &self.stores[i];
+            if s.after & passed == 0 && s.before & frontier == frontier {
+                beyond |= bit(i);
+            }
+        }
+        beyond
+    }
+
+    /// The stores modification order has placed neither before the frontier
+    /// of `passed` nor beyond it.
+    fn unplaced(&self, passed: Slots) -> Slots {
+        let frontier = self.frontier(passed);
+        let mut unplaced = 0;
+        for i in slots(self.all_slots() & !passed) {
+            let s = &self.stores[i];
+            if s.after & passed == 0 && s.before & frontier != frontier {
+                unplaced |= bit(i);
+            }
+        }
+        unplaced
+    }
+
+    /// Place every store the order leaves unplaced against the frontier of a
+    /// monitor armed with `view`, by a two-way branch each: beyond it, where
+    /// it wakes the monitor, or before a store of it, where it never will.
+    /// Both are coherent, since the store is mo-unordered with everything the
+    /// monitor's thread has seen.
+    fn place_unplaced(&mut self, view: &VersionVec, path: &mut Path) {
+        loop {
+            let passed = self.passed(view);
+            let Some(i) = slots(self.unplaced(passed)).next() else {
+                return;
+            };
+            let frontier = self.frontier(passed);
+
+            if path.branch_spurious() {
+                self.order_all(frontier, i);
+            } else {
+                let below = frontier & !self.stores[i].before;
+                self.order(i, below.trailing_zeros() as usize);
+            }
+        }
     }
 
     /// Promote into the SC total order S, at an executing `SeqCst` fence's

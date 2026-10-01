@@ -715,6 +715,15 @@ impl<T: Object<Entry = Entry>> Ref<T> {
         });
     }
 
+    /// The operation `action` on this object, as a blocked thread's pending
+    /// one.
+    pub(super) fn operation(self, action: impl Into<Action>, location: Location) -> Operation {
+        Operation {
+            action: action.into(),
+            ..self.opaque(location)
+        }
+    }
+
     /// An operation on this object with no specialized dependencies.
     pub(super) fn opaque(self, location: Location) -> Operation {
         Operation {

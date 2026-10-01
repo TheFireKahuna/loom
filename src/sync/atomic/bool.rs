@@ -191,6 +191,15 @@ impl AtomicBool {
     }
 }
 
+impl crate::hint::sealed::Arm for AtomicBool {
+    #[track_caller]
+    fn arm(&self, timed: bool) -> crate::hint::MonitorWake {
+        self.0.monitor_wait(timed)
+    }
+}
+
+impl crate::hint::Monitored for AtomicBool {}
+
 impl std::fmt::Debug for AtomicBool {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         self.0.fmt_peek(f, "AtomicBool", std::fmt::Debug::fmt)

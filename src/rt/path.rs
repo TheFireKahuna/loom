@@ -363,7 +363,8 @@ macro_rules! assert_path_len {
             $branches.len() < $branches.capacity() || std::thread::panicking(),
             "Model exceeded maximum number of branches. This is often caused \
              by an algorithm requiring the processor to make progress, e.g. \
-             spin locks: a loop that waits for another thread must spin through \
+             spin locks: a loop that waits for another thread's store must \
+             sleep in `loom::hint::monitor_wait` or spin through \
              `loom::hint::spin_loop` (`thread::yield_now` gives it no progress).",
         );
     }};

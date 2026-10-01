@@ -223,6 +223,18 @@ where
         )
     }
 
+    /// Watch the whole cell with a hardware monitor (`hint::monitor_wait`).
+    #[track_caller]
+    pub(crate) fn monitor_wait(&self, timed: bool) -> crate::hint::MonitorWake {
+        self.state.monitor_wait(location!(), rt::FULL_MASK, timed)
+    }
+
+    /// Watch the bits under `mask` alone — a lane view's monitor.
+    #[track_caller]
+    pub(crate) fn monitor_wait_masked(&self, mask: T, timed: bool) -> crate::hint::MonitorWake {
+        self.state.monitor_wait(location!(), mask.into_u128(), timed)
+    }
+
     #[track_caller]
     pub(crate) fn store(&self, value: T, order: Ordering) {
         self.state

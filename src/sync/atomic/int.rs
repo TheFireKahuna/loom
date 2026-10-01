@@ -117,6 +117,15 @@ macro_rules! atomic_int {
             }
         }
 
+        impl crate::hint::sealed::Arm for $name {
+            #[track_caller]
+            fn arm(&self, timed: bool) -> crate::hint::MonitorWake {
+                self.0.monitor_wait(timed)
+            }
+        }
+
+        impl crate::hint::Monitored for $name {}
+
         impl $name {
             /// Get access to a mutable reference to the inner value.
             #[track_caller]
