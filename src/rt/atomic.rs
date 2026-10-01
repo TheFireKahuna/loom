@@ -5229,7 +5229,18 @@ impl Region {
             write_mask,
             creator: threads.active_id().as_usize(),
         });
-        self.preserved_cnt += 1;
+        self.preserved_cnt = self.preserved_cnt.saturating_add(1);
+    }
+
+    /// Count a store just pushed. `cnt` is the store's identity, so it never
+    /// wraps: a wrapped id would alias an older store. `stores_by` is bounded
+    /// by `cnt`.
+    fn count_store(&mut self, by: thread::Id) {
+        match self.cnt.checked_add(1) {
+            Some(next) => self.cnt = next,
+            None => region_stores_exhausted(),
+        }
+        self.stores_by[by.as_usize()] += 1;
     }
 
     /// Plant the genesis store of a `const`-constructed cell: an
@@ -5350,8 +5361,7 @@ impl Region {
             self.stores[r].rmw_write = Some(slot as u8);
             self.paired |= bit(r) | bit(slot);
         }
-        self.cnt += 1;
-        self.stores_by[threads.active_id().as_usize()] += 1;
+        self.count_store(threads.active_id());
 
         self.order_all(preds, slot);
 
@@ -5420,8 +5430,7 @@ impl Region {
             hb: threads.active().causality,
             acq_fence: threads.active().acq_fence_version,
         });
-        self.cnt += 1;
-        self.stores_by[threads.active_id().as_usize()] += 1;
+        self.count_store(threads.active_id());
 
         self.order_all(bit(slot) - 1, slot);
     }
@@ -6011,4 +6020,14 @@ fn slots(mut set: Slots) -> impl Iterator<Item = usize> {
         set &= set - 1;
         Some(slot)
     })
+}
+
+#[cold]
+#[inline(never)]
+fn region_stores_exhausted() -> ! {
+    panic!(
+        "more than {} stores to one atomic location in one execution; loom's \
+         store identities are u16 and cannot order more",
+        u16::MAX
+    )
 }

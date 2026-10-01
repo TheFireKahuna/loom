@@ -170,8 +170,8 @@ impl Execution {
 
         // Bump causality in order to ensure CausalCell accurately detects
         // incorrect access when first action.
-        new.causality[thread_id] += 1;
-        active.causality[active_id] += 1;
+        new.causality.inc(thread_id);
+        active.causality.inc(active_id);
 
         thread_id
     }
@@ -460,7 +460,7 @@ impl Execution {
                 });
             }
 
-            threads.active_mut().dpor_vv[th_id] += 1;
+            threads.active_mut().dpor_vv.inc(th_id);
 
             self.objects
                 .set_last_access(operation, th_id, path_id, &threads.active().dpor_vv);
