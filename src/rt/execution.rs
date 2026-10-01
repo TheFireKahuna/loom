@@ -404,6 +404,7 @@ impl Execution {
         let path_id = self.path.pos();
 
         let asleep = if self.sleep_sets { self.sleep.mask() } else { 0 };
+        let displaced_blocked = self.threads.active().is_blocked_timed();
 
         let (next, covered) = self.path.branch_thread(self.id, {
             self.threads.iter().map(|(i, th)| {
@@ -425,7 +426,7 @@ impl Execution {
                     Thread::Skip
                 }
             })
-        }, asleep);
+        }, asleep, displaced_blocked);
 
         // With nothing runnable, which timeout fires first is a choice no
         // race reverses: firing one makes its thread runnable, which disables

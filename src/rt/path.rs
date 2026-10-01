@@ -697,11 +697,16 @@ impl Path {
     /// owes this step (`rt::dpor`), dropping children `asleep` and, where a
     /// child's thread cannot run here, opening every runnable thread that is
     /// not asleep instead; with no tree it takes the scheduler's seed.
+    ///
+    /// `displaced_blocked`: the thread whose step ran into the branch ended it
+    /// blocked, so a seed of that thread is its timeout firing, not a
+    /// continuation of a runnable thread.
     pub(super) fn branch_thread(
         &mut self,
         execution_id: execution::Id,
         seed: impl ExactSizeIterator<Item = Thread>,
         asleep: u16,
+        displaced_blocked: bool,
     ) -> (Option<thread::Id>, u16) {
         // The path outlives every snapshot restore: it grows outside the world.
         let _outside = world::leave();
@@ -774,11 +779,13 @@ impl Path {
 
             let mut yield_seam = false;
 
-            if initial_active != displaced {
+            if initial_active != displaced || displaced_blocked {
                 // The seed switched threads, so the displaced thread stopped
                 // being runnable — every alternative here is free
                 // (Definition 2.5: no enabled thread is being preempted; at
-                // the root the seed's pick has yet to run a transition).
+                // the root the seed's pick has yet to run a transition). So
+                // is a seed that resumes a blocked displaced thread through
+                // its own timeout: that thread could not run on.
                 // Unless it *spun*: that switch is still free, since a spin
                 // waits for another thread, but the seam is flagged so a spent bound
                 // keeps refusing marks here (see `Schedule::yield_seam`).

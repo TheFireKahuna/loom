@@ -400,3 +400,51 @@ fn unbounded_walk_fires_either_of_two_pending_timeouts() {
         );
     }
 }
+
+// A thread blocked in a timed wait that resumes through its own timeout,
+// because nothing else can run, is not a running thread continuing:
+// scheduling another thread's timeout there is free. Here main's second
+// wait has blocked while the peer sleeps; the peer's sleep must end first
+// for the peer to take the lock between main's two timeouts, which bound
+// 0 allows.
+#[test]
+fn another_timeout_at_a_blocked_threads_resume_costs_no_preemption() {
+    use std::collections::BTreeSet;
+
+    let seen: Arc<std::sync::Mutex<BTreeSet<(usize, usize, usize, usize)>>> = Default::default();
+    let out = seen.clone();
+    let mut builder = loom::model::Builder::new();
+    builder.preemption_bound = Some(0);
+    builder.threads = 1;
+    builder.check(move || {
+        let s = loom::sync::Arc::new((Mutex::new(0usize), Condvar::new()));
+        let s1 = s.clone();
+        let peer = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(1));
+            let mut g = s1.0.lock().unwrap();
+            *g += 1;
+            *g
+        });
+        let mut reads = [0; 2];
+        for read in &mut reads {
+            let g = s.0.lock().unwrap();
+            let (g, r) = s.1.wait_timeout(g, Duration::from_millis(1)).unwrap();
+            if !r.timed_out() {
+                return;
+            }
+            *read = *g;
+        }
+        let mine = {
+            let mut g = s.0.lock().unwrap();
+            *g += 1;
+            *g
+        };
+        let theirs = peer.join().unwrap();
+        out.lock().unwrap().insert((reads[0], reads[1], mine, theirs));
+    });
+    assert!(
+        seen.lock().unwrap().contains(&(0, 1, 2, 1)),
+        "the peer never locked between main's two timeouts: {:?}",
+        seen.lock().unwrap()
+    );
+}
