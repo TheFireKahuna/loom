@@ -165,12 +165,13 @@ impl Once {
     }
 
     /// Wait for the state to move on from `seen`, then re-read it. If it
-    /// already had — `seen` was stale — time passes for this thread instead,
-    /// as in a spin, so the re-read reaches the newer state.
+    /// already had — `seen` was stale — the newer state lies beyond what this
+    /// thread has seen of the word, so the monitor wait returns at once,
+    /// having observed it, and the re-read reaches it.
     #[track_caller]
     fn block_on(&self, seen: u8) -> u8 {
         if !self.waiters.get().wait(seen, location!()) {
-            rt::spin_loop();
+            crate::hint::monitor_wait(&self.state);
         }
         self.state.load(Ordering::Acquire)
     }
@@ -179,5 +180,30 @@ impl Once {
 impl fmt::Debug for Once {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Once").finish_non_exhaustive()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Once;
+    use crate::rt;
+    use crate::sync::Arc;
+    use crate::thread;
+
+    /// A waiter whose read of the state was already stale when it reached the
+    /// wait queue still returns once the state completes, and spends no
+    /// forced-progress wait doing so: no store it has seen elsewhere is made
+    /// unreadable to it.
+    #[test]
+    fn a_stale_wait_is_not_a_spin() {
+        crate::model(|| {
+            let once = Arc::new(Once::new());
+            let o2 = once.clone();
+            let th = thread::spawn(move || o2.call_once(|| {}));
+            once.wait();
+            let yielded = rt::execution(|execution| execution.threads.active().last_yield);
+            assert_eq!(yielded, None, "Once::wait entered the forced-progress model");
+            th.join().unwrap();
+        });
     }
 }
