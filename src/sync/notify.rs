@@ -33,7 +33,8 @@ impl Notify {
         self.object.notify(location!());
     }
 
-    /// Wait for a notification.
+    /// Wait for a notification. May return spuriously without one, as
+    /// `park` may, so a caller waits in a loop on its own condition.
     ///
     /// # Panics
     /// Panics if multiple threads try to wait on the same `Notify` simultaneously.

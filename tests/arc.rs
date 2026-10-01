@@ -108,10 +108,14 @@ fn try_unwrap_multithreaded() {
         let num = Arc::new(0usize);
         let num2 = Arc::clone(&num);
         let can_drop = Arc::new(Notify::new());
+        let allowed = Arc::new(AtomicBool::new(false));
         let thread = {
-            let can_drop = can_drop.clone();
+            let (can_drop, allowed) = (can_drop.clone(), allowed.clone());
             thread::spawn(move || {
-                can_drop.wait();
+                // `Notify::wait` may return spuriously, as `park` does.
+                while !allowed.load(Acquire) {
+                    can_drop.wait();
+                }
                 drop(num2);
             })
         };
@@ -120,6 +124,7 @@ fn try_unwrap_multithreaded() {
         let num = Arc::try_unwrap(num).unwrap_err();
 
         // Allow the thread to proceed.
+        allowed.store(true, Release);
         can_drop.notify();
 
         // After the thread drops the other clone, the arc should be
