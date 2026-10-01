@@ -197,7 +197,7 @@ fn the_deadlock_report_names_the_lane() {
 /// stored before the flag without a release is not acquired through it.
 #[test]
 fn the_wake_carries_no_synchronization() {
-    let seen: Arc<StdMutex<BTreeSet<u32>>> = Arc::default();
+    let seen: std::sync::Arc<StdMutex<BTreeSet<u32>>> = Default::default();
     let out = seen.clone();
 
     loom::model(move || {
