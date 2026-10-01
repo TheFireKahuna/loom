@@ -92,41 +92,48 @@ fn spurious_poll() {
 }
 
 /// A spurious wake of `block_on` is one step of the waiting thread, not a
-/// wait for the others' progress: the re-poll it causes can still run before
-/// the peer's store, or read past it. A second poll that reads 0 had no
-/// wake behind it (the peer's wake would have carried its store), and it is
-/// reachable only if the spurious return leaves the peer unscheduled and the
-/// first poll's read readable.
+/// wait for the others' progress that makes stale values unreadable: a
+/// re-poll with no wake behind it can read again the value the first poll
+/// read, even after the first poll saw, through another cell, that the
+/// peer's store had landed. A second poll that reads 0 had no wake behind it
+/// (the peer's wake carries its store).
 #[test]
 fn a_spurious_wake_is_a_step_not_a_spin() {
-    use loom::sync::atomic::Ordering::{Acquire, Release};
     use loom::sync::Mutex;
     use std::task::Waker;
 
-    let unwoken_repoll = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let reached = unwoken_repoll.clone();
+    let stale_repoll = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let reached = stale_repoll.clone();
 
     loom::model(move || {
         let x = Arc::new(AtomicUsize::new(0));
+        let landed = Arc::new(AtomicUsize::new(0));
         let slot = Arc::new(Mutex::new(None::<Waker>));
-        let (x2, slot2) = (x.clone(), slot.clone());
+        let (x2, landed2, slot2) = (x.clone(), landed.clone(), slot.clone());
 
         let th = thread::spawn(move || {
-            x2.store(1, Release);
+            x2.store(1, Relaxed);
+            landed2.store(1, Relaxed);
             if let Some(waker) = slot2.lock().unwrap().take() {
                 waker.wake();
             }
         });
 
         let mut polls = 0;
+        let mut saw_landed = false;
         block_on(poll_fn(|cx| {
             *slot.lock().unwrap() = Some(cx.waker().clone());
             polls += 1;
-            if x.load(Acquire) == 1 {
+            if polls == 1 {
+                saw_landed = landed.load(Relaxed) == 1;
+            }
+            if x.load(Relaxed) == 1 {
                 return Poll::Ready(());
             }
             if polls == 2 {
-                unwoken_repoll.store(true, Relaxed);
+                if saw_landed {
+                    stale_repoll.store(true, Relaxed);
+                }
                 return Poll::Ready(());
             }
             Poll::Pending
@@ -134,5 +141,8 @@ fn a_spurious_wake_is_a_step_not_a_spin() {
         th.join().unwrap();
     });
 
-    assert!(reached.load(Relaxed), "a spurious re-poll never read the old value");
+    assert!(
+        reached.load(Relaxed),
+        "a spurious re-poll never read the value its first poll read after the store landed"
+    );
 }
