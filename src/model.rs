@@ -269,7 +269,8 @@ pub struct Builder {
     /// [`alloc::Model`](crate::alloc::Model) as its global allocator, whose
     /// contract the model must keep.
     ///
-    /// Defaults to the `LOOM_SNAPSHOT` environment variable; unset, off.
+    /// Defaults to the `LOOM_SNAPSHOT` environment variable, else 64;
+    /// `LOOM_SNAPSHOT=0` replays every execution from the start.
     pub snapshot: Option<usize>,
 }
 
@@ -351,10 +352,12 @@ impl Builder {
                 .unwrap_or(true),
             stats: env::var_os("LOOM_STATS").is_some(),
             check_committed_leaks: false,
-            snapshot: env::var("LOOM_SNAPSHOT")
-                .map(|v| v.parse().expect("invalid value for `LOOM_SNAPSHOT`"))
-                .ok()
-                .filter(|&spacing| spacing > 0),
+            snapshot: Some(
+                env::var("LOOM_SNAPSHOT")
+                    .map(|v| v.parse().expect("invalid value for `LOOM_SNAPSHOT`"))
+                    .unwrap_or(64),
+            )
+            .filter(|&spacing| spacing > 0),
         }
     }
 
@@ -499,9 +502,9 @@ impl Builder {
         }
     }
 
-    /// The per-thread state executions run on: snapshotting when
-    /// `LOOM_SNAPSHOT` asks for it and the binary installs
-    /// [`crate::alloc::Model`], replaying from the start otherwise.
+    /// The per-thread state executions run on: snapshotting when `snapshot`
+    /// is set and the binary installs [`crate::alloc::Model`], replaying from
+    /// the start otherwise.
     fn new_engine(&self) -> Engine {
         // A tracing subscriber's spans count references outside the world,
         // which a restore would replay.
