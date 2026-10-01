@@ -359,7 +359,19 @@ impl Store {
     /// shadow a peer's, silently dropping the DPOR reorder owed to that
     /// conflict); the other object types, whose operations are all mutually
     /// dependent, keep a single last-access slot and yield it here.
-    pub(super) fn for_each_dependent_access(&self, operation: Operation, mut f: impl FnMut(&Access)) {
+    pub(super) fn for_each_dependent_access(&self, operation: Operation, f: impl FnMut(&Access)) {
+        self.for_each_access(operation, false, f);
+    }
+
+    /// Calls `f` with every access the operation races for the unbounded
+    /// search's reversals (`rt::dpor`): its dependent accesses, except that a
+    /// blocking lock acquire races the acquire before it, not the unlock that
+    /// admits it (`mutex::State::last_acquire`).
+    pub(super) fn for_each_racing_access(&self, operation: Operation, f: impl FnMut(&Access)) {
+        self.for_each_access(operation, true, f);
+    }
+
+    fn for_each_access(&self, operation: Operation, racing: bool, mut f: impl FnMut(&Access)) {
         let virt = &*self.virtual_accesses;
 
         if operation.obj == Ref::SC_ORDER {
@@ -393,7 +405,11 @@ impl Store {
             }
             Entry::Arc(entry) => entry.for_each_dependent_access(operation.action.into(), f),
             Entry::Mutex(entry) => {
-                if let Some(access) = entry.last_dependent_access() {
+                let access = match operation.action {
+                    Action::Mutex(action) if racing => entry.last_racing_access(action),
+                    _ => entry.last_dependent_access(),
+                };
+                if let Some(access) = access {
                     f(access);
                 }
             }
@@ -408,7 +424,11 @@ impl Store {
                 }
             }
             Entry::RwLock(entry) => {
-                if let Some(access) = entry.last_dependent_access() {
+                let access = match operation.action {
+                    Action::RwLock(action) if racing => entry.last_racing_access(action),
+                    _ => entry.last_dependent_access(),
+                };
+                if let Some(access) = access {
                     f(access);
                 }
             }
@@ -462,10 +482,16 @@ impl Store {
                 let action = operation.action.into();
                 entry.set_last_access(action, operation.sc, thread_id, path_id, dpor_vv)
             }
-            Entry::Mutex(entry) => entry.set_last_access(path_id, dpor_vv),
+            Entry::Mutex(entry) => match operation.action {
+                Action::Mutex(action) => entry.set_last_access(action, path_id, dpor_vv),
+                _ => unreachable!("mutex touched by {:?}", operation.action),
+            },
             Entry::Condvar(entry) => entry.set_last_access(path_id, dpor_vv),
             Entry::Notify(entry) => entry.set_last_access(path_id, dpor_vv),
-            Entry::RwLock(entry) => entry.set_last_access(path_id, dpor_vv),
+            Entry::RwLock(entry) => match operation.action {
+                Action::RwLock(action) => entry.set_last_access(action, path_id, dpor_vv),
+                _ => unreachable!("rwlock touched by {:?}", operation.action),
+            },
             Entry::Futex(entry) => entry.set_last_access(path_id, dpor_vv),
             Entry::Channel(entry) => {
                 entry.set_last_access(operation.action.into(), path_id, dpor_vv)

@@ -160,3 +160,39 @@ fn a_blocked_acquire_races_the_unlock_that_admits_it() {
         );
     }
 }
+
+// Without a bound, a blocking acquire races the acquire before it, past the
+// unlock between: running it before that unlock is impossible, before that
+// acquire is the other order of the critical sections.
+#[test]
+fn unbounded_search_runs_both_orders_of_two_critical_sections() {
+    use loom::sync::Arc;
+    use std::collections::BTreeSet;
+
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(BTreeSet::new()));
+    let seen_ = seen.clone();
+    let mut b = loom::model::Builder::new();
+    b.preemption_bound = None;
+    b.threads = 1;
+    b.check(move || {
+        let m = Arc::new(Mutex::new(0usize));
+        let m2 = m.clone();
+        let t = thread::spawn(move || {
+            let mut g = m2.lock().unwrap();
+            *g += 1;
+            *g
+        });
+        let main = {
+            let mut g = m.lock().unwrap();
+            *g += 2;
+            *g
+        };
+        let peer = t.join().unwrap();
+        seen_.lock().unwrap().insert((main, peer));
+    });
+    let seen = seen.lock().unwrap();
+    assert!(
+        seen.contains(&(2, 3)) && seen.contains(&(3, 1)),
+        "both orders of the critical sections: {seen:?}"
+    );
+}

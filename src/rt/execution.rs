@@ -497,13 +497,18 @@ impl Execution {
                 let dpor_vv = &mut active.dpor_vv;
                 let steps = &mut self.steps;
                 self.objects.for_each_dependent_access(operation, |access| {
-                    // Concurrent and dependent: a race, unless another of
-                    // this step's races is ordered after it (`rt::dpor`).
-                    if !bounded && !access.happens_before(&prior) {
-                        steps.race(access.path_id(), access.version());
-                    }
                     dpor_vv.join(access.version());
                 });
+
+                // Concurrent and dependent: a race, unless another of this
+                // step's races is ordered after it (`rt::dpor`).
+                if !bounded {
+                    self.objects.for_each_racing_access(operation, |access| {
+                        if !access.happens_before(&prior) {
+                            steps.race(access.path_id(), access.version());
+                        }
+                    });
+                }
             }
 
             threads.active_mut().dpor_vv.inc(th_id);

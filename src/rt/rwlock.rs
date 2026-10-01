@@ -52,6 +52,12 @@ pub(super) struct State {
     /// the unlock, to a thread that then blocks there, at no preemption cost.
     last_access: Option<Access>,
 
+    /// The last acquire or attempt: what a blocking acquire races for the
+    /// unbounded search's reversals (`rt::dpor`). The unlock between admits
+    /// the acquire and no execution runs the acquire before it, so the race
+    /// to reverse is with the acquire that unlock ended.
+    last_acquire: Option<Access>,
+
     /// Causality transfers between threads
     synchronize: Synchronize,
 }
@@ -63,6 +69,7 @@ impl RwLock {
             let state = execution.objects.insert(State {
                 lock: None,
                 last_access: None,
+                last_acquire: None,
                 synchronize: Synchronize::new(),
             });
 
@@ -299,7 +306,18 @@ impl State {
         self.last_access.as_ref()
     }
 
-    pub(crate) fn set_last_access(&mut self, path_id: usize, version: &VersionVec) {
+    /// The access `action` races (`last_acquire`).
+    pub(crate) fn last_racing_access(&self, action: Action) -> Option<&Access> {
+        match action {
+            Action::Read | Action::Write => self.last_acquire.as_ref(),
+            _ => self.last_access.as_ref(),
+        }
+    }
+
+    pub(crate) fn set_last_access(&mut self, action: Action, path_id: usize, version: &VersionVec) {
+        if action != Action::Unlock {
+            Access::set_or_create(&mut self.last_acquire, path_id, version);
+        }
         Access::set_or_create(&mut self.last_access, path_id, version)
     }
 }
