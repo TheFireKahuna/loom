@@ -298,11 +298,13 @@ where
 /// So a poll loop that yields through `yield_now` is given no progress:
 /// wherever the search spends no preemption on the peer it waits for, it
 /// polls until [`Builder::max_branches`] and the model fails. A loop that
-/// waits for another thread must say so with [`hint::spin_loop`], which
-/// loom models as exactly that wait.
+/// waits for another thread's store to one location sleeps in
+/// [`hint::monitor_wait`] until it lands; any other wait for another thread
+/// says so with [`hint::spin_loop`]. Loom models each as exactly that wait.
 ///
 /// [`Builder::preemption_bound`]: crate::model::Builder::preemption_bound
 /// [`Builder::max_branches`]: crate::model::Builder::max_branches
+/// [`hint::monitor_wait`]: crate::hint::monitor_wait
 /// [`hint::spin_loop`]: crate::hint::spin_loop
 pub fn yield_now() {
     branch(|execution| {
