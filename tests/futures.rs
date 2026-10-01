@@ -90,3 +90,49 @@ fn spurious_poll() {
 
     assert!(actual.load(Acquire));
 }
+
+/// A spurious wake of `block_on` is one step of the waiting thread, not a
+/// wait for the others' progress: the re-poll it causes can still run before
+/// the peer's store, or read past it. A second poll that reads 0 had no
+/// wake behind it (the peer's wake would have carried its store), and it is
+/// reachable only if the spurious return leaves the peer unscheduled and the
+/// first poll's read readable.
+#[test]
+fn a_spurious_wake_is_a_step_not_a_spin() {
+    use loom::sync::atomic::Ordering::{Acquire, Release};
+    use loom::sync::Mutex;
+    use std::task::Waker;
+
+    let unwoken_repoll = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let reached = unwoken_repoll.clone();
+
+    loom::model(move || {
+        let x = Arc::new(AtomicUsize::new(0));
+        let slot = Arc::new(Mutex::new(None::<Waker>));
+        let (x2, slot2) = (x.clone(), slot.clone());
+
+        let th = thread::spawn(move || {
+            x2.store(1, Release);
+            if let Some(waker) = slot2.lock().unwrap().take() {
+                waker.wake();
+            }
+        });
+
+        let mut polls = 0;
+        block_on(poll_fn(|cx| {
+            *slot.lock().unwrap() = Some(cx.waker().clone());
+            polls += 1;
+            if x.load(Acquire) == 1 {
+                return Poll::Ready(());
+            }
+            if polls == 2 {
+                unwoken_repoll.store(true, Relaxed);
+                return Poll::Ready(());
+            }
+            Poll::Pending
+        }));
+        th.join().unwrap();
+    });
+
+    assert!(reached.load(Relaxed), "a spurious re-poll never read the old value");
+}

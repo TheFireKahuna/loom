@@ -115,8 +115,10 @@ impl Notify {
             (state.notified, spurious)
         });
 
+        // A spurious return is the waiter's own step on this object, ordered
+        // against `notify` like any wait; the waiter's loop then waits again.
         if spurious {
-            rt::spin_loop();
+            self.state.branch_opaque(location);
             return;
         }
 
