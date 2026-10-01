@@ -165,3 +165,46 @@ fn a_sleep_resumed_by_its_timeout_frees_the_switch() {
         seen.lock().unwrap()
     );
 }
+
+// With both threads asleep, which sleep ends first is a choice: ending one
+// makes its thread runnable, so the other's can no longer end, and no race
+// reverses that. The peer's second sleep has to end first, while main still
+// sleeps, for main to read the peer's last store after reading its first;
+// both orders are free switches, so bound 2 reaches it as bound 6 does, and
+// the unbounded walk reaches everything bound 6 does.
+#[test]
+fn either_of_two_pending_sleeps_ends_first() {
+    use std::collections::BTreeSet;
+
+    fn outcomes(bound: Option<usize>) -> BTreeSet<(usize, usize)> {
+        let seen: std::sync::Arc<std::sync::Mutex<BTreeSet<(usize, usize)>>> = Default::default();
+        let out = seen.clone();
+        let mut builder = loom::model::Builder::new();
+        builder.preemption_bound = bound;
+        builder.threads = 1;
+        builder.check(move || {
+            let cell = Arc::new(loom::sync::atomic::AtomicUsize::new(0));
+            let c = cell.clone();
+            let peer = thread::spawn(move || {
+                thread::sleep(Duration::from_millis(1));
+                c.store(12, Relaxed);
+                thread::sleep(Duration::from_millis(1));
+                c.store(11, Relaxed);
+            });
+            let first = cell.load(Relaxed);
+            thread::sleep(Duration::from_millis(1));
+            let second = cell.load(Relaxed);
+            peer.join().unwrap();
+            out.lock().unwrap().insert((first, second));
+        });
+        let seen = seen.lock().unwrap().clone();
+        seen
+    }
+
+    let reference = outcomes(Some(6));
+    assert!(reference.contains(&(12, 11)), "bound 6: {reference:?}");
+    for bound in [Some(2), None] {
+        let reached = outcomes(bound);
+        assert_eq!(reached, reference, "bound {bound:?}");
+    }
+}

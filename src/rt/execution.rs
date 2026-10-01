@@ -427,6 +427,14 @@ impl Execution {
             })
         }, asleep);
 
+        // With nothing runnable, which timeout fires first is a choice no
+        // race reverses: firing one makes its thread runnable, which disables
+        // every other firing, and a disabled firing never runs to race. Both
+        // searches open every firing here; the switch is free under a bound.
+        if timed && !others_runnable {
+            self.path.open_all(self.id, path_id);
+        }
+
         if self.sleep_sets && !timed {
             self.sleep.cover(covered);
 

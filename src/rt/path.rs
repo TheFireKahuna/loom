@@ -999,6 +999,44 @@ impl Path {
         }
     }
 
+    /// Open every schedulable alternative at the schedule branch at `index`,
+    /// when it is explored: the rule for a choice whose alternatives disable
+    /// one another (`Execution::schedule`). Under a bound each goes through
+    /// `mark`, whose gate decides what the bound allows.
+    pub(super) fn open_all(&mut self, execution_id: execution::Id, index: usize) {
+        let Some(schedule_ref) = object::Ref::from_usize(index).downcast::<Schedule>(&self.branches) else {
+            return;
+        };
+
+        if !schedule_ref.get(&self.branches).exploring {
+            return;
+        }
+
+        if self.preemption_bound.is_some() {
+            // A frozen branch's private copy no longer shows its alternatives.
+            let candidates = match self.frozen.get(index) {
+                Some(frozen) => frozen.enabled & frozen.markable,
+                None => schedule_ref.get(&self.branches).mask_of(Thread::Skip),
+            };
+            for q in 0..MAX_THREADS {
+                if candidates & (1 << q) != 0 {
+                    self.mark(schedule_ref, thread::Id::new(execution_id, q), false);
+                }
+            }
+            return;
+        }
+
+        if let Some(frozen) = self.frozen.get(index) {
+            frozen.open(frozen.enabled & frozen.markable, false);
+            return;
+        }
+
+        let schedule = schedule_ref.get_mut(&mut self.branches);
+        for q in 0..MAX_THREADS {
+            schedule.open_leaf(q);
+        }
+    }
+
     /// Classic DPOR's backtrack rule for the unbounded search, where the
     /// branch at `point` explores nothing: open `thread` at the nearest
     /// exploring schedule branch at or before it, or every candidate there

@@ -351,3 +351,52 @@ fn timeout_after_a_free_switch_sees_the_store() {
         seen.lock().unwrap()
     );
 }
+
+// With every thread in a timed wait, which timeout fires first is a choice:
+// firing one makes its thread runnable, so the others' timeouts can no longer
+// fire, and no race reverses that. Here the waiter's timeout must fire while
+// main still sits in `park_timeout`, its flag unset. The unbounded walk has to
+// reach every outcome the bounded one does, whatever ends the waiter's first
+// wait.
+#[test]
+fn unbounded_walk_fires_either_of_two_pending_timeouts() {
+    use std::collections::BTreeSet;
+
+    fn outcomes(bound: Option<usize>, first_sleeps: bool) -> BTreeSet<(bool, bool)> {
+        let seen: Arc<std::sync::Mutex<BTreeSet<(bool, bool)>>> = Default::default();
+        let out = seen.clone();
+        let mut builder = loom::model::Builder::new();
+        builder.preemption_bound = bound;
+        builder.threads = 1;
+        builder.check(move || {
+            let s = loom::sync::Arc::new((Mutex::new(false), Condvar::new()));
+            let s1 = s.clone();
+            let waiter = thread::spawn(move || {
+                if first_sleeps {
+                    thread::sleep(Duration::from_millis(1));
+                } else {
+                    thread::park_timeout(Duration::from_millis(1));
+                }
+                let g = s1.0.lock().unwrap();
+                let (g, r) = s1.1.wait_timeout(g, Duration::from_millis(1)).unwrap();
+                (*g, r.timed_out())
+            });
+            thread::park_timeout(Duration::from_millis(1));
+            *s.0.lock().unwrap() = true;
+            s.1.notify_one();
+            let r = waiter.join().unwrap();
+            out.lock().unwrap().insert(r);
+        });
+        let seen = seen.lock().unwrap().clone();
+        seen
+    }
+
+    for first_sleeps in [true, false] {
+        let bounded = outcomes(Some(4), first_sleeps);
+        let unbounded = outcomes(None, first_sleeps);
+        assert!(
+            bounded.contains(&(false, true)) && bounded.is_subset(&unbounded),
+            "first_sleeps={first_sleeps}: bounded {bounded:?}, unbounded {unbounded:?}"
+        );
+    }
+}
