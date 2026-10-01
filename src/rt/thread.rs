@@ -9,6 +9,12 @@ use super::Location;
 pub(crate) struct Thread {
     pub id: Id,
 
+    /// An order-free digest of what the thread observed — the store each read
+    /// took, the release each lock acquisition followed, each condvar wake
+    /// and fired timeout — under `LOOM_SNAPSHOT_CHECK`, which compares it
+    /// between an execution resumed from a snapshot and its replay.
+    pub(crate) observed: std::cell::Cell<u64>,
+
     /// If the thread is runnable, blocked, or terminated.
     pub state: State,
 
@@ -230,6 +236,7 @@ impl Thread {
             woken: false,
             dpor_vv: VersionVec::new(),
             dpor_prior: None,
+            observed: std::cell::Cell::new(0),
             last_yield: None,
             yield_count: 0,
             symmetry: None,
@@ -398,6 +405,25 @@ impl fmt::Debug for Thread {
 }
 
 impl Set {
+    /// Fold an observation into the active thread's digest, keyed by the
+    /// thread and its operation index.
+    pub(crate) fn observe(&self, key: u64) {
+        if !super::snapshot::check() {
+            return;
+        }
+        if let Some(i) = self.active {
+            let t = &self.threads[i];
+            let own = t.dpor_vv[Id::new(self.execution_id, i)] as u64;
+            t.observed
+                .set(t.observed.get().wrapping_add(super::snapshot::mix(own | (i as u64) << 20, key)));
+        }
+    }
+
+    /// The execution's observations so far.
+    pub(crate) fn observed(&self) -> u64 {
+        self.threads.iter().fold(0u64, |h, t| h.wrapping_add(t.observed.get()))
+    }
+
     /// Create an empty thread set.
     ///
     /// The set may contain up to `max_threads` threads.

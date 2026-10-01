@@ -5,7 +5,7 @@ use crate::rt::Execution;
 
 use generator::{self, Generator, Gn};
 use scoped_tls::scoped_thread_local;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 use std::panic::{self, AssertUnwindSafe};
 
@@ -14,6 +14,16 @@ pub(crate) struct Scheduler {
 
     /// Stack size, in bytes, of a coroutine whose spawn names none.
     stack_size: usize,
+
+    /// The execution being driven, reachable from its coroutines.
+    run: Run,
+
+    /// Coroutines armed in the current execution.
+    used: usize,
+
+    /// A coroutine was rebuilt since this was last cleared: a snapshot taken
+    /// before then names a stack that no longer exists.
+    rebuilt: bool,
 
     /// Coroutines pooled across iterations, indexed by loom thread id.
     ///
@@ -32,17 +42,28 @@ struct PooledThread {
     /// requesting a different size cannot reuse this stack; the coroutine is
     /// retired and rebuilt.
     stack_size: usize,
+
+    /// Where the coroutine's stack pointer was when it last yielded, and the
+    /// end of its stack's mapping: the live part a snapshot copies. The
+    /// mapping runs past the stack's top, because the generator keeps the
+    /// coroutine's context and closure there.
+    sp: usize,
+    end: usize,
 }
 
 type Thread = Generator<'static, Option<Box<dyn FnOnce()>>, ()>;
 
 scoped_thread_local! {
-    static STATE: Run<'_>
+    static STATE: Run
 }
 
+/// Stack pointer and stack top of the coroutine that yielded last.
+#[thread_local]
+static YIELDED: Cell<(usize, usize)> = Cell::new((0, 0));
+
 /// One execution's scheduler state, reachable from its coroutines.
-struct Run<'a> {
-    state: RefCell<State<'a>>,
+struct Run {
+    state: RefCell<State>,
 
     /// The most recent panic raised on one of this run's coroutines, recorded
     /// by the panic hook. Outside `state`: a panic raised inside the runtime
@@ -52,6 +73,9 @@ struct Run<'a> {
     /// Why the execution failed, once it has. The driver stops scheduling at
     /// the first resume that returns with this set.
     failure: RefCell<Option<Failure>>,
+
+    /// The coroutine that yielded asks the driver for a snapshot.
+    snapshot: Cell<bool>,
 }
 
 /// What the panic hook saw of a panic on a model thread: all of it that
@@ -65,9 +89,29 @@ struct QueuedSpawn {
     stack_size: Option<usize>,
 }
 
-struct State<'a> {
-    execution: &'a mut Execution,
-    queued_spawn: &'a mut VecDeque<QueuedSpawn>,
+struct State {
+    /// The execution being driven; set by `start` for the whole execution.
+    execution: *mut Execution,
+    queued_spawn: VecDeque<QueuedSpawn>,
+}
+
+impl State {
+    fn execution(&mut self) -> &mut Execution {
+        // SAFETY: `start` points this at an execution that outlives every
+        // drive of it, and the `RefCell` around `State` makes this the only
+        // reference made through it at a time.
+        unsafe { &mut *self.execution }
+    }
+}
+
+/// How one stretch of driving an execution ended.
+pub(crate) enum Drive {
+    /// The execution finished, or failed.
+    Done(Result<(), Failure>),
+
+    /// A model thread asked for a snapshot; every coroutine is suspended, and
+    /// `drive` continues the execution.
+    Snapshot,
 }
 
 impl Scheduler {
@@ -76,8 +120,56 @@ impl Scheduler {
         Scheduler {
             max_threads: capacity,
             stack_size,
+            run: Run {
+                state: RefCell::new(State {
+                    execution: std::ptr::null_mut(),
+                    queued_spawn: VecDeque::new(),
+                }),
+                panic: RefCell::new(None),
+                failure: RefCell::new(None),
+                snapshot: Cell::new(false),
+            },
+            used: 0,
+            rebuilt: false,
             threads: Vec::with_capacity(capacity),
         }
+    }
+
+    /// A scheduler whose coroutines are all built up front, so the pool never
+    /// grows under a snapshot: a restore would forget a stack built after it.
+    pub(crate) fn new_pooled(capacity: usize, stack_size: usize) -> Scheduler {
+        let mut scheduler = Scheduler::new(capacity, stack_size);
+        for _ in 0..capacity {
+            let gen = park_thread(stack_size);
+            let (sp, top) = YIELDED.get();
+            scheduler.threads.push(PooledThread {
+                gen,
+                stack_size,
+                sp,
+                end: mapping_end(top),
+            });
+        }
+        scheduler
+    }
+
+    /// Run one coroutine to completion, so whatever the generator crate
+    /// builds lazily on first use exists before a world does.
+    pub(crate) fn warm_up() {
+        let mut gen = park_thread(DEFAULT_WARM_STACK);
+        retire(&mut gen);
+    }
+
+    /// Whether a coroutine was rebuilt since the last call.
+    pub(crate) fn take_rebuilt(&mut self) -> bool {
+        std::mem::take(&mut self.rebuilt)
+    }
+
+    /// The live stack range of every pooled coroutine, as `(low, high)`.
+    pub(crate) fn stacks(&self) -> impl Iterator<Item = (usize, usize)> + '_ {
+        self.threads
+            .iter()
+            .filter(|th| th.end != 0)
+            .map(|th| (th.sp.saturating_sub(STACK_MARGIN), th.end))
     }
 
     /// Access the execution
@@ -85,7 +177,7 @@ impl Scheduler {
     where
         F: FnOnce(&mut Execution) -> R,
     {
-        Self::with_state(|state| f(state.execution))
+        Self::with_state(|state| f(state.execution()))
     }
 
     /// Access the execution if there is one to access: `None` outside a model,
@@ -99,12 +191,14 @@ impl Scheduler {
         }
         STATE.with(|run| {
             let mut state = run.state.try_borrow_mut().ok()?;
-            Some(f(state.execution))
+            Some(f(state.execution()))
         })
     }
 
     /// Perform a context switch
     pub(crate) fn switch() {
+        // Not through `with_state`: a thread abandoning its unwind switches
+        // here forever, and `with_state` would send it back to abandon.
         use std::future::Future;
         use std::pin::Pin;
         use std::ptr;
@@ -114,6 +208,8 @@ impl Scheduler {
             unreachable!()
         }
         unsafe fn noop(_: *const ()) {}
+
+        YIELDED.set((stack_pointer(), stack_top()));
 
         // Wrapping with an async block deals with the thread-local context
         // `std` uses to manage async blocks
@@ -128,6 +224,20 @@ impl Scheduler {
         let mut cx = Context::from_waker(&waker);
 
         assert!(switch.poll(&mut cx).is_ready());
+    }
+
+    /// Ask the driver for a snapshot here, unless this model thread is
+    /// inside the execution already (a nested access), where it asks again at
+    /// its next access.
+    fn request_snapshot() {
+        let free = STATE.with(|run| run.state.try_borrow_mut().is_ok());
+        if !free || !generator::is_generator() {
+            return;
+        }
+
+        crate::rt::snapshot::clear_due();
+        STATE.with(|run| run.snapshot.set(true));
+        Self::switch();
     }
 
     pub(crate) fn spawn(stack_size: Option<usize>, f: Box<dyn FnOnce()>) {
@@ -146,50 +256,68 @@ impl Scheduler {
     where
         F: FnOnce() + Send + 'static,
     {
+        self.start(execution, f);
+
+        loop {
+            match self.drive() {
+                Drive::Done(result) => return result,
+                Drive::Snapshot => {}
+            }
+        }
+    }
+
+    /// Begin an execution of `f` on `execution`, which must outlive every
+    /// [`drive`](Self::drive) of it.
+    pub(crate) fn start<F>(&mut self, execution: &mut Execution, f: F)
+    where
+        F: FnOnce() + Send + 'static,
+    {
+        self.run.state.get_mut().execution = execution;
         self.arm(0, Box::new(f), None);
-        let mut used = 1;
+        self.used = 1;
+    }
 
-        // The scoped-TLS state brackets the whole iteration, not each tick:
+    /// Drive the started execution until it ends or a model thread asks for
+    /// a snapshot.
+    pub(crate) fn drive(&mut self) -> Drive {
+        // The scoped-TLS state brackets the whole stretch, not each tick:
         // set/unset plus a fresh `RefCell` per branch is pure overhead when
-        // the borrowed execution is the same one throughout. Inside the
-        // closure the execution is only reachable through `run` — the
-        // coroutines borrow it via `STATE` between resumes.
-        let mut queued_spawn = VecDeque::new();
-        let run = Run {
-            state: RefCell::new(State {
-                execution,
-                queued_spawn: &mut queued_spawn,
-            }),
-            panic: RefCell::new(None),
-            failure: RefCell::new(None),
-        };
+        // the borrowed execution is the same one throughout. The coroutines
+        // borrow the execution via `STATE` between resumes.
+        //
+        // SAFETY: `run` is not moved or dropped while the drive lasts; the
+        // loop below touches only `threads` and `used` through `self`.
+        let run: &Run = unsafe { &*(&self.run as *const Run) };
 
-        let result = STATE.set(unsafe { transmute_lt(&run) }, || loop {
+        let result = STATE.set(run, || loop {
             let active = {
-                let state = run.state.borrow();
+                let mut state = run.state.borrow_mut();
+                let execution = state.execution();
 
-                if state.execution.threads.is_complete() {
+                if execution.threads.is_complete() {
                     // Every loom thread has terminated, so every armed
                     // coroutine has finished its closure and parked back at
                     // its recv point, ready for the next iteration.
-                    return Ok(());
+                    return Drive::Done(Ok(()));
                 }
 
-                state.execution.threads.active_id()
+                execution.threads.active_id()
             };
 
-            let gen = &mut self.threads[active.as_usize()].gen;
+            let thread = &mut self.threads[active.as_usize()];
 
             // A panic that unwound to the coroutine's root: the thread's own
             // destructors have run, against a still-consistent runtime.
-            if let Err(payload) = panic::catch_unwind(AssertUnwindSafe(|| gen.resume())) {
+            if let Err(payload) = panic::catch_unwind(AssertUnwindSafe(|| thread.gen.resume())) {
                 std::hint::cold_path();
-                return Err(Failure::Panic(payload));
+                return Drive::Done(Err(Failure::Panic(payload)));
             }
+
+            thread.sp = YIELDED.get().0;
 
             if let Some(failure) = run.failure.borrow_mut().take() {
                 std::hint::cold_path();
-                return Err(failure);
+                return Drive::Done(Err(failure));
             }
 
             loop {
@@ -201,21 +329,24 @@ impl Scheduler {
                     break;
                 };
 
-                assert!(used < self.max_threads);
+                assert!(self.used < self.max_threads);
 
-                self.arm(used, f, stack_size);
-                used += 1;
+                self.arm(self.used, f, stack_size);
+                self.used += 1;
+            }
+
+            if run.snapshot.replace(false) {
+                return Drive::Snapshot;
             }
         });
 
-        if result.is_err() {
+        if let Drive::Done(Err(_)) = result {
             // Suspended coroutines are never resumed, so their frames are
             // never unwound; unstarted spawns own user values too.
             for th in self.threads.drain(..) {
                 std::mem::forget(th);
             }
-            drop(run);
-            std::mem::forget(queued_spawn);
+            std::mem::forget(std::mem::take(&mut self.run.state.get_mut().queued_spawn));
         }
 
         result
@@ -297,28 +428,39 @@ impl Scheduler {
             Some(slot) if slot.stack_size == stack_size => {}
             Some(slot) => {
                 retire(&mut slot.gen);
+                let gen = park_thread(stack_size);
+                let (sp, top) = YIELDED.get();
                 *slot = PooledThread {
-                    gen: park_thread(stack_size),
+                    gen,
                     stack_size,
+                    sp,
+                    end: mapping_end(top),
                 };
+                self.rebuilt = true;
             }
             None => {
                 debug_assert_eq!(index, self.threads.len(), "[loom internal bug]");
+                let gen = park_thread(stack_size);
+                let (sp, top) = YIELDED.get();
                 self.threads.push(PooledThread {
-                    gen: park_thread(stack_size),
+                    gen,
                     stack_size,
+                    sp,
+                    end: mapping_end(top),
                 });
+                self.rebuilt = true;
             }
         }
 
-        let gen = &mut self.threads[index].gen;
-        gen.set_para(Some(f));
-        gen.resume();
+        let thread = &mut self.threads[index];
+        thread.gen.set_para(Some(f));
+        thread.gen.resume();
+        thread.sp = YIELDED.get().0;
     }
 
     fn with_state<F, R>(f: F) -> R
     where
-        F: FnOnce(&mut State<'_>) -> R,
+        F: FnOnce(&mut State) -> R,
     {
         if !STATE.is_set() {
             panic!("cannot access Loom execution state from outside a Loom model. \
@@ -329,6 +471,10 @@ impl Scheduler {
         // while its OS thread unwinds: panicking means this thread unwinds.
         if std::thread::panicking() {
             Self::abandon_unwind();
+        }
+
+        if crate::rt::snapshot::is_due() {
+            Self::request_snapshot();
         }
 
         STATE.with(|run| f(&mut run.state.borrow_mut()))
@@ -356,9 +502,11 @@ impl Drop for Scheduler {
 fn park_thread(stack_size: usize) -> Thread {
     let body = || {
         loop {
+            YIELDED.set((stack_pointer(), stack_top()));
             let f: Option<Option<Box<dyn FnOnce()>>> = generator::yield_(());
 
             if let Some(f) = f {
+                YIELDED.set((stack_pointer(), stack_top()));
                 generator::yield_with(());
                 f.unwrap()();
             } else {
@@ -383,6 +531,72 @@ fn retire(gen: &mut Thread) {
     assert!(gen.is_done(), "[loom internal bug] coroutine still live");
 }
 
-unsafe fn transmute_lt<'a, 'b>(run: &'a Run<'b>) -> &'a Run<'static> {
-    ::std::mem::transmute(run)
+/// Stack size of the coroutine `warm_up` runs.
+const DEFAULT_WARM_STACK: usize = 64 * 1024;
+
+/// How far below a yielding function's own frame the coroutine's saved
+/// stack pointer may lie: the generator's yield and swap frames.
+const STACK_MARGIN: usize = 4096;
+
+/// An address in the calling function's frame.
+#[inline(never)]
+fn stack_pointer() -> usize {
+    let local = 0u8;
+    std::hint::black_box(&local) as *const u8 as usize
+}
+
+/// The top of the running stack: on a coroutine, its own (the generator
+/// switches the TEB's stack bounds with the registers).
+#[cfg(all(windows, target_arch = "x86_64"))]
+fn stack_top() -> usize {
+    let top: usize;
+    // SAFETY: reads `NT_TIB::StackBase` of the current thread's TEB.
+    unsafe { std::arch::asm!("mov {}, gs:[0x08]", out(reg) top, options(nostack, readonly, preserves_flags)) };
+    top
+}
+
+#[cfg(not(all(windows, target_arch = "x86_64")))]
+fn stack_top() -> usize {
+    0
+}
+
+/// The end of the mapping holding a coroutine stack whose top is `top`, or 0
+/// when unknown.
+#[cfg(windows)]
+fn mapping_end(top: usize) -> usize {
+    #[repr(C)]
+    struct MemoryBasicInformation {
+        base: usize,
+        allocation_base: usize,
+        allocation_protect: u32,
+        partition_id: u16,
+        region_size: usize,
+        state: u32,
+        protect: u32,
+        kind: u32,
+    }
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn VirtualQuery(addr: usize, info: *mut MemoryBasicInformation, len: usize) -> usize;
+    }
+
+    if top == 0 {
+        return 0;
+    }
+
+    let mut info = std::mem::MaybeUninit::<MemoryBasicInformation>::zeroed();
+    // SAFETY: a valid out-buffer of the stated size.
+    let filled = unsafe {
+        VirtualQuery(top - 1, info.as_mut_ptr(), std::mem::size_of::<MemoryBasicInformation>())
+    };
+    assert_ne!(filled, 0, "[loom internal bug] a coroutine stack is not mapped");
+    // SAFETY: filled by the call.
+    let info = unsafe { info.assume_init() };
+    info.base + info.region_size
+}
+
+#[cfg(not(windows))]
+fn mapping_end(_top: usize) -> usize {
+    0
 }

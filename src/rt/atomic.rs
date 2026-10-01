@@ -5100,6 +5100,7 @@ impl Region {
     /// SC-ranked store within the read's SC scope (the SC read rule). The
     /// candidate filters guarantee `index` is mo-before none of them.
     fn observe(&mut self, threads: &thread::Set, index: usize, ordering: Ordering) {
+        threads.observe(1 << 60 | (self.stores[index].creator as u64) << 16 | self.stores[index].dpor as u64);
         self.last_read[threads.active_id().as_usize()] =
             (threads.active().causality, self.stores[index].id);
 

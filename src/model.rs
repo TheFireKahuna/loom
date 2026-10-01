@@ -259,6 +259,20 @@ pub struct Builder {
     /// region held by a `static` and committed afresh in each — is committed
     /// at every execution's end by design.
     pub check_committed_leaks: bool,
+
+    /// Snapshot each execution every this many branches, and resume the next
+    /// execution from the deepest snapshot at or before the branch where it
+    /// leaves the previous one's path, instead of replaying that prefix. The
+    /// set of executions explored is the same either way.
+    ///
+    /// Takes effect only in a binary that installs
+    /// [`alloc::Model`](crate::alloc::Model) as its global allocator, whose
+    /// contract the model must keep, and only while sleep sets are inert (a
+    /// preemption bound is set): a sleep set at a branch depends on siblings
+    /// explored since a snapshot of it was taken.
+    ///
+    /// Defaults to the `LOOM_SNAPSHOT` environment variable; unset, off.
+    pub snapshot: Option<usize>,
 }
 
 impl Builder {
@@ -339,6 +353,10 @@ impl Builder {
                 .unwrap_or(true),
             stats: env::var_os("LOOM_STATS").is_some(),
             check_committed_leaks: false,
+            snapshot: env::var("LOOM_SNAPSHOT")
+                .map(|v| v.parse().expect("invalid value for `LOOM_SNAPSHOT`"))
+                .ok()
+                .filter(|&spacing| spacing > 0),
         }
     }
 
@@ -444,6 +462,7 @@ impl Builder {
         // run explored. This can, and the execution count is the number that
         // says whether a reduction is doing anything.
         if std::env::var_os("LOOM_STATS").is_some() {
+            rt::snapshot::stats::report(stats.executions as u64);
             eprintln!(
                 "loom: {} executions ({} pruned, {} bound-conservative), {} worker(s), bound={:?}, {:.2}s",
                 stats.executions,
@@ -469,7 +488,9 @@ impl Builder {
 
         let driver = std::thread::scope(|scope| {
             driver_thread()
-                .spawn_scoped(scope, || tracing::dispatcher::with_default(&dispatch, walk))
+                .spawn_scoped(scope, || {
+                    tracing::dispatcher::with_default(&dispatch, walk)
+                })
                 .expect("failed to spawn the loom driver thread")
                 .join()
         });
@@ -477,6 +498,36 @@ impl Builder {
         match driver {
             Ok(value) => value,
             Err(payload) => panic::resume_unwind(payload),
+        }
+    }
+
+    /// The per-thread state executions run on: snapshotting when
+    /// `LOOM_SNAPSHOT` asks for it and the binary installs
+    /// [`crate::alloc::Model`], replaying from the start otherwise.
+    fn new_engine(&self) -> Engine {
+        // A tracing subscriber's spans count references outside the world,
+        // which a restore would replay.
+        let spacing = self.snapshot.filter(|_| {
+            rt::snapshot::available()
+                && !self.log
+                && !(self.sleep_sets && self.preemption_bound.is_none())
+        });
+
+        let world = spacing.and_then(|spacing| {
+            let world =
+                rt::snapshot::World::new(|| self.new_execution(), self.max_threads, self.stack_size)?;
+            Some((world, spacing))
+        });
+
+        match world {
+            Some((world, spacing)) => Engine::Snapshot {
+                world,
+                snapshots: rt::snapshot::Snapshots::new(spacing),
+            },
+            None => Engine::Replay {
+                execution: self.new_execution(),
+                scheduler: Scheduler::new(self.max_threads, self.stack_size),
+            },
         }
     }
 
@@ -526,8 +577,7 @@ impl Builder {
         let mut conservative = 0;
         let mut _span = tracing::info_span!("iter", message = i).entered();
 
-        let mut execution = self.new_execution();
-        let mut scheduler = Scheduler::new(self.max_threads, self.stack_size);
+        let mut engine = self.new_engine();
 
         if let Some(ref path) = self.checkpoint_file {
             if path.exists() {
@@ -546,8 +596,9 @@ impl Builder {
                     self.preemption_bound,
                 );
 
-                execution.path = saved;
-                execution.path.set_max_branches(self.max_branches);
+                let mut saved = saved;
+                saved.set_max_branches(self.max_branches);
+                engine.take_path(saved);
             }
         }
 
@@ -561,7 +612,7 @@ impl Builder {
                 info!(parent: None, "");
 
                 if let Some(ref path) = self.checkpoint_file {
-                    checkpoint::store_execution_path(&execution.path, path);
+                    checkpoint::store_execution_path(&engine.execution().path, path);
                 }
             }
 
@@ -572,20 +623,20 @@ impl Builder {
             // executions are thrown away along with the tree they built.
             if let Some(deadline) = probe {
                 if Instant::now() >= deadline {
-                    let probed = self.stats(i - 1, 1, execution.pruned, conservative);
-                    return Walk::Handover(probed, execution.path);
+                    let probed = self.stats(i - 1, 1, engine.execution().pruned, conservative);
+                    return Walk::Handover(probed, engine.into_path());
                 }
             }
 
-            if let Err(failure) = run_once(&mut scheduler, &mut execution, f) {
+            if let Err(failure) = engine.run(f) {
                 // Its user values must not be destroyed (`Scheduler::run`).
-                std::mem::forget(execution);
+                engine.leak();
                 return Walk::Failed(failure);
             }
 
-            execution.check_for_leaks();
+            engine.check_for_leaks();
 
-            if self.stats && execution.path.conservative_attributed() {
+            if self.stats && engine.execution().path.conservative_attributed() {
                 conservative += 1;
             }
 
@@ -593,18 +644,23 @@ impl Builder {
             // execution, as the `Execution` will capture the current span when
             // it's reset.
             _span = tracing::info_span!(parent: None, "iter", message = i + 1).entered();
-            if !execution.step() {
+            if !engine.step() {
                 info!(parent: None, "Completed in {} iterations", i);
-                return Walk::Done(self.stats(i, 1, execution.pruned, conservative));
+                return Walk::Done(self.stats(i, 1, engine.execution().pruned, conservative));
             }
 
             match self.limit_reached(i, start) {
                 None => {}
                 Some(Limit::Permutations) => {
-                    return Walk::Done(self.stats(i, 1, execution.pruned, conservative))
+                    return Walk::Done(self.stats(i, 1, engine.execution().pruned, conservative))
                 }
                 Some(Limit::Duration) => {
-                    return Walk::TimedOut(self.stats(i, 1, execution.pruned, conservative))
+                    return Walk::TimedOut(self.stats(
+                        i,
+                        1,
+                        engine.execution().pruned,
+                        conservative,
+                    ))
                 }
             }
 
@@ -686,31 +742,28 @@ impl Builder {
     where
         F: Fn() + Sync + Send + 'static,
     {
-        let mut scheduler = Scheduler::new(self.max_threads, self.stack_size);
-
         // One `Execution` for the worker's whole life: taking a new subtree
         // swaps the path in and epoch-resets the rest, so the object store's
         // reincarnation carcasses carry across tasks, not just iterations.
-        let mut execution = self.new_execution();
+        let mut engine = self.new_engine();
 
         let mut conservative = 0;
 
         while let Some(path) = shared.take(workers) {
-            execution.path = path;
-            execution.reset_iteration();
+            engine.take_path(path);
 
             loop {
-                if let Err(failure) = run_once(&mut scheduler, &mut execution, f) {
+                if let Err(failure) = engine.run(f) {
                     // Its user values must not be destroyed (`Scheduler::run`),
                     // and this thread runs no further execution.
-                    std::mem::forget(execution);
+                    engine.leak();
                     shared.fail(failure);
                     return;
                 }
 
-                execution.check_for_leaks();
+                engine.check_for_leaks();
 
-                if self.stats && execution.path.conservative_attributed() {
+                if self.stats && engine.execution().path.conservative_attributed() {
                     conservative += 1;
                 }
 
@@ -722,29 +775,29 @@ impl Builder {
                     }
 
                     shared.stop();
-                    shared.pruned.fetch_add(execution.pruned, Relaxed);
+                    shared.pruned.fetch_add(engine.execution().pruned, Relaxed);
                     shared.conservative.fetch_add(conservative, Relaxed);
                     return;
                 }
 
-                if !execution.step() {
+                if !engine.step() {
                     break;
                 }
 
                 if done % DONATE_INTERVAL == 0 {
-                    shared.donate(&mut execution.path);
+                    shared.donate(&mut engine.execution().path);
                 }
 
                 // A peer failed or hit a ceiling: the verdict is in.
                 if shared.stopped() {
-                    shared.pruned.fetch_add(execution.pruned, Relaxed);
+                    shared.pruned.fetch_add(engine.execution().pruned, Relaxed);
                     shared.conservative.fetch_add(conservative, Relaxed);
                     return;
                 }
             }
         }
 
-        shared.pruned.fetch_add(execution.pruned, Relaxed);
+        shared.pruned.fetch_add(engine.execution().pruned, Relaxed);
         shared.conservative.fetch_add(conservative, Relaxed);
     }
 
@@ -760,18 +813,270 @@ impl Builder {
     }
 }
 
-fn run_once<F>(
-    scheduler: &mut Scheduler,
-    execution: &mut Execution,
+/// The state a thread runs executions on.
+enum Engine {
+    /// Every execution replays its path from the start.
+    Replay {
+        execution: Execution,
+        scheduler: Scheduler,
+    },
+
+    /// An execution resumes from the deepest snapshot its path allows.
+    Snapshot {
+        world: rt::snapshot::World,
+        snapshots: rt::snapshot::Snapshots,
+    },
+}
+
+impl Engine {
+    fn execution(&mut self) -> &mut Execution {
+        match self {
+            Engine::Replay { execution, .. } => execution,
+            Engine::Snapshot { world, .. } => &mut world.inner().execution,
+        }
+    }
+
+    /// Start a fresh subtree.
+    fn take_path(&mut self, path: rt::Path) {
+        match self {
+            Engine::Replay { execution, .. } => {
+                execution.path = path;
+                execution.path.detach();
+                execution.reset_iteration();
+            }
+            Engine::Snapshot { world, snapshots } => {
+                world.inner().execution.path = path;
+                world.inner().execution.path.detach();
+                snapshots.clear();
+            }
+        }
+    }
+
+    /// Hand the path over and drop the rest.
+    fn into_path(mut self) -> rt::Path {
+        let fresh = rt::Path::new(0, None, false);
+        std::mem::replace(&mut self.execution().path, fresh)
+    }
+
+    /// Abandon this state after a failed execution.
+    fn leak(self) {
+        match self {
+            Engine::Replay { execution, .. } => std::mem::forget(execution),
+            Engine::Snapshot { world, .. } => world.leak(),
+        }
+    }
+
+    fn check_for_leaks(&mut self) {
+        match self {
+            Engine::Replay { execution, .. } => execution.check_for_leaks(),
+            Engine::Snapshot { world, .. } => {
+                let execution: *mut Execution = &mut world.inner().execution;
+                // SAFETY: the world outlives the call.
+                world.routed(|| unsafe { (*execution).check_for_leaks() });
+            }
+        }
+    }
+
+    /// Step the path; `false` once the tree is exhausted.
+    fn step(&mut self) -> bool {
+        match self {
+            Engine::Replay { execution, .. } => execution.step(),
+            Engine::Snapshot { world, .. } => world.inner().execution.step_path(),
+        }
+    }
+
+    /// Run the next execution.
+    fn run<F>(&mut self, f: &Arc<F>) -> Result<(), Failure>
+    where
+        F: Fn() + Sync + Send + 'static,
+    {
+        match self {
+            Engine::Replay {
+                execution,
+                scheduler,
+            } => scheduler.run(execution, body(f)),
+            Engine::Snapshot { world, snapshots } => run_checked(world, snapshots, f),
+        }
+    }
+}
+
+/// [`run_snapshot`], and under `LOOM_SNAPSHOT_CHECK` a replay of every
+/// resumed execution from the start, which must leave the same branch record
+/// and the same observations.
+fn run_checked<F>(
+    world: &mut rt::snapshot::World,
+    snapshots: &mut rt::snapshot::Snapshots,
     f: &Arc<F>,
 ) -> Result<(), Failure>
 where
     F: Fn() + Sync + Send + 'static,
 {
-    let f = f.clone();
+    if !rt::snapshot::check() {
+        return run_snapshot(world, snapshots, f).0;
+    }
 
-    scheduler.run(execution, move || {
-        f();
+    let before = world.inner().execution.path.duplicate();
+    let (result, resumed) = run_snapshot(world, snapshots, f);
+    result?;
+    if !resumed {
+        return Ok(());
+    }
+
+    let restored = world.inner().execution.path.record();
+    let restored_observed = observed(&world.inner().execution);
+    let after = std::mem::replace(&mut world.inner().execution.path, before);
+
+    start(world, f, usize::MAX);
+    drive(world, snapshots, |_, _| unreachable!("[loom internal bug] snapshot during a check replay"))?;
+
+    let replayed = world.inner().execution.path.record();
+    let replayed_observed = observed(&world.inner().execution);
+    assert!(
+        restored == replayed && restored_observed == replayed_observed,
+        "loom: an execution resumed from a snapshot differs from its replay \
+         (branch records equal: {}, observations equal: {})",
+        restored == replayed,
+        restored_observed == replayed_observed,
+    );
+
+    world.inner().execution.path = after;
+    rt::snapshot::stats::add(&rt::snapshot::stats::CHECKED, 1);
+    Ok(())
+}
+
+/// The digest of what an execution observed (`thread::Set::observed`).
+fn observed(execution: &Execution) -> u64 {
+    execution.threads.observed().wrapping_add(execution.path.observed)
+}
+
+/// Run the next execution from the deepest usable snapshot, or from the
+/// start when there is none, taking snapshots as it goes. Also says whether
+/// it resumed from a snapshot.
+fn run_snapshot<F>(
+    world: &mut rt::snapshot::World,
+    snapshots: &mut rt::snapshot::Snapshots,
+    f: &Arc<F>,
+) -> (Result<(), Failure>, bool)
+where
+    F: Fn() + Sync + Send + 'static,
+{
+    use rt::snapshot::stats;
+
+    let spacing = snapshots.spacing();
+    let divergence = world.inner().execution.path.divergence();
+
+    let resumed = match divergence {
+        None => {
+            snapshots.clear();
+            false
+        }
+        Some(divergence) => snapshots.restorable(divergence).is_some(),
+    };
+
+    if resumed {
+        let pos = snapshots.restore(world);
+        stats::add(&stats::RESTORED, 1);
+
+        let next = next_snapshot(&world.inner().execution.path, pos, divergence, spacing);
+        world.inner().execution.path.snapshot_at(next);
+        rt::snapshot::clear_due();
+    } else {
+        stats::add(&stats::STARTED, 1);
+        let next = next_snapshot(&world.inner().execution.path, 0, divergence, spacing);
+        start(world, f, next);
+    }
+
+    let result = drive(world, snapshots, |world, snapshots| {
+        let bytes = snapshots.take(world);
+        stats::add(&stats::TAKEN, 1);
+        stats::add(&stats::BYTES, bytes as u64);
+
+        let pos = world.inner().execution.path.pos_now();
+        if Some(pos) == divergence {
+            stats::add(&stats::ON_TARGET, 1);
+        }
+        world.inner().execution.path.snapshot_at(pos + spacing);
+    });
+
+    (result, resumed)
+}
+
+/// Begin an execution of `f` from the start, its first snapshot due at
+/// branch `next`.
+fn start<F>(world: &mut rt::snapshot::World, f: &Arc<F>, next: usize)
+where
+    F: Fn() + Sync + Send + 'static,
+{
+    let inner: *mut rt::snapshot::Inner = world.inner();
+    // SAFETY: the world outlives the call, and the scheduler and the
+    // execution are disjoint fields.
+    world.routed(|| unsafe {
+        (*inner).execution.reset_iteration();
+        (*inner).execution.path.snapshot_at(next);
+        (*inner).scheduler.start(&mut (*inner).execution, body(f));
+    });
+    rt::snapshot::clear_due();
+}
+
+/// Drive the started execution to its end, handing every snapshot request
+/// to `snapshot`.
+fn drive(
+    world: &mut rt::snapshot::World,
+    snapshots: &mut rt::snapshot::Snapshots,
+    mut snapshot: impl FnMut(&mut rt::snapshot::World, &mut rt::snapshot::Snapshots),
+) -> Result<(), Failure> {
+    use rt::scheduler::Drive;
+
+    loop {
+        let inner: *mut rt::snapshot::Inner = world.inner();
+        // SAFETY: the world outlives the call.
+        let drive = world.routed(|| unsafe { (*inner).scheduler.drive() });
+
+        // A snapshot taken before a coroutine was rebuilt names its old stack.
+        if world.inner().scheduler.take_rebuilt() {
+            snapshots.clear();
+        }
+
+        match drive {
+            Drive::Done(result) => return result,
+            Drive::Snapshot => snapshot(world, snapshots),
+        }
+    }
+}
+
+/// Where an execution resuming at `pos` and diverging at `divergence` takes
+/// its first snapshot: at the divergence branch when that branch has another
+/// alternative to come, whose execution then resumes there; otherwise a
+/// spacing on.
+fn next_snapshot(path: &rt::Path, pos: usize, divergence: Option<usize>, spacing: usize) -> usize {
+    match divergence {
+        Some(divergence) if pos < divergence && path.has_alternative(divergence) => {
+            divergence.min(pos + spacing)
+        }
+        _ => pos + spacing,
+    }
+}
+
+/// A pointer to the model closure, which `Builder::check` keeps alive across
+/// every execution. An execution holds no count on it: a restore would
+/// replay the count's changes.
+struct Body<F>(*const F);
+
+// SAFETY: `F: Sync`, and the pointee outlives every execution.
+unsafe impl<F: Sync> Send for Body<F> {}
+
+/// The root of model thread 0: the model closure, then the execution's
+/// teardown.
+fn body<F>(f: &Arc<F>) -> impl FnOnce() + Send + 'static
+where
+    F: Fn() + Sync + Send + 'static,
+{
+    let f = Body::<F>(&**f);
+
+    move || {
+        let f = f;
+        // SAFETY: `Body`'s.
+        unsafe { (*f.0)() };
 
         // Run the main thread's `thread_local` destructors before
         // the lazy_statics tear down: a TLS destructor may still
@@ -789,7 +1094,7 @@ where
         drop(lock_data);
 
         rt::thread_done();
-    })
+    }
 }
 
 /// A thread to drive executions on, named for the thread that asked for the

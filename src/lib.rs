@@ -3,7 +3,7 @@
 // `const_eval_select`: one `const fn new` on every cell, registering eagerly
 // at runtime and deferring in `const` evaluation. Nightly-only, as the fork is.
 // `deprecated_suggestion`: `fetch_update` deprecates as `core`'s does.
-#![feature(core_intrinsics, const_eval_select, deprecated_suggestion, ptr_metadata)]
+#![feature(core_intrinsics, const_eval_select, deprecated_suggestion, ptr_metadata, thread_local)]
 #![allow(internal_features)]
 
 //! Loom is a tool for testing concurrent programs.

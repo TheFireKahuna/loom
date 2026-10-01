@@ -137,6 +137,9 @@ impl Condvar {
 
             trace!(state = ?self.state, ?thread, "Condvar::notify_one");
 
+            execution
+                .threads
+                .observe(3 << 60 | thread.map_or(0xfff, |t| t.as_usize() as u64));
             if let Some(thread) = thread {
                 execution.threads.wake(thread);
             }

@@ -34,6 +34,10 @@ pub(super) struct State {
 
     /// Causality transfers between threads
     synchronize: Synchronize,
+
+    /// The last release, as its thread and operation index plus one, for the
+    /// digest an acquisition folds (`thread::Set::observe`).
+    last_release: u64,
 }
 
 /// What a thread's pending operation on the mutex is. Only `Lock` blocks:
@@ -55,6 +59,7 @@ impl Mutex {
                 last_access: None,
                 last_acquire: None,
                 synchronize: Synchronize::new(),
+                last_release: 0,
             });
 
             trace!(?state, ?seq_cst, "Mutex::new");
@@ -89,6 +94,12 @@ impl Mutex {
             let state = self.state.get_mut(&mut execution.objects);
 
             // Release the lock flag
+            if let Some(holder) = state.lock {
+                if execution.threads.is_active() {
+                    state.last_release = 1 + ((holder.as_usize() as u64) << 20
+                        | execution.threads.active().dpor_vv[holder] as u64);
+                }
+            }
             state.lock = None;
 
             // Execution has deadlocked, cleanup does not matter.
@@ -137,6 +148,7 @@ impl Mutex {
 
             // Set the lock to the current thread
             state.lock = Some(thread_id);
+            execution.threads.observe(2 << 60 | state.last_release);
 
             state.synchronize.sync_load(&mut execution.threads, Acquire);
 

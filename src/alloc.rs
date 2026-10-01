@@ -107,3 +107,50 @@ impl<T> Track<T> {
         self.value
     }
 }
+
+/// A global allocator that lets loom snapshot executions: install it with
+/// `#[global_allocator]` over the allocator the binary would use anyway.
+///
+/// While a model runs, every allocation made on one of its exploring threads
+/// comes from that thread's execution-owned arena, which loom copies at
+/// branch points and copies back to resume a later execution from there
+/// instead of replaying it from the start. Everything else passes through to
+/// `A`. Without it installed, every execution replays from the start.
+///
+/// A model under it must not leave state it created reachable from outside
+/// the model — a process-wide registry, a lazily built `static`, a
+/// thread-local of the OS thread — because a restore rewinds the memory such
+/// state points into. Freeing that memory from another thread aborts.
+#[derive(Debug, Default)]
+pub struct Model<A>(pub A);
+
+unsafe impl<A: std::alloc::GlobalAlloc> std::alloc::GlobalAlloc for Model<A> {
+    #[inline]
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        rt::world::alloc(&self.0, layout)
+    }
+
+    #[inline]
+    unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+        rt::world::alloc_zeroed(&self.0, layout)
+    }
+
+    #[inline]
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        rt::world::dealloc(&self.0, ptr, layout)
+    }
+
+    #[inline]
+    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+        rt::world::realloc(&self.0, ptr, layout, new_size)
+    }
+}
+
+/// Run `f` with its allocations outside the model's snapshotted memory: for
+/// an oracle that deliberately outlives executions, such as a registry a
+/// leak gate reads. A snapshot restore does not rewind what `f` builds, so
+/// it must record only what stays true whichever execution resumes next, and
+/// must not keep pointers into model state.
+pub fn outside<R>(f: impl FnOnce() -> R) -> R {
+    rt::world::outside(f)
+}

@@ -1,5 +1,5 @@
 use crate::rt::dpor::{Reversal, Wakeup};
-use crate::rt::{execution, object, thread, MAX_ATOMIC_HISTORY, MAX_THREADS};
+use crate::rt::{execution, object, snapshot, thread, MAX_ATOMIC_HISTORY, MAX_THREADS};
 
 use std::sync::atomic::{
     AtomicU16, AtomicU32, Ordering::AcqRel, Ordering::Acquire, Ordering::Relaxed,
@@ -200,6 +200,42 @@ pub(crate) struct Path {
     /// races have not been reversed yet.
     #[cfg_attr(feature = "checkpoint", serde(skip))]
     fresh: usize,
+
+    /// The branch where this execution leaves the previous one's path, or
+    /// `None` when it has no predecessor on this thread: where a snapshot
+    /// engine resumes it from.
+    #[cfg_attr(feature = "checkpoint", serde(skip))]
+    divergence: Option<usize>,
+
+    /// The position at which the execution asks for its next snapshot
+    /// (`rt::snapshot`); `usize::MAX` when none is wanted.
+    #[cfg_attr(feature = "checkpoint", serde(skip))]
+    snapshot_at: usize,
+
+    /// The spurious outcomes this execution took, keyed by position: the
+    /// path's share of the digest `LOOM_SNAPSHOT_CHECK` compares
+    /// (`thread::Set::observed`).
+    #[cfg_attr(feature = "checkpoint", serde(skip))]
+    pub(crate) observed: u64,
+}
+
+/// Where an execution stands in its path: everything about the path that a
+/// snapshot rewinds. The branches themselves are the exploration's record
+/// and survive a restore.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Cursor {
+    /// Spurious outcomes so far, keyed by position (`Path::observed`).
+    observed: u64,
+    pos: usize,
+    exploring: bool,
+    skipping: bool,
+}
+
+impl Cursor {
+    /// Branches the execution had consumed.
+    pub(crate) fn pos(&self) -> usize {
+        self.pos
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -346,6 +382,9 @@ impl Path {
             split_depth: 0,
             step_key: Vec::new(),
             fresh: 0,
+            divergence: None,
+            snapshot_at: usize::MAX,
+            observed: 0,
         }
     }
 
@@ -365,6 +404,85 @@ impl Path {
         if self.preemption_bound.is_none() {
             self.step_key.push(key);
         }
+    }
+
+    /// The execution's position, for a snapshot.
+    pub(crate) fn cursor(&self) -> Cursor {
+        Cursor {
+            observed: self.observed,
+            pos: self.pos,
+            exploring: self.exploring,
+            skipping: self.skipping,
+        }
+    }
+
+    /// Branches the running execution has consumed.
+    pub(crate) fn pos_now(&self) -> usize {
+        self.pos
+    }
+
+    /// Whether the branch at `index` has an alternative left to explore
+    /// besides its current choice, as far as this path knows now.
+    pub(crate) fn has_alternative(&self, index: usize) -> bool {
+        if index < self.frozen.len() {
+            return true;
+        }
+        let entry = object::Ref::from_usize(index);
+        if let Some(schedule) = entry.downcast::<Schedule>(&self.branches) {
+            let schedule = schedule.get(&self.branches);
+            schedule.exploring && schedule.threads.iter().any(|th| th.is_pending())
+        } else if let Some(load) = entry.downcast::<Load>(&self.branches) {
+            let load = load.get(&self.branches);
+            load.exploring && load.pos + 1 < load.len
+        } else if let Some(spurious) = entry.downcast::<Spurious>(&self.branches) {
+            let spurious = spurious.get(&self.branches);
+            spurious.exploring && !spurious.spur
+        } else {
+            false
+        }
+    }
+
+    /// A copy that can grow as far as this path can.
+    pub(crate) fn duplicate(&self) -> Path {
+        let mut copy = self.clone();
+        copy.branches
+            .reserve_exact(self.branches.capacity() - copy.branches.len());
+        copy
+    }
+
+    /// The branches as a comparable record: what an execution chose and saw
+    /// at each, and the alternatives it left. Two runs of one execution from
+    /// one path must leave identical records.
+    pub(crate) fn record(&self) -> String {
+        format!("{:?}", self.branches)
+    }
+
+    /// Resume at a snapshot's position.
+    pub(crate) fn set_cursor(&mut self, cursor: Cursor) {
+        self.pos = cursor.pos;
+        self.observed = cursor.observed;
+        self.exploring = cursor.exploring;
+        self.skipping = cursor.skipping;
+    }
+
+    /// Ask for a snapshot once the execution has consumed `pos` branches.
+    pub(crate) fn snapshot_at(&mut self, pos: usize) {
+        self.snapshot_at = pos;
+    }
+
+    /// Branches in the current execution.
+    pub(crate) fn branch_count(&self) -> usize {
+        self.branches.len()
+    }
+
+    /// See [`Path::divergence`](Path#structfield.divergence).
+    pub(crate) fn divergence(&self) -> Option<usize> {
+        self.divergence
+    }
+
+    /// Mark the next execution as sharing no prefix with the last one.
+    pub(crate) fn detach(&mut self) {
+        self.divergence = None;
     }
 
     /// The preemption bound this path is explored under.
@@ -471,6 +589,10 @@ impl Path {
             .get(&self.branches);
 
         self.pos += 1;
+        if self.pos >= self.snapshot_at {
+            self.snapshot_at = usize::MAX;
+            snapshot::set_due();
+        }
 
         let mut values = load.values;
         for _ in 0..load.pos {
@@ -502,6 +624,13 @@ impl Path {
             self.step_key.push(spurious as u64);
         }
 
+        if self.pos >= self.snapshot_at {
+            self.snapshot_at = usize::MAX;
+            snapshot::set_due();
+        }
+        self.observed = self
+            .observed
+            .wrapping_add(snapshot::mix(self.pos as u64, 5 << 60 | spurious as u64));
         spurious
     }
 
@@ -648,6 +777,10 @@ impl Path {
         let schedule = schedule_ref.get(&self.branches);
 
         self.pos += 1;
+        if self.pos >= self.snapshot_at {
+            self.snapshot_at = usize::MAX;
+            snapshot::set_due();
+        }
 
         let active = schedule.threads.iter().position(|th| th.is_active());
 
@@ -944,6 +1077,7 @@ impl Path {
         // Reset the position to zero, the path will start traversing from the
         // beginning
         self.pos = 0;
+        self.observed = 0;
 
         // Reset exploring / critical / skip
         self.exploring = self.exploring_on_start;
@@ -1003,6 +1137,7 @@ impl Path {
                 }
 
                 self.fresh = last.index();
+                self.divergence = Some(last.index());
                 return true;
             }
 
@@ -1033,6 +1168,7 @@ impl Path {
                     schedule.threads[i] = Thread::Active;
                     schedule.entered_conservative = schedule.conservative & (1 << i) != 0;
                     self.fresh = last.index();
+                    self.divergence = Some(last.index());
                     return true;
                 }
 
@@ -1051,6 +1187,7 @@ impl Path {
 
                 if load.pos < load.len {
                     self.fresh = last.index();
+                    self.divergence = Some(last.index());
                     return true;
                 }
             } else if let Some(spurious_ref) = last.downcast::<Spurious>(&self.branches) {
@@ -1063,6 +1200,7 @@ impl Path {
                 if !spurious.spur {
                     spurious.spur = true;
                     self.fresh = last.index();
+                    self.divergence = Some(last.index());
                     return true;
                 }
             } else {
@@ -1238,6 +1376,7 @@ impl Path {
         let mut task = self.clone();
         task.pos = 0;
         task.fresh = point;
+        task.divergence = None;
         task.branches.truncate(entry);
 
         // `point` is frozen for the new task too — its choice there is

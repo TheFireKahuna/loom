@@ -52,13 +52,17 @@ pub(crate) use self::mutex::Mutex;
 mod path;
 pub(crate) use self::path::Path;
 
+pub(crate) mod snapshot;
+
+pub(crate) mod world;
+
 mod registration;
 pub(crate) use self::registration::{instance, take_instance, Deferred, Fresh, Registration};
 
 mod rwlock;
 pub(crate) use self::rwlock::RwLock;
 
-mod scheduler;
+pub(crate) mod scheduler;
 pub(crate) use self::scheduler::Scheduler;
 
 mod sleep;

@@ -134,12 +134,22 @@ impl Execution {
         let preemption_bound =
             preemption_bound.map(|bound| bound.try_into().expect("preemption_bound too big"));
 
+        // The path is the exploration's record, which a snapshot restore keeps:
+        // its storage stays outside the world. Inside one, the object store
+        // grows on demand, since its whole capacity is copied by a snapshot.
+        let path = super::world::outside(|| Path::new(max_branches, preemption_bound, exploring));
+        let objects = if super::world::is_routed() {
+            object::Store::with_capacity(64)
+        } else {
+            object::Store::with_capacity(max_branches)
+        };
+
         Execution {
             id,
-            path: Path::new(max_branches, preemption_bound, exploring),
+            path,
             threads,
             lazy_statics: lazy_static::Set::new(),
-            objects: object::Store::with_capacity(max_branches),
+            objects,
             raw_allocations: FxHashMap::default(),
             arc_objs: FxHashMap::default(),
             deferred_atomics: FxHashMap::default(),
@@ -190,6 +200,12 @@ impl Execution {
 
         self.reset_iteration();
         true
+    }
+
+    /// Step the path to the next execution without resetting the rest: the
+    /// next execution resumes from a snapshot, or resets when it starts over.
+    pub(crate) fn step_path(&mut self) -> bool {
+        self.path.step()
     }
 
     /// Reset every per-iteration structure in place, keeping its allocations:
@@ -445,6 +461,7 @@ impl Execution {
         if fires {
             trace!(thread = ?self.threads.active_id(), ?others_runnable, "timeout fires");
             self.threads.active_mut().fire_timeout(others_runnable);
+            self.threads.observe(4 << 60);
         }
 
         if !bounded {
