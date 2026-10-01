@@ -258,3 +258,74 @@ fn an_unplaced_store_is_explored_on_both_sides() {
     assert!(WOKEN.load(Std::Relaxed) > 0, "the store was never placed beyond");
     assert!(PLACED_BEFORE.load(Std::Relaxed) > 0, "the store was never placed before");
 }
+
+/// The wake is ordered against the store both ways, whichever bound: a store
+/// that lands while the waiter sleeps races its timeout, so a waiter whose
+/// only use of the wait is control flow can both wake and time out. Search
+/// that treated the sleeping waiter as independent of the store would only
+/// ever see the store wake it.
+#[test]
+fn a_store_races_the_timeout_of_a_sleeping_waiter() {
+    for bound in [None, Some(1), Some(2)] {
+        let seen: std::sync::Arc<StdMutex<BTreeSet<u32>>> = Default::default();
+        let out = seen.clone();
+
+        let mut builder = loom::model::Builder::new();
+        builder.preemption_bound = bound;
+        builder.check(move || {
+            let x = Arc::new(AtomicU32::new(0));
+            let y = Arc::new(AtomicU32::new(0));
+            let (x2, y2) = (x.clone(), y.clone());
+            let waiter = thread::spawn(move || {
+                let woke = monitor_wait_timeout(&*x2) == MonitorWake::Stored;
+                y2.store(if woke { 1 } else { 2 }, Relaxed);
+            });
+            x.store(1, Relaxed);
+            waiter.join().unwrap();
+            out.lock().unwrap().insert(y.load(Relaxed));
+        });
+
+        assert_eq!(*seen.lock().unwrap(), BTreeSet::from([1, 2]), "bound {bound:?}");
+    }
+}
+
+// With both threads in a timed wait, which timeout fires first is a choice:
+// here the peer's must fire first, while the main thread waits on c0, so
+// that the peer's later store to c0 wakes it. Two preemptions reach it.
+#[test]
+fn either_of_two_pending_timeouts_fires_first() {
+    use loom::hint::{monitor_wait_timeout, MonitorWake};
+    use loom::sync::atomic::{AtomicUsize, Ordering::*};
+    use loom::sync::Arc;
+    use std::collections::BTreeSet;
+
+    for bound in [Some(2), Some(3), None] {
+        let seen: std::sync::Arc<std::sync::Mutex<BTreeSet<(usize, usize)>>> = Default::default();
+        let out = seen.clone();
+        let mut b = loom::model::Builder::new();
+        b.threads = 1;
+        b.preemption_bound = bound;
+        b.check(move || {
+            let c0 = Arc::new(AtomicUsize::new(0));
+            let c1 = Arc::new(AtomicUsize::new(0));
+            let (c0b, c1b) = (c0.clone(), c1.clone());
+            let peer = loom::thread::spawn(move || {
+                loom::thread::sleep(std::time::Duration::from_millis(1));
+                c1b.store(12, Relaxed);
+                let w = monitor_wait_timeout(&*c0b);
+                c1b.store(if w == MonitorWake::Stored { 1 } else { 11 }, Relaxed);
+                c0b.store(2, SeqCst);
+            });
+            let r = c1.load(Relaxed);
+            let w = monitor_wait_timeout(&*c0);
+            c1.store(if w == MonitorWake::Stored { 1 } else { 11 }, Relaxed);
+            peer.join().unwrap();
+            out.lock().unwrap().insert((r, c1.load(Relaxed)));
+        });
+        assert!(
+            seen.lock().unwrap().contains(&(12, 1)),
+            "bound {bound:?}: the peer's timeout never fired first: {:?}",
+            seen.lock().unwrap()
+        );
+    }
+}
