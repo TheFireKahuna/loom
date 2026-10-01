@@ -387,9 +387,9 @@ fn interleaved_cells(_: &Log) {
     }
 }
 
-/// A sharded run must walk exactly the tree a serial run walks — not a
-/// superset, not a subset, and not something that depends on how many workers
-/// happened to be running.
+/// A sharded bounded run must walk exactly the tree a serial run walks —
+/// not a superset, not a subset, and not something that depends on how many
+/// workers happened to be running.
 ///
 /// This is the invariant that catches the two ways sharding goes wrong, both
 /// of which are otherwise silent. If a donated subtree cannot record a
@@ -401,11 +401,17 @@ fn interleaved_cells(_: &Log) {
 /// each other passes just as happily when every one of them over-explores by
 /// the same factor, which is exactly how an earlier design hid a 5.3x tax.
 ///
-/// Sleep sets are pinned off here: their pruning at a *shared* branch reads
-/// the claim record at passage time, which is deliberately time-sensitive
-/// (later marks only prune more), so exact counts are a property of the
-/// unpruned walk. Coverage under sleep sets is asserted separately by
-/// `sleep_sets_cover_every_behavior_of_the_full_walk`.
+/// Sleep sets are pinned off here: which alternatives a *shared* branch's
+/// executions defer to follows the order they were claimed in, so exact
+/// counts are a property of the unpruned walk. Coverage under sleep sets is
+/// asserted separately by `sleep_sets_cover_every_behavior_of_the_full_walk`.
+///
+/// Without a bound the tree is not the serial one by design: a branch frozen
+/// for sharding takes its race reversals as source sets in the claim record
+/// instead of into the wakeup tree a serial walk keeps there, and which
+/// branches freeze depends on timing. There the sharded walk must reach
+/// exactly the serial walk's behaviors, and a duplicated subtree still shows
+/// as a count well past the serial one.
 #[test]
 fn sharding_walks_the_same_tree_as_a_serial_run() {
     let models: &[(&str, fn(&Log))] = &[
@@ -420,17 +426,31 @@ fn sharding_walks_the_same_tree_as_a_serial_run() {
 
     for &(name, model) in models {
         for &bound in BOUNDS {
-            let (_, serial) = explore_with(1, bound, model, true, false);
+            let (serial_seen, serial) = explore_with(1, bound, model, true, false);
 
             for workers in [2, 3, 4, 8] {
-                let (_, n) = explore_with(workers, bound, model, true, false);
+                let (seen, n) = explore_with(workers, bound, model, true, false);
 
-                assert_eq!(
-                    n, serial,
-                    "{name}: bound={bound:?} explored {n} executions on \
-                     {workers} workers but {serial} serially — sharding changed \
-                     the tree, which means lost or duplicated subtrees"
-                );
+                if bound.is_some() {
+                    assert_eq!(
+                        n, serial,
+                        "{name}: bound={bound:?} explored {n} executions on \
+                         {workers} workers but {serial} serially — sharding changed \
+                         the tree, which means lost or duplicated subtrees"
+                    );
+                } else {
+                    assert_eq!(
+                        seen, serial_seen,
+                        "{name}: unbounded, {workers} workers reached other \
+                         behaviors than the serial walk"
+                    );
+                    assert!(
+                        n <= serial + serial / 2 + 8,
+                        "{name}: unbounded, {workers} workers explored {n} \
+                         executions against {serial} serially — a subtree walked \
+                         more than once"
+                    );
+                }
             }
         }
     }
@@ -669,6 +689,13 @@ enum FuzzOp {
     WideLoad(u32),
     /// lock the mutex, add v, log the total
     Mutex(usize),
+    /// lock the mutex, add 10, `notify_one` the condvar
+    Notify,
+    /// lock the mutex, `wait_timeout` on the condvar, log the total and
+    /// whether it timed out
+    WaitTimeout,
+    /// log a `nondet_bool`
+    Nondet,
 }
 
 const ORDERINGS: [loom::sync::atomic::Ordering; 5] = [Relaxed, Acquire, Release, AcqRel, SeqCst];
@@ -685,6 +712,18 @@ impl FuzzOp {
         }
     }
 
+    /// [`Self::generate`], or one of the blocking and environment-chosen ops
+    /// a third of the time: the steps whose enabling no access record
+    /// shows — a wake, a timeout firing, a coin.
+    fn generate_blocking(rng: &mut Rng) -> FuzzOp {
+        if rng.below(3) == 0 {
+            [FuzzOp::Notify, FuzzOp::WaitTimeout, FuzzOp::Nondet, FuzzOp::Mutex(1)]
+                [rng.below(4) as usize]
+        } else {
+            FuzzOp::generate(rng)
+        }
+    }
+
     /// A load-shaped ordering for reads, store-shaped for writes, either for
     /// RMWs — mirroring what real code can legally write.
     fn ordering(&self, rng: &mut Rng) -> loom::sync::atomic::Ordering {
@@ -697,6 +736,7 @@ impl FuzzOp {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn run(
         self,
         ord: loom::sync::atomic::Ordering,
@@ -704,6 +744,7 @@ impl FuzzOp {
         cells: &[Arc<AtomicUsize>],
         wide: &Arc<AtomicU128>,
         mutex: &Arc<loom::sync::Mutex<usize>>,
+        condvar: &Arc<loom::sync::Condvar>,
         log: &Log,
     ) {
         match self {
@@ -728,6 +769,19 @@ impl FuzzOp {
                 *g += v;
                 log.record(format_args!("t{who}:m={}", *g));
             }
+            FuzzOp::Notify => {
+                let mut g = mutex.lock().unwrap();
+                *g += 10;
+                condvar.notify_one();
+            }
+            FuzzOp::WaitTimeout => {
+                let g = mutex.lock().unwrap();
+                let (g, r) = condvar
+                    .wait_timeout(g, std::time::Duration::from_secs(1))
+                    .unwrap();
+                log.record(format_args!("t{who}:cv={},{}", *g, r.timed_out()));
+            }
+            FuzzOp::Nondet => log.record(format_args!("t{who}:nd={}", loom::nondet_bool())),
         }
     }
 }
@@ -741,6 +795,16 @@ struct FuzzProgram {
 
 impl FuzzProgram {
     fn generate(seed: u64) -> FuzzProgram {
+        FuzzProgram::generate_with(seed, FuzzOp::generate)
+    }
+
+    /// A program that also blocks, times out and flips coins
+    /// (`FuzzOp::generate_blocking`).
+    fn generate_blocking(seed: u64) -> FuzzProgram {
+        FuzzProgram::generate_with(seed, FuzzOp::generate_blocking)
+    }
+
+    fn generate_with(seed: u64, op: fn(&mut Rng) -> FuzzOp) -> FuzzProgram {
         // Seed 0 is a xorshift fixed point; offset by a constant.
         let mut rng = Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
 
@@ -748,7 +812,7 @@ impl FuzzProgram {
             .map(|_| {
                 (0..2 + rng.below(3) as usize)
                     .map(|_| {
-                        let op = FuzzOp::generate(&mut rng);
+                        let op = op(&mut rng);
                         let ord = op.ordering(&mut rng);
                         (op, ord)
                     })
@@ -763,6 +827,7 @@ impl FuzzProgram {
         let cells: Vec<_> = (0..2).map(|_| Arc::new(AtomicUsize::new(0))).collect();
         let wide = Arc::new(AtomicU128::new(0));
         let mutex = Arc::new(loom::sync::Mutex::new(0usize));
+        let condvar = Arc::new(loom::sync::Condvar::new());
 
         let handles: Vec<_> = self
             .threads
@@ -771,18 +836,23 @@ impl FuzzProgram {
             .skip(1)
             .map(|(who, ops)| {
                 let ops = ops.clone();
-                let (cells, wide, mutex, log) =
-                    (cells.clone(), wide.clone(), mutex.clone(), log.clone());
+                let (cells, wide, mutex, condvar, log) = (
+                    cells.clone(),
+                    wide.clone(),
+                    mutex.clone(),
+                    condvar.clone(),
+                    log.clone(),
+                );
                 thread::spawn(move || {
                     for (op, ord) in ops {
-                        op.run(ord, who, &cells, &wide, &mutex, &log);
+                        op.run(ord, who, &cells, &wide, &mutex, &condvar, &log);
                     }
                 })
             })
             .collect();
 
         for &(op, ord) in &self.threads[0] {
-            op.run(ord, 0, &cells, &wide, &mutex, &log);
+            op.run(ord, 0, &cells, &wide, &mutex, &condvar, &log);
         }
 
         for h in handles {
@@ -857,6 +927,48 @@ fn fuzz_pruned_walk_matches_full_walk() {
             "seed={seed} bound={bound:?} workers={workers}: pruned walk took \
              {slept_n} executions, full walk {full_n}"
         );
+    }
+}
+
+/// Two independent searches, one inside the other: every behavior a
+/// preemption-bounded walk reaches is a behavior the unbounded walk must
+/// reach, since every bounded execution is an execution. The bounded walk is
+/// BPOR and the unbounded one source sets and wakeup trees, so neither checks
+/// itself here. Over both program families, serially and sharded.
+#[test]
+fn unbounded_walk_covers_every_bounded_behavior() {
+    let programs: u64 = std::env::var("LOOM_FUZZ_PROGRAMS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(64);
+
+    let families: [(&str, fn(u64) -> FuzzProgram); 2] = [
+        ("plain", FuzzProgram::generate),
+        ("blocking", FuzzProgram::generate_blocking),
+    ];
+
+    for (family, generate) in families {
+        for seed in 0..programs {
+            let program = Arc::new(generate(seed));
+            let workers = [1, 4][(seed % 2) as usize];
+
+            let run = |workers: usize, bound: Option<usize>| {
+                let program = program.clone();
+                explore_with(workers, bound, move |log| program.run(log), true, true)
+            };
+
+            let (bounded, _) = run(1, Some(3));
+            let (unbounded, n) = run(workers, None);
+
+            let lost: Vec<_> = bounded.difference(&unbounded).collect();
+            assert!(
+                lost.is_empty(),
+                "{family} seed={seed} workers={workers}: the unbounded walk ({n} \
+                 executions) missed {} behaviors the bound-3 walk reached: \
+                 {lost:?}\nprogram: {program:#?}",
+                lost.len(),
+            );
+        }
     }
 }
 

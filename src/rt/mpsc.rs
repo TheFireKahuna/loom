@@ -151,7 +151,7 @@ impl Channel {
                         .map(|operation| operation.object());
 
                     if obj == Some(self.state.erase()) {
-                        thread.set_runnable();
+                        thread.wake();
                     }
                 }
             }
@@ -190,7 +190,7 @@ impl Channel {
                         && thread.operation.as_ref().map(|operation| operation.object())
                             == Some(self.state.erase())
                     {
-                        thread.set_runnable();
+                        thread.wake();
                     }
                 }
             }

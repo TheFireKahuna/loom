@@ -1,4 +1,5 @@
 use crate::rt::alloc::Allocation;
+use crate::rt::dpor::Log;
 use crate::rt::sleep::SleepSet;
 use crate::rt::{lazy_static, object, thread, Path};
 
@@ -79,19 +80,17 @@ pub(crate) struct Execution {
     /// Threads asleep at the current point of the execution (`rt::sleep`).
     sleep: SleepSet,
 
+    /// The steps of the execution and the races each took part in, for the
+    /// unbounded search to reverse once the execution ends (`rt::dpor`).
+    pub(super) steps: Log,
+
     /// Prune sleep-set-redundant executions (`Builder::sleep_sets`, gated off
     /// under a preemption bound).
     pub(crate) sleep_sets: bool,
 
     /// Executions this instance cut short as sleep-set redundant. Cumulative
-    /// across iterations; never reset.
-    ///
-    /// A scout still runs its mark scan: its branches are non-exploring, so
-    /// its races land on exploring ancestors. That can open an alternative a
-    /// full walk would not have (a few extra executions on small trees), but
-    /// suppressing the marks loses behaviors outright under forward
-    /// deference — the deferred-to subtree is explored *later*, and scout
-    /// races are part of how its obligations get planted (fuzz seed 28).
+    /// across iterations; never reset. The scout tail of such an execution
+    /// reverses no race (`Execution::skip`).
     pub(crate) pruned: usize,
 }
 
@@ -153,6 +152,7 @@ impl Execution {
             log: false,
             reuse_objects: true,
             sleep: SleepSet::default(),
+            steps: Log::default(),
             sleep_sets: true,
             pruned: 0,
         }
@@ -179,6 +179,11 @@ impl Execution {
     /// Resets the execution state for the next execution run. Returns `false`
     /// when the path is fully explored.
     pub(crate) fn step(&mut self) -> bool {
+        if !self.path.is_bounded() {
+            let (steps, path) = (&mut self.steps, &mut self.path);
+            steps.reverse_races(path.fresh(), |index, rev| path.reverse(index, rev));
+        }
+
         if !self.path.step() {
             return false;
         }
@@ -214,6 +219,7 @@ impl Execution {
         self.vm.clear();
         self.threads.clear(id);
         self.sleep.clear();
+        self.steps.clear();
 
         // Object refs do not survive the iteration reset.
         self.dpor_update = None;
@@ -226,8 +232,25 @@ impl Execution {
         // Implementation of the DPOR algorithm.
 
         let curr_thread = self.threads.active_id();
+        let bounded = self.path.is_bounded();
 
-        {
+        // The step that just ended: its thread's clock now holds everything
+        // it was ordered after, and its branches have all been taken.
+        if !bounded && self.threads.is_active() {
+            self.steps.end(&self.threads.active().dpor_vv, self.path.step_key());
+        }
+
+        // The threads that step woke can run only after it.
+        for (id, th) in self.threads.iter_mut() {
+            if std::mem::take(&mut th.woken) && !bounded {
+                self.steps.woke(id.as_usize());
+            }
+        }
+
+        // Without a bound, races are reversed once the execution ends, each
+        // at the step that ran its later event (`rt::dpor`); the scan below
+        // is the bounded search's, which marks them as it goes.
+        if bounded {
             let objects = &self.objects;
             let path = &mut self.path;
             let dirty = self.dpor_update;
@@ -353,7 +376,7 @@ impl Execution {
                         None => {
                             if !self.path.is_skipping() {
                                 self.pruned += 1;
-                                self.path.skip_branch();
+                                self.skip();
                             }
                         }
                     }
@@ -362,6 +385,8 @@ impl Execution {
         }
 
         let path_id = self.path.pos();
+
+        let asleep = if self.sleep_sets { self.sleep.mask() } else { 0 };
 
         let (next, covered) = self.path.branch_thread(self.id, {
             self.threads.iter().map(|(i, th)| {
@@ -383,7 +408,7 @@ impl Execution {
                     Thread::Skip
                 }
             })
-        });
+        }, asleep);
 
         if self.sleep_sets && !timed {
             self.sleep.cover(covered);
@@ -393,7 +418,7 @@ impl Execution {
             if let Some(id) = next {
                 if self.sleep.contains(id) && !self.path.is_skipping() {
                     self.pruned += 1;
-                    self.path.skip_branch();
+                    self.skip();
                 }
             }
         }
@@ -415,9 +440,23 @@ impl Execution {
             return true;
         }
 
-        if self.threads.active().is_blocked_timed() {
+        let fires = self.threads.active().is_blocked_timed();
+
+        if fires {
             trace!(thread = ?self.threads.active_id(), ?others_runnable, "timeout fires");
             self.threads.active_mut().fire_timeout(others_runnable);
+        }
+
+        if !bounded {
+            let asleep = if self.sleep_sets { self.sleep.mask() } else { 0 };
+            let active = self.threads.active();
+            self.steps.begin(active.id.as_usize(), path_id, active.operation, asleep);
+
+            // A firing's enabledness hangs on what else can run, which no
+            // operation's dependence describes.
+            if fires {
+                self.steps.make_opaque();
+            }
         }
 
         // The chosen thread is scheduled now: any symmetry pin waiting on it
@@ -453,9 +492,16 @@ impl Execution {
             // recent one overall.
             {
                 let active = threads.active_mut();
-                active.dpor_prior = (!self.path.is_bounded()).then_some(active.dpor_vv);
+                active.dpor_prior = (!bounded).then_some(active.dpor_vv);
+                let prior = active.dpor_vv;
                 let dpor_vv = &mut active.dpor_vv;
+                let steps = &mut self.steps;
                 self.objects.for_each_dependent_access(operation, |access| {
+                    // Concurrent and dependent: a race, unless another of
+                    // this step's races is ordered after it (`rt::dpor`).
+                    if !bounded && !access.happens_before(&prior) {
+                        steps.race(access.path_id(), access.version());
+                    }
                     dpor_vv.join(access.version());
                 });
             }
@@ -548,6 +594,16 @@ impl Execution {
         report
     }
 
+    /// Finish the execution as a non-exploring scout: nothing from here on is
+    /// explored, and no race of a step from here on is reversed. A sleep set
+    /// cut it, so every continuation is covered where its sleepers fell
+    /// asleep, and the races there are reversed there; or the model asked to
+    /// skip it.
+    pub(crate) fn skip(&mut self) {
+        self.path.skip_branch();
+        self.steps.scout();
+    }
+
     /// Hand out the execution's lock data to be dropped by the caller,
     /// outside the execution borrow, last-touched first.
     pub(crate) fn take_lock_data(&mut self) -> Vec<super::registration::Instance> {
@@ -555,9 +611,11 @@ impl Execution {
     }
 
     /// Wake every sleeping thread: an operation whose dependence the sleep set
-    /// cannot see from `Operation::conflicts_with` ran.
+    /// cannot see from `Operation::conflicts_with` ran. The step that ran it
+    /// is dependent with every other for the race reversals too.
     pub(crate) fn wake_sleepers(&mut self) {
         self.sleep.wake_all();
+        self.steps.make_opaque();
     }
 
     /// Panics if any leaks were detected

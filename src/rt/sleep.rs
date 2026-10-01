@@ -1,31 +1,25 @@
-//! Sleep sets over the canonical thread order.
+//! Sleep sets for the unbounded search (`rt::dpor`).
 //!
 //! A thread goes to sleep at a schedule branch when a sibling alternative
-//! there already covers the executions that differ only by running this
-//! thread earlier: every behavior reachable by scheduling it now is reachable
-//! in that sibling's subtree by commuting its next operation forward across
-//! the independent operations in between. It wakes the moment a conflicting
-//! operation executes — past that point the commutation argument no longer
-//! holds. Scheduling a still-sleeping thread therefore proves the whole
-//! remainder redundant, and the execution finishes as a non-exploring scout
-//! (`Path::skip_branch`), closing the subtree.
+//! explored before the current one already covers the executions that differ
+//! only by running this thread earlier: every behavior reachable by
+//! scheduling it now is reachable in that sibling's subtree by commuting its
+//! next operation forward across the independent operations in between. It
+//! wakes the moment a conflicting operation executes — past that point the
+//! commutation argument no longer holds. Scheduling a still-sleeping thread
+//! therefore proves the whole remainder redundant, and the execution
+//! finishes as a non-exploring scout (`Execution::skip`), closing the
+//! subtree.
 //!
-//! Which siblings count as covering is one rule, built to survive sharding:
-//! the *open* alternatives canonically below the chosen one. Open bits are
-//! monotone and every open alternative is eventually fully explored, so
-//! deferring along the fixed thread order is well-founded: no two subtrees
-//! can each prune a class deferring to the other, regardless of which
-//! workers run them in which order — or, serially, of the order the
-//! depth-first walk happens to visit them. Deferring *forward* to a sibling
-//! not yet explored is what the classical explored-before rule cannot do,
-//! and it is where most of the pruning lives: the first subtree walked is
-//! the bulk of the tree, and its races open the very siblings it defers to.
-//!
-//! The rule is a function of the path prefix, the canonical order, and
-//! monotone branch state — never of when a sibling subtree happens to run.
-//! That order-freedom is the contract a parallel walk needs, and equally the
-//! contract an eager-race-reversal explorer would need, so the policy can be
-//! replaced without touching the runtime.
+//! "Explored before" is the order the branch's alternatives are taken in: the
+//! wakeup tree's order at a branch the path owns, and the claim order at a
+//! branch frozen for sharding, where alternatives run concurrently and the
+//! claim word's history is the one order every worker agrees on
+//! (`Path::branch_thread`). Either way the set an alternative defers to is
+//! fixed when the alternative is taken, so every execution of its subtree
+//! starts from the same sleep set: a wakeup tree inserted under one sleep set
+//! is never replayed under a larger one, which would cut the very executions
+//! whose races open the alternatives the tree still owes.
 //!
 //! Never engaged under a preemption bound. The commutation the whole scheme
 //! rests on is budget-blind: moving the sleeper's operation to the front of
@@ -59,6 +53,11 @@ impl SleepSet {
 
     pub(crate) fn is_empty(&self) -> bool {
         self.asleep == 0
+    }
+
+    /// The sleepers, a bit per thread index.
+    pub(crate) fn mask(&self) -> u16 {
+        self.asleep
     }
 
     pub(crate) fn contains(&self, id: thread::Id) -> bool {

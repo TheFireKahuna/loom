@@ -73,6 +73,15 @@ pub(crate) struct Thread {
     /// execution. One spurious return per thread bounds every park loop.
     park_spurred: bool,
 
+    /// A step woke this thread from an untimed block on an event it waits
+    /// for — a notification, a wake, an unpark, a message — and the
+    /// scheduler has not yet seen it (`rt::dpor`): the thread's next step can
+    /// run only after the step that woke it. A timed block's next step can
+    /// also be its timeout firing, earlier, so it is not set for one; nor
+    /// for a lock's release, since what orders a lock's acquirers is their
+    /// acquires.
+    pub(crate) woken: bool,
+
     /// Whether a timed wait of this thread has already timed out while
     /// another thread could run, this execution. One such early timeout per
     /// thread bounds every timed-wait loop; a timeout with nothing else
@@ -218,6 +227,7 @@ impl Thread {
             parked: false,
             park_spurred: false,
             timeout_spent: false,
+            woken: false,
             dpor_vv: VersionVec::new(),
             dpor_prior: None,
             last_yield: None,
@@ -291,6 +301,7 @@ impl Thread {
     /// carries no synchronization: the primitive supplies its own.
     pub(crate) fn wake(&mut self) {
         if self.is_blocked() {
+            self.woken = !self.is_blocked_timed();
             self.set_runnable();
         }
     }
@@ -581,6 +592,7 @@ impl Set {
 
         if th.parked {
             th.parked = false;
+            th.woken = !th.is_blocked_timed();
             th.set_runnable();
         }
     }

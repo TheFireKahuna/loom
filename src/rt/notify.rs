@@ -26,6 +26,9 @@ pub(super) struct State {
     /// `true` if there is a pending notification to consume.
     notified: bool,
 
+    /// The step that made the pending notification (`rt::dpor`).
+    notifier: Option<u32>,
+
     /// Tracks access to the notify object
     last_access: Option<Access>,
 
@@ -41,6 +44,7 @@ impl Notify {
                 did_spur: false,
                 seq_cst,
                 notified: false,
+                notifier: None,
                 last_access: None,
                 synchronize: Synchronize::new(),
             });
@@ -66,6 +70,7 @@ impl Notify {
             }
 
             state.notified = true;
+            state.notifier = execution.steps.current();
 
             let (_, inactive) = execution.threads.split_active();
 
@@ -137,6 +142,12 @@ impl Notify {
             }
 
             state.notified = false;
+
+            // Consuming the notification: this step runs after the one that
+            // made it in every execution, whether it blocked for it or found
+            // it already made by its own earlier check.
+            let notifier = state.notifier.take();
+            execution.steps.require(notifier);
         });
     }
 }

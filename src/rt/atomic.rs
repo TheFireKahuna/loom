@@ -975,7 +975,7 @@ fn page_dependence(execution: &mut Execution, p: usize, record: bool) {
 
     for access in page.accesses.iter().flatten() {
         if !access.happens_before(dpor_vv) {
-            execution.path.backtrack(access.path_id(), thread);
+            rt::dpor::race(&mut execution.path, &mut execution.steps, access, thread);
         }
     }
     for access in page.accesses.iter().flatten() {
@@ -1063,7 +1063,7 @@ pub(crate) fn reset(base: usize, len: usize, location: Location) {
             let mut joined = *dpor_vv;
             state.for_each_dependent_access(Action::Store(FULL_MASK), false, |access| {
                 if !access.happens_before(dpor_vv) {
-                    execution.path.backtrack(access.path_id(), thread);
+                    rt::dpor::race(&mut execution.path, &mut execution.steps, access, thread);
                 }
                 joined.join(access.version());
             });
@@ -2436,6 +2436,13 @@ struct RmwRead {
 }
 
 impl Store {
+    /// The store's identity across executions, as a step's key names what
+    /// its load read (`rt::dpor`): the operation that wrote it, by thread and
+    /// that thread's DPOR clock there.
+    fn key(&self) -> u64 {
+        1 << 63 | (self.creator as u64) << 16 | self.dpor as u64
+    }
+
     /// The creating thread's clock at creation: its own first sight of the
     /// store, taken as it stored (0 for a pre-execution genesis).
     fn tick(&self) -> u16 {
@@ -3780,6 +3787,7 @@ impl State {
                 }
                 path.branch_load()
             };
+            path.note_read(region.stores[chosen].key());
             for other in slots(maximal & !bit(chosen)) {
                 region.order(other, chosen);
             }
@@ -4042,6 +4050,7 @@ impl State {
             }
 
             let ci = path.branch_load();
+            path.note_read(self.regions[ri].stores[ci].key());
             let (next, next_view) = self
                 .rmw_step(ri, ci, (writable, readable), threads, orders, &acc, &entry, &view)
                 .expect("[loom internal bug] RMW committed to an illegal read");
@@ -4114,6 +4123,7 @@ impl State {
         }
 
         let ci = path.branch_load();
+        path.note_read(region.stores[ci].key());
         let value = region.stores[ci].value & region.mask;
         let arm = if spur {
             Arm::Spurious
@@ -4401,6 +4411,7 @@ impl State {
             }
 
             let index = path.branch_load();
+            path.note_read(self.regions[ri].stores[index].key());
             if multi {
                 // The chosen candidate is one the filter above passed — a
                 // replayed path replays a seed that same filter recorded — so

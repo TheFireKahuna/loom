@@ -26,6 +26,8 @@ pub(crate) use self::cell::Cell;
 mod condvar;
 pub(crate) use self::condvar::Condvar;
 
+mod dpor;
+
 mod execution;
 pub(crate) use self::execution::{Execution, Failure};
 
@@ -399,7 +401,7 @@ pub fn stop_exploring() {
 ///
 /// Unlike `stop_exploring`, exploration cannot be restarted by `explore`.
 pub fn skip_branch() {
-    execution(|execution| execution.path.skip_branch())
+    execution(|execution| execution.skip())
 }
 
 /// Explore both boolean outcomes at this point, resolved each way across

@@ -1,3 +1,4 @@
+use crate::rt::dpor::{Reversal, Wakeup};
 use crate::rt::{execution, object, thread, MAX_ATOMIC_HISTORY, MAX_THREADS};
 
 use std::sync::atomic::{
@@ -97,12 +98,15 @@ impl Frozen {
     }
 
     /// Take responsibility for the next alternative nobody holds, or `None`
-    /// when this branch is entirely spoken for.
+    /// when this branch is entirely spoken for. Also returns the
+    /// alternatives claimed before it: the claim word's history orders every
+    /// alternative of the branch, and that order is the one sleep sets defer
+    /// along (`Schedule::defer`).
     ///
     /// The retry is not a wait: every pass either wins a bit or observes one
     /// permanently claimed by somebody else, so it runs at most once per
     /// thread slot and always makes progress.
-    fn claim_next(&self) -> Option<usize> {
+    fn claim_next(&self) -> Option<(usize, u16)> {
         loop {
             let word = self.word.0.load(Acquire);
             let free = (word as u16) & !((word >> 16) as u16);
@@ -112,20 +116,19 @@ impl Frozen {
             }
 
             let thread = free.trailing_zeros() as usize;
-            let bit = 1u32 << (16 + thread);
-
-            if self.word.0.fetch_or(bit, AcqRel) & bit == 0 {
-                return Some(thread);
+            if let Some(before) = self.claim(thread) {
+                return Some((thread, before));
             }
         }
     }
 
-    /// Take responsibility for one specific alternative, reporting whether
-    /// this caller is the one that got it.
-    fn claim(&self, thread: usize) -> bool {
+    /// Take responsibility for one specific alternative: the alternatives
+    /// claimed before it when this caller is the one that got it.
+    fn claim(&self, thread: usize) -> Option<u16> {
         let bit = 1u32 << (16 + thread);
+        let prev = self.word.0.fetch_or(bit, AcqRel);
 
-        self.word.0.fetch_or(bit, AcqRel) & bit == 0
+        (prev & bit == 0).then(|| (prev >> 16) as u16)
     }
 
     /// Alternatives proven necessary here so far. Monotone — a set bit is a
@@ -185,6 +188,18 @@ pub(crate) struct Path {
     /// never which alternatives exist. So it only has to be deep enough to
     /// expose more independent subtrees than there are workers.
     split_depth: usize,
+
+    /// The choices the running step has taken so far: its key
+    /// (`rt::dpor`). One entry per load-value branch, the store read, and
+    /// one per spurious branch, its outcome.
+    #[cfg_attr(feature = "checkpoint", serde(skip))]
+    step_key: Vec<u64>,
+
+    /// The first branch whose choice this execution is the first to take:
+    /// every step from the one holding it on is new, and only those steps'
+    /// races have not been reversed yet.
+    #[cfg_attr(feature = "checkpoint", serde(skip))]
+    fresh: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -224,6 +239,18 @@ pub(crate) struct Schedule {
     /// This is the fairness-bound seam of Coons et al., carried as a flag
     /// rather than a second bound.
     yield_seam: bool,
+
+    /// The alternatives the current choice defers to when the branch is
+    /// frozen: those claimed before it (`Frozen::claim_next`). Fixed when the
+    /// choice is made, so the sleep set every execution of its subtree
+    /// starts from is the same, as a wakeup tree inserted under it assumes.
+    defer: u16,
+
+    /// Without a preemption bound, the branch's wakeup tree (`rt::dpor`):
+    /// a child for the current choice and for each `Pending` thread, in the
+    /// order they are explored. Empty under a bound and where nothing is
+    /// explored.
+    wut: Wakeup,
 }
 
 const _: () = assert!(MAX_ATOMIC_HISTORY <= u32::BITS as usize);
@@ -317,6 +344,26 @@ impl Path {
             exploring_on_start: exploring,
             frozen: Vec::new(),
             split_depth: 0,
+            step_key: Vec::new(),
+            fresh: 0,
+        }
+    }
+
+    /// The first branch this execution is the first to take (`fresh`).
+    pub(crate) fn fresh(&self) -> usize {
+        self.fresh
+    }
+
+    /// The choices the running step has taken (`step_key`).
+    pub(crate) fn step_key(&self) -> &[u64] {
+        &self.step_key
+    }
+
+    /// The running step's load read the store `key` names
+    /// (`rt::atomic::Store::key`).
+    pub(crate) fn note_read(&mut self, key: u64) {
+        if self.preemption_bound.is_none() {
+            self.step_key.push(key);
         }
     }
 
@@ -450,19 +497,30 @@ impl Path {
             .spur;
 
         self.pos += 1;
+
+        if self.preemption_bound.is_none() {
+            self.step_key.push(spurious as u64);
+        }
+
         spurious
     }
 
     /// Returns the thread identifier to schedule, and the mask of sibling
-    /// alternatives this execution may defer to at the branch (`rt::sleep`):
-    /// the canonically-lower open alternatives, minus the bound's
-    /// conservative ones. One rule for owned and frozen branches alike — at a
-    /// frozen branch the private copy's thread states are degenerate, so the
-    /// open set comes from the claim record instead.
+    /// alternatives this execution may defer to at the branch (`rt::sleep`).
+    /// Under a preemption bound there are none. Otherwise, at a branch this
+    /// path owns, the alternatives already explored there; at a frozen
+    /// branch, whose alternatives run concurrently, those claimed before the
+    /// current one (`Schedule::defer`).
+    ///
+    /// A new branch takes its first choice from the wakeup tree its parent
+    /// owes this step (`rt::dpor`), dropping children `asleep` and, where a
+    /// child's thread cannot run here, opening every runnable thread that is
+    /// not asleep instead; with no tree it takes the scheduler's seed.
     pub(super) fn branch_thread(
         &mut self,
         execution_id: execution::Id,
         seed: impl ExactSizeIterator<Item = Thread>,
+        asleep: u16,
     ) -> (Option<thread::Id>, u16) {
         if self.is_traversed() {
             assert_path_len!(self.branches);
@@ -483,6 +541,8 @@ impl Path {
                 conservative: 0,
                 entered_conservative: false,
                 yield_seam: false,
+                defer: 0,
+                wut: Wakeup::default(),
             });
 
             // Get a reference to the branch in the object store.
@@ -559,7 +619,25 @@ impl Path {
             schedule.initial_active = initial_active;
             schedule.preemptions = preemptions;
             schedule.yield_seam = yield_seam;
+
+            if self.preemption_bound.is_none() && self.exploring {
+                // The continuation the parent's wakeup tree owes this step.
+                let owed = match prev {
+                    Some(prev) => {
+                        let prev = prev.get_mut(&mut self.branches);
+                        match prev.active_thread_index() {
+                            Some(a) => prev.wut.take(a as usize, &self.step_key),
+                            None => Wakeup::default(),
+                        }
+                    }
+                    None => Wakeup::default(),
+                };
+
+                schedule_ref.get_mut(&mut self.branches).seed_wakeup(owed, asleep);
+            }
         }
+
+        self.step_key.clear();
 
         let index = self.pos;
 
@@ -580,21 +658,10 @@ impl Path {
         // class would have lived. Not a theoretical scruple — the fuzz corpus
         // finds behavior loss for bounded deference within seconds.
         let covered = match active {
-            Some(chosen) if self.preemption_bound.is_none() => {
-                let coverable = match self.frozen.get(index) {
-                    Some(frozen) => frozen.open_mask(),
-                    None => schedule
-                        .threads
-                        .iter()
-                        .enumerate()
-                        .filter(|&(_, th)| {
-                            matches!(th, Thread::Pending | Thread::Active | Thread::Visited)
-                        })
-                        .fold(0u16, |mask, (i, _)| mask | (1u16 << i)),
-                };
-
-                coverable & ((1u16 << chosen) - 1)
-            }
+            Some(_) if self.preemption_bound.is_none() => match self.frozen.get(index) {
+                Some(_) => schedule.defer,
+                None => schedule.mask_of(Thread::Visited),
+            },
             _ => 0,
         };
 
@@ -655,6 +722,129 @@ impl Path {
                     }
                     return;
                 }
+            }
+        }
+    }
+
+    /// Reverse a race of the unbounded search at the schedule branch at
+    /// `index`, where its earlier event was chosen (`rt::dpor`).
+    ///
+    /// Nothing is owed when an initial of the reversal `v` is asleep there,
+    /// already explored, or already owed: every execution `v` leads to starts
+    /// with that thread's step, so its subtree covers them. Otherwise a
+    /// branch this path owns takes `v` into its wakeup tree, starting with an
+    /// initial that can be scheduled there, and a frozen one opens such an
+    /// initial in the claim record. When the only initials are spinners, a
+    /// runnable thread that commutes with all of `v` steps first, which
+    /// leaves the trace as it is; when they are blocked, nothing can run
+    /// `e'` before `e`, and nothing is owed.
+    pub(super) fn reverse(&mut self, index: usize, rev: &Reversal<'_>) {
+        let schedule_ref = object::Ref::from_usize(index)
+            .downcast::<Schedule>(&self.branches)
+            .expect("[loom internal bug] a race reversed at a branch that is not a schedule");
+
+        if !schedule_ref.get(&self.branches).exploring {
+            // Nothing is explored here: classic DPOR's rule at the nearest
+            // branch that is.
+            self.mark_target(index, rev.target());
+            return;
+        }
+
+        let asleep = rev.asleep();
+        let initials = rev.initials();
+        if initials & asleep != 0 {
+            return;
+        }
+
+        if let Some(frozen) = self.frozen.get(index) {
+            if initials & frozen.open_mask() != 0 {
+                return;
+            }
+
+            let usable = frozen.enabled & frozen.markable & !asleep;
+            let open = if initials & usable & (1 << rev.target()) != 0 {
+                1 << rev.target()
+            } else if initials & usable != 0 {
+                initials & usable & (initials & usable).wrapping_neg()
+            } else if initials & frozen.enabled != 0 {
+                // Enabled and never markable: a spinner.
+                rev.runnable_weak_initial(usable).map_or(0, |y| 1 << y)
+            } else {
+                0
+            };
+
+            frozen.open(open, false);
+            return;
+        }
+
+        let schedule = schedule_ref.get_mut(&mut self.branches);
+
+        if initials & schedule.mask_of(Thread::Visited) != 0 {
+            return;
+        }
+
+        if rev.covered_by_tree(&mut schedule.wut, 1 << rev.racer()) {
+            return;
+        }
+
+        let w = rev.seq();
+        let usable = schedule.mask_of(Thread::Skip) & !asleep;
+        let first = rev.thread_of(w[0]);
+
+        if initials & usable & (1 << first) != 0 {
+            rev.append(&mut schedule.wut, w);
+            schedule.threads[first] = Thread::Pending;
+        } else if initials & usable != 0 {
+            let q = (initials & usable).trailing_zeros() as usize;
+            rev.append(&mut schedule.wut, &rev.starting_with(q));
+            schedule.threads[q] = Thread::Pending;
+        } else if initials & schedule.mask_of(Thread::Yield) != 0 {
+            // A spinner runs only once another thread steps.
+            if let Some(y) = rev.runnable_weak_initial(usable) {
+                let mut led = vec![rev.next_of(y).expect("[loom internal bug] no next step")];
+                led.extend_from_slice(w);
+                rev.append(&mut schedule.wut, &led);
+                schedule.threads[y] = Thread::Pending;
+            }
+        }
+    }
+
+    /// Classic DPOR's backtrack rule for the unbounded search, where the
+    /// branch at `point` explores nothing: open `thread` at the nearest
+    /// exploring schedule branch at or before it, or every candidate there
+    /// when `thread` cannot be scheduled there.
+    fn mark_target(&mut self, mut point: usize, thread: usize) {
+        let schedule_ref = loop {
+            if let Some(schedule_ref) =
+                object::Ref::from_usize(point).downcast::<Schedule>(&self.branches)
+            {
+                if schedule_ref.get(&self.branches).exploring {
+                    break schedule_ref;
+                }
+            }
+
+            if point == 0 {
+                return;
+            }
+
+            point -= 1;
+        };
+
+        let bit = 1u16 << thread;
+
+        if let Some(frozen) = self.frozen.get(point) {
+            let candidates = if frozen.enabled & bit != 0 { bit } else { ALL_THREADS };
+            frozen.open(candidates & frozen.markable, false);
+            return;
+        }
+
+        let schedule = schedule_ref.get_mut(&mut self.branches);
+
+        if schedule.threads[thread].is_enabled() {
+            schedule.open_leaf(thread);
+        } else {
+            for q in 0..MAX_THREADS {
+                schedule.open_leaf(q);
             }
         }
     }
@@ -776,7 +966,7 @@ impl Path {
             // branch, so it costs one atomic instead of a trip through the
             // pool.
             if last.index() < self.frozen.len() {
-                let Some(thread) = self.frozen[last.index()].claim_next() else {
+                let Some((thread, before)) = self.frozen[last.index()].claim_next() else {
                     // Nothing left here for anybody. Dropping the record is
                     // safe precisely because of that: this path can no longer
                     // be the one that owes work at this branch.
@@ -803,7 +993,16 @@ impl Path {
                 }
 
                 schedule.entered_conservative = entered_conservative;
+                schedule.defer = before;
 
+                // A claimed alternative owes no continuation: whatever reversed
+                // a race into it went through the claim record.
+                if self.preemption_bound.is_none() {
+                    schedule.wut.clear();
+                    schedule.wut.push_leaf(thread);
+                }
+
+                self.fresh = last.index();
                 return true;
             }
 
@@ -816,27 +1015,31 @@ impl Path {
 
                 // The alternative just explored is finished; its subtree from
                 // this branch is fully walked.
-                if let Some(thread) = schedule.threads.iter_mut().find(|th| th.is_active()) {
-                    *thread = Thread::Visited;
+                if let Some(i) = schedule.threads.iter().position(Thread::is_active) {
+                    schedule.threads[i] = Thread::Visited;
+                    schedule.wut.remove(i);
                 }
 
-                // Find a pending thread and transition it to active.
-                let mut rem = None;
-
-                for (i, th) in schedule.threads.iter_mut().enumerate() {
-                    if !th.is_pending() {
-                        continue;
-                    }
-
-                    *th = Thread::Active;
-                    rem = Some(i);
-                    break;
-                }
+                // The next alternative: the wakeup tree's order without a
+                // bound, the lowest pending thread under one.
+                let rem = if self.preemption_bound.is_none() {
+                    let threads = &schedule.threads;
+                    schedule.wut.threads().find(|&i| threads[i].is_pending())
+                } else {
+                    schedule.threads.iter().position(Thread::is_pending)
+                };
 
                 if let Some(i) = rem {
+                    schedule.threads[i] = Thread::Active;
                     schedule.entered_conservative = schedule.conservative & (1 << i) != 0;
+                    self.fresh = last.index();
                     return true;
                 }
+
+                debug_assert!(
+                    !schedule.threads.iter().any(Thread::is_pending),
+                    "[loom internal bug] a pending thread outside the wakeup tree"
+                );
             } else if let Some(load_ref) = last.downcast::<Load>(&self.branches) {
                 let load = load_ref.get_mut(&mut self.branches);
 
@@ -847,6 +1050,7 @@ impl Path {
                 load.pos += 1;
 
                 if load.pos < load.len {
+                    self.fresh = last.index();
                     return true;
                 }
             } else if let Some(spurious_ref) = last.downcast::<Spurious>(&self.branches) {
@@ -858,6 +1062,7 @@ impl Path {
 
                 if !spurious.spur {
                     spurious.spur = true;
+                    self.fresh = last.index();
                     return true;
                 }
             } else {
@@ -907,11 +1112,11 @@ impl Path {
 
         for point in 0..self.floor() {
             while tasks.len() < wanted {
-                let Some(thread) = self.frozen[point].claim_next() else {
+                let Some((thread, before)) = self.frozen[point].claim_next() else {
                     break;
                 };
 
-                tasks.push(self.task_at(point, Fixed::Thread(thread)));
+                tasks.push(self.task_at(point, Fixed::Thread(thread, before)));
             }
         }
 
@@ -945,7 +1150,7 @@ impl Path {
                                 // Open, and about to be claimed by its task.
                                 Thread::Pending => {
                                     open |= bit;
-                                    handing_out.push(Fixed::Thread(i));
+                                    handing_out.push(Fixed::Thread(i, 0));
                                 }
                                 // Open, and this path is already on it or done
                                 // with it.
@@ -988,14 +1193,35 @@ impl Path {
                 self.frozen.push(Arc::new(frozen));
                 debug_assert_eq!(self.floor(), point + 1, "[loom internal bug]");
 
-                for fixed in handing_out {
-                    if let Fixed::Thread(i) = fixed {
-                        let won = self.frozen[point].claim(i);
+                // This path's own choice keeps deferring to what it explored
+                // before it, and goes on with only its own continuation; the
+                // pending children are claimed in the wakeup tree's order, so
+                // each defers to everything before it in that order.
+                if let Some(sched) = entry.downcast::<Schedule>(&self.branches) {
+                    let sched = sched.get_mut(&mut self.branches);
+                    sched.defer = sched.mask_of(Thread::Visited);
+                    let order: Vec<usize> = sched.wut.threads().collect();
+                    handing_out.sort_by_key(|fixed| match fixed {
+                        Fixed::Thread(i, _) => order.iter().position(|t| t == i),
+                        _ => None,
+                    });
+                }
 
-                        debug_assert!(won, "[loom internal bug] fresh branch already claimed");
+                for mut fixed in handing_out {
+                    if let Fixed::Thread(i, ref mut before) = fixed {
+                        *before = self.frozen[point]
+                            .claim(i)
+                            .expect("[loom internal bug] fresh branch already claimed");
                     }
 
                     tasks.push(self.task_at(point, fixed));
+                }
+
+                if let Some(sched) = entry.downcast::<Schedule>(&self.branches) {
+                    let sched = sched.get_mut(&mut self.branches);
+                    if let Some(a) = sched.active_thread_index() {
+                        sched.wut.retain_only(a as usize);
+                    }
                 }
             }
         }
@@ -1011,6 +1237,7 @@ impl Path {
 
         let mut task = self.clone();
         task.pos = 0;
+        task.fresh = point;
         task.branches.truncate(entry);
 
         // `point` is frozen for the new task too — its choice there is
@@ -1028,7 +1255,7 @@ impl Path {
         }
 
         match fixed {
-            Fixed::Thread(thread) => {
+            Fixed::Thread(thread, before) => {
                 let entered_conservative = task.frozen[point].is_conservative(thread);
 
                 let schedule = entry
@@ -1048,6 +1275,10 @@ impl Path {
                 }
 
                 schedule.entered_conservative = entered_conservative;
+                schedule.defer = before;
+
+                // The task carries the continuation its alternative owes.
+                schedule.wut.retain_only(thread);
             }
             Fixed::Value(value) => {
                 entry
@@ -1095,7 +1326,8 @@ impl Path {
 
 /// The one choice a spawned task takes at the branch it was created for.
 enum Fixed {
-    Thread(usize),
+    /// A thread, with the alternatives claimed before it.
+    Thread(usize, u16),
     Value(u8),
     Spurious,
 }
@@ -1119,6 +1351,73 @@ impl Schedule {
         self.preemptions
     }
 
+    /// The threads in state `state`.
+    fn mask_of(&self, state: Thread) -> u16 {
+        self.threads
+            .iter()
+            .enumerate()
+            .filter(|&(_, th)| *th == state)
+            .fold(0u16, |mask, (i, _)| mask | (1u16 << i))
+    }
+
+    /// Install the wakeup tree `owed` at a new branch whose seed is set: its
+    /// first child that can run becomes the choice, the rest `Pending`.
+    /// Children `asleep` are dropped — every execution they lead to is
+    /// covered where they fell asleep. A child whose thread cannot be
+    /// scheduled here, which loom's enabling rules (spinning, symmetry pins,
+    /// timeouts) can make of a reversal recorded elsewhere, is replaced by
+    /// every runnable thread not asleep, each with no continuation.
+    fn seed_wakeup(&mut self, mut owed: Wakeup, asleep: u16) {
+        let runnable = self.mask_of(Thread::Skip) | self.mask_of(Thread::Active);
+
+        let mut infeasible = false;
+        let mut keep = 0u16;
+        for q in owed.threads() {
+            if runnable & (1 << q) == 0 {
+                infeasible = true;
+            } else if asleep & (1 << q) == 0 {
+                keep |= 1 << q;
+            }
+        }
+        owed.retain_mask(keep);
+
+        if let Some(first) = owed.threads().next() {
+            for th in self.threads.iter_mut() {
+                if *th == Thread::Active {
+                    *th = Thread::Skip;
+                }
+            }
+            for q in owed.threads() {
+                self.threads[q] = Thread::Pending;
+            }
+            self.threads[first] = Thread::Active;
+        }
+
+        self.wut = owed;
+
+        if let Some(active) = self.active_thread_index() {
+            if !self.wut.contains(active as usize) {
+                self.wut.push_leaf(active as usize);
+            }
+        }
+
+        if infeasible {
+            for q in 0..MAX_THREADS {
+                if self.threads[q] == Thread::Skip && asleep & (1 << q) == 0 {
+                    self.threads[q] = Thread::Pending;
+                    self.wut.push_leaf(q);
+                }
+            }
+        }
+    }
+
+    /// Open `thread` here as a leaf of the wakeup tree, if it is not open yet.
+    fn open_leaf(&mut self, thread: usize) {
+        if self.threads[thread] == Thread::Skip {
+            self.threads[thread] = Thread::Pending;
+            self.wut.push_leaf(thread);
+        }
+    }
 }
 
 impl Thread {

@@ -105,6 +105,12 @@ pub struct Builder {
 
     /// Maximum number of thread preemptions to explore
     ///
+    /// Without a bound (`None`) the search is optimal dynamic partial-order
+    /// reduction: source sets and wakeup trees (Abdulla et al., JACM 2017),
+    /// which reaches every equivalence class of executions, most of them
+    /// once. Under a bound it is bounded partial-order reduction (Coons et
+    /// al., OOPSLA'13), complete for the executions within the bound.
+    ///
     /// A preemption is a switch away from a thread that could have continued,
     /// including one that called [`thread::yield_now`](crate::thread::yield_now).
     /// A switch after a thread blocks or finishes is free, and so is the
@@ -216,13 +222,16 @@ pub struct Builder {
     pub reuse_objects: bool,
 
     /// Prune executions that only reorder independent operations of a
-    /// subtree already covered at some branch (canonical-order sleep sets,
-    /// see `rt::sleep`). Coverage is unchanged: every observable behavior of
-    /// the full walk is still reached.
+    /// subtree already covered at some branch (sleep sets, see `rt::sleep`).
+    /// Coverage is unchanged: every observable behavior of the full walk is
+    /// still reached.
     ///
-    /// On by default; `LOOM_SLEEP_SETS=0` turns it off, restoring the exact
-    /// exploration the pruned walk is tested against — with it off, sharded
-    /// execution counts are again identical at every worker count.
+    /// On by default; `LOOM_SLEEP_SETS=0` turns it off, restoring the
+    /// exploration the pruned walk is tested against. Without sleep sets a
+    /// bounded walk's sharded execution counts are identical at every worker
+    /// count; an unbounded walk's are not, since a branch frozen for sharding
+    /// takes its reversals as source sets rather than into a wakeup tree
+    /// (`rt::dpor`), and which branches freeze depends on timing.
     ///
     /// Inert when `preemption_bound` is set. Deference is only sound when
     /// the covered-elsewhere subtree is fully explored, and a bound truncates
