@@ -872,6 +872,7 @@ impl Engine {
                 let execution: *mut Execution = &mut world.inner().execution;
                 // SAFETY: the world outlives the call.
                 world.routed(|| unsafe { (*execution).check_for_leaks() });
+                world.check_escapes();
             }
         }
     }

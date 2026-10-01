@@ -1,6 +1,7 @@
 #![allow(deprecated)]
 
 use crate::rt::execution::Failure;
+use crate::rt::world;
 use crate::rt::Execution;
 
 use generator::{self, Generator, Gn};
@@ -49,6 +50,10 @@ struct PooledThread {
     /// coroutine's context and closure there.
     sp: usize,
     end: usize,
+
+    /// Whether the coroutine was running the code under test, rather than
+    /// the runtime, when it last yielded: what its allocations resume as.
+    in_model: bool,
 }
 
 type Thread = Generator<'static, Option<Box<dyn FnOnce()>>, ()>;
@@ -147,6 +152,7 @@ impl Scheduler {
                 stack_size,
                 sp,
                 end: mapping_end(top),
+                in_model: false,
             });
         }
         scheduler
@@ -191,6 +197,7 @@ impl Scheduler {
         }
         STATE.with(|run| {
             let mut state = run.state.try_borrow_mut().ok()?;
+            let _runtime = world::runtime();
             Some(f(state.execution()))
         })
     }
@@ -308,7 +315,10 @@ impl Scheduler {
 
             // A panic that unwound to the coroutine's root: the thread's own
             // destructors have run, against a still-consistent runtime.
-            if let Err(payload) = panic::catch_unwind(AssertUnwindSafe(|| thread.gen.resume())) {
+            world::set_in_model(thread.in_model);
+            let resumed = panic::catch_unwind(AssertUnwindSafe(|| thread.gen.resume()));
+            thread.in_model = world::set_in_model(false);
+            if let Err(payload) = resumed {
                 std::hint::cold_path();
                 return Drive::Done(Err(Failure::Panic(payload)));
             }
@@ -435,6 +445,7 @@ impl Scheduler {
                     stack_size,
                     sp,
                     end: mapping_end(top),
+                    in_model: false,
                 };
                 self.rebuilt = true;
             }
@@ -447,6 +458,7 @@ impl Scheduler {
                     stack_size,
                     sp,
                     end: mapping_end(top),
+                    in_model: false,
                 });
                 self.rebuilt = true;
             }
@@ -456,6 +468,8 @@ impl Scheduler {
         thread.gen.set_para(Some(f));
         thread.gen.resume();
         thread.sp = YIELDED.get().0;
+        // Parked at its recv point; its next resume runs the closure.
+        thread.in_model = true;
     }
 
     fn with_state<F, R>(f: F) -> R
@@ -477,6 +491,7 @@ impl Scheduler {
             Self::request_snapshot();
         }
 
+        let _runtime = world::runtime();
         STATE.with(|run| f(&mut run.state.borrow_mut()))
     }
 }

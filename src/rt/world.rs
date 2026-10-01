@@ -13,6 +13,13 @@
 //! memory by a thread that does not own the arena aborts the process — it
 //! means state the model created escaped into memory other threads share,
 //! which a restore would corrupt.
+//!
+//! An arena has two zones with an allocator each: the runtime's, whose state
+//! persists across executions, and the model's, for what the code under test
+//! allocates while it runs. A block stays in the zone it was allocated in.
+//! Everything in the model's zone dies with its execution, so a block still
+//! live there when the execution ends escaped it into state that outlives
+//! it, which the next restore would rewind under its owner.
 
 use std::alloc::Layout;
 use std::cell::Cell;
@@ -20,6 +27,12 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering::Relaxed};
 
 /// Bytes of address space per arena.
 const SLOT: usize = 1 << 30;
+
+/// Bytes of address space per zone, and the zones of an arena: the
+/// runtime's at the base, the model's above it.
+const ZONE: usize = SLOT / 2;
+pub(crate) const ZONES: usize = 2;
+const MODEL: usize = 1;
 
 /// Arenas the process can hold at once: every exploring thread of every
 /// check running in it. A thread that finds none free replays instead.
@@ -140,6 +153,31 @@ static ROUTE: Cell<*mut Header> = Cell::new(std::ptr::null_mut());
 #[thread_local]
 static OWNED: Cell<*mut Header> = Cell::new(std::ptr::null_mut());
 
+/// Whether the code under test is running on this thread, so routed
+/// allocations go to the model's zone. The scheduler keeps one per
+/// coroutine, since a coroutine can yield inside the runtime.
+#[thread_local]
+static IN_MODEL: Cell<bool> = Cell::new(false);
+
+/// Set whether the code under test is running; returns the previous value.
+pub(crate) fn set_in_model(on: bool) -> bool {
+    IN_MODEL.replace(on)
+}
+
+/// The runtime runs, not the code under test, until the guard drops.
+pub(crate) fn runtime() -> Runtime {
+    Runtime(set_in_model(false))
+}
+
+#[derive(Debug)]
+pub(crate) struct Runtime(bool);
+
+impl Drop for Runtime {
+    fn drop(&mut self) {
+        IN_MODEL.set(self.0);
+    }
+}
+
 #[repr(C)]
 struct Header {
     /// Offset of the first byte never handed out.
@@ -152,6 +190,8 @@ struct Header {
     /// each other or to the bump offset.
     holes: [(usize, usize); HOLES],
     hole_count: usize,
+    /// Blocks handed out and not yet freed.
+    live: usize,
 }
 
 /// One worker's arena.
@@ -198,25 +238,29 @@ impl Arena {
         let slot = claim()?;
 
         let base = (base + slot * SLOT) as *mut u8;
-        if !os::commit(base, COMMIT) {
-            TAKEN[slot / 64].fetch_and(!(1 << (slot % 64)), Relaxed);
-            return None;
-        }
-
-        let header = base.cast::<Header>();
-        // SAFETY: committed, exclusively ours.
-        unsafe {
-            header.write(Header {
-                bump: std::mem::size_of::<Header>().next_multiple_of(64),
-                committed: COMMIT,
-                free: [0; CLASSES],
-                holes: [(0, 0); HOLES],
-                hole_count: 0,
-            });
+        for zone in 0..ZONES {
+            // SAFETY: inside the slot.
+            let at = unsafe { base.add(zone * ZONE) };
+            if !os::commit(at, COMMIT) {
+                os::decommit(base, SLOT);
+                TAKEN[slot / 64].fetch_and(!(1 << (slot % 64)), Relaxed);
+                return None;
+            }
+            // SAFETY: committed, exclusively ours.
+            unsafe {
+                at.cast::<Header>().write(Header {
+                    bump: std::mem::size_of::<Header>().next_multiple_of(64),
+                    committed: COMMIT,
+                    free: [0; CLASSES],
+                    holes: [(0, 0); HOLES],
+                    hole_count: 0,
+                    live: 0,
+                });
+            }
         }
 
         assert!(OWNED.get().is_null(), "loom: a thread owns one arena at a time");
-        OWNED.set(header);
+        OWNED.set(base.cast());
 
         Some(Arena { base, slot })
     }
@@ -226,17 +270,28 @@ impl Arena {
         Route(ROUTE.replace(self.base.cast()))
     }
 
-    /// The arena's base.
-    pub(crate) fn base(&self) -> *mut u8 {
-        self.base
+    /// The base of `zone`.
+    pub(crate) fn zone_base(&self, zone: usize) -> *mut u8 {
+        // SAFETY: inside the slot.
+        unsafe { self.base.add(zone * ZONE) }
     }
 
-    /// The byte ranges, as `(offset, len)` from the base, that hold
+    fn header(&self, zone: usize) -> &Header {
+        // SAFETY: each zone's header is committed for the arena's life.
+        unsafe { &*self.zone_base(zone).cast::<Header>() }
+    }
+
+    /// The byte ranges of `zone`, as `(offset, len)` from its base, that hold
     /// anything: the allocator's metadata and every block it has handed out,
     /// less the holes freed large blocks left.
-    pub(crate) fn live(&self, f: impl FnMut(usize, usize)) {
-        // SAFETY: the header is committed for the arena's life.
-        unsafe { (*self.base.cast::<Header>()).live(f) }
+    pub(crate) fn live(&self, zone: usize, f: impl FnMut(usize, usize)) {
+        self.header(zone).live(f)
+    }
+
+    /// Blocks the code under test allocated that are still live. Between
+    /// executions every one escaped the execution that made it.
+    pub(crate) fn model_live(&self) -> usize {
+        self.header(MODEL).live
     }
 
     /// Give the slot back. Every object in the arena must be dead or leaked.
@@ -302,7 +357,7 @@ fn block(layout: Layout) -> Block {
 impl Header {
     /// Advance the bump offset to `end`, committing as needed.
     unsafe fn bump_to(&mut self, end: usize) -> bool {
-        if end > SLOT {
+        if end > ZONE {
             return false;
         }
         if end > self.committed {
@@ -362,8 +417,18 @@ impl Header {
 }
 
 /// # Safety
-/// `header` is a live arena's header and this thread owns it.
+/// `header` is a live zone's header and this thread owns its arena.
 unsafe fn alloc_in(header: *mut Header, layout: Layout) -> *mut u8 {
+    let ptr = carve(header, layout);
+    if !ptr.is_null() {
+        (*header).live += 1;
+    }
+    ptr
+}
+
+/// # Safety
+/// As [`alloc_in`].
+unsafe fn carve(header: *mut Header, layout: Layout) -> *mut u8 {
     let h = &mut *header;
     let base = header.cast::<u8>();
 
@@ -419,6 +484,7 @@ unsafe fn alloc_in(header: *mut Header, layout: Layout) -> *mut u8 {
 /// `ptr` came from [`alloc_in`] on `header` with `layout`.
 unsafe fn dealloc_in(header: *mut Header, ptr: *mut u8, layout: Layout) {
     let h = &mut *header;
+    h.live -= 1;
     let offset = ptr as usize - header as usize;
     match block(layout) {
         Block::Small(class) => {
@@ -456,6 +522,23 @@ unsafe fn realloc_in(header: *mut Header, ptr: *mut u8, layout: Layout, new_size
     fresh
 }
 
+/// The header of the zone that `ptr`, an address in the arena whose header
+/// is `arena`, lies in.
+fn zone_of(arena: *mut Header, ptr: *mut u8) -> *mut Header {
+    let zone = (ptr as usize - arena as usize) / ZONE;
+    (arena as usize + zone * ZONE) as *mut Header
+}
+
+/// The zone this thread's routed allocations go to.
+#[inline]
+fn routed_zone(route: *mut Header) -> *mut Header {
+    if IN_MODEL.get() {
+        (route as usize + MODEL * ZONE) as *mut Header
+    } else {
+        route
+    }
+}
+
 fn escaped() -> ! {
     use std::io::Write;
     let _ = std::io::stderr().write_all(
@@ -474,7 +557,7 @@ fn escaped() -> ! {
 pub(crate) unsafe fn alloc<A: std::alloc::GlobalAlloc>(next: &A, layout: Layout) -> *mut u8 {
     let route = ROUTE.get();
     if !route.is_null() {
-        return alloc_in(route, layout);
+        return alloc_in(routed_zone(route), layout);
     }
     if !INSTALLED.load(Relaxed) {
         INSTALLED.store(true, Relaxed);
@@ -490,7 +573,7 @@ pub(crate) unsafe fn alloc<A: std::alloc::GlobalAlloc>(next: &A, layout: Layout)
 pub(crate) unsafe fn alloc_zeroed<A: std::alloc::GlobalAlloc>(next: &A, layout: Layout) -> *mut u8 {
     let route = ROUTE.get();
     if !route.is_null() {
-        let ptr = alloc_in(route, layout);
+        let ptr = alloc_in(routed_zone(route), layout);
         if !ptr.is_null() {
             ptr.write_bytes(0, layout.size());
         }
@@ -515,7 +598,7 @@ pub(crate) unsafe fn dealloc<A: std::alloc::GlobalAlloc>(next: &A, ptr: *mut u8,
             }
             escaped();
         }
-        return dealloc_in(owned, ptr, layout);
+        return dealloc_in(zone_of(owned, ptr), ptr, layout);
     }
     next.dealloc(ptr, layout)
 }
@@ -549,5 +632,5 @@ pub(crate) unsafe fn realloc<A: std::alloc::GlobalAlloc>(
         }
         escaped();
     }
-    realloc_in(owned, ptr, layout, new_size)
+    realloc_in(zone_of(owned, ptr), ptr, layout, new_size)
 }

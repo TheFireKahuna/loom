@@ -133,6 +133,28 @@ impl World {
         f()
     }
 
+    /// Fail if the code under test left anything it allocated live at the end
+    /// of an execution: such a block is reachable only from state that
+    /// outlives the execution, and the next restore would rewind it.
+    ///
+    /// On failure the world is abandoned as after a failed execution: the
+    /// escaped blocks' owner may still free them, which must not reach a
+    /// released arena.
+    pub(crate) fn check_escapes(&mut self) {
+        let live = self.arena().model_live();
+        if live == 0 {
+            return;
+        }
+        self.arena.take().unwrap().orphan();
+        panic!(
+            "loom: {live} block(s) the model allocated outlived its execution. An \
+             execution's allocations are snapshotted and rewound, so state that outlives \
+             one — a `static`, a `OnceLock`, a `std::thread_local!`, a registry, a leaked \
+             box — must be built inside `loom::alloc::outside`; or run with \
+             LOOM_SNAPSHOT=0, which replays every execution instead",
+        );
+    }
+
     /// Abandon the world after a failed execution: its objects own user
     /// values whose destructors must not run, and the failure's payload may
     /// live in it.
@@ -145,6 +167,10 @@ impl World {
 
 impl Drop for World {
     fn drop(&mut self) {
+        // Abandoned with everything in it (`check_escapes`).
+        if self.arena.is_none() {
+            return;
+        }
         {
             let _route = self.arena().enter();
             // SAFETY: allocated in `new`; nothing uses it after this.
@@ -220,8 +246,8 @@ impl Drop for Pool {
 #[derive(Debug)]
 struct Snapshot {
     cursor: Cursor,
-    /// The arena's pages, from its base.
-    arena: Table,
+    /// Each arena zone's pages, from the zone's base.
+    arena: [Table; world::ZONES],
     /// Each live coroutine stack's pages, from its top down, keyed by its top.
     stacks: Vec<(usize, Table)>,
     /// The pages this snapshot holds itself.
@@ -390,7 +416,7 @@ impl Snapshots {
         let mut own = snapshot.own;
         self.pool.free.extend(own.drain(..));
         self.spare_own.push(own);
-        self.spare_tables.push(snapshot.arena);
+        self.spare_tables.extend(snapshot.arena);
         self.spare_tables
             .extend(snapshot.stacks.into_iter().map(|(_, table)| table));
     }
@@ -430,21 +456,21 @@ impl Snapshots {
     }
 
     fn take_outside(&mut self, world: &mut World) -> usize {
-        let base = world.arena().base();
-
-        // The arena's pages that hold anything: every page a live range
+        // Each zone's pages that hold anything: every page a live range
         // touches. A page wholly inside a hole holds nothing.
-        let mut arena = self.table(0);
-        world.arena().live(|offset, len| {
-            if len == 0 {
-                return;
-            }
-            let (first, last) = (offset / PAGE, (offset + len - 1) / PAGE);
-            if arena.len() <= last {
-                arena.resize(last + 1, std::ptr::null());
-            }
-            arena[first..=last].fill(PENDING);
-        });
+        let mut arena: [Table; world::ZONES] = std::array::from_fn(|_| self.table(0));
+        for (zone, table) in arena.iter_mut().enumerate() {
+            world.arena().live(zone, |offset, len| {
+                if len == 0 {
+                    return;
+                }
+                let (first, last) = (offset / PAGE, (offset + len - 1) / PAGE);
+                if table.len() <= last {
+                    table.resize(last + 1, std::ptr::null());
+                }
+                table[first..=last].fill(PENDING);
+            });
+        }
 
         let live_stacks: Vec<(usize, usize)> = world.inner().scheduler.stacks().collect();
         let mut stacks = Vec::with_capacity(live_stacks.len());
@@ -468,13 +494,16 @@ impl Snapshots {
         // committed, and nothing runs. The parent's pages are the pool's
         // until it is recycled, which is after this snapshot is.
         unsafe {
-            copied += capture(
-                &mut arena,
-                parent.map(|parent| &parent.arena),
-                |i| base.add(i * PAGE).cast(),
-                &mut self.pool,
-                &mut own,
-            );
+            for (zone, table) in arena.iter_mut().enumerate() {
+                let base = world.arena().zone_base(zone);
+                copied += capture(
+                    table,
+                    parent.map(|parent| &parent.arena[zone]),
+                    |i| base.add(i * PAGE).cast(),
+                    &mut self.pool,
+                    &mut own,
+                );
+            }
             for (top, table) in &mut stacks {
                 let top = *top;
                 let parent = parent.and_then(|parent| {
@@ -496,6 +525,7 @@ impl Snapshots {
 
         let image = arena
             .iter()
+            .flatten()
             .chain(stacks.iter().flat_map(|(_, t)| t))
             .filter(|p| !p.is_null())
             .count();
@@ -521,7 +551,7 @@ impl Snapshots {
             .expect("[loom internal bug] nothing to restore");
         snapshot.uses += 1;
         let snapshot = &*snapshot;
-        let base = world.arena().base();
+        let bases: [*mut u8; world::ZONES] = std::array::from_fn(|zone| world.arena().zone_base(zone));
         let execution: *mut Execution = &mut world.inner().execution;
 
         let mut synced = 0;
@@ -535,10 +565,12 @@ impl Snapshots {
             let path = std::ptr::read(&(*execution).path);
             let pruned = (*execution).pruned;
 
-            for (i, &page) in snapshot.arena.iter().enumerate() {
-                if !page.is_null() {
-                    written += sync(base.add(i * PAGE).cast(), page);
-                    synced += 1;
+            for (table, base) in snapshot.arena.iter().zip(bases) {
+                for (i, &page) in table.iter().enumerate() {
+                    if !page.is_null() {
+                        written += sync(base.add(i * PAGE).cast(), page);
+                        synced += 1;
+                    }
                 }
             }
             for (top, table) in &snapshot.stacks {
@@ -571,16 +603,18 @@ impl Snapshots {
 
 /// The world's live ranges and live stacks, copied byte for byte.
 fn dense(world: &World, stacks: &[(usize, usize)]) -> Vec<(usize, Vec<u8>)> {
-    let base = world.arena().base();
     let mut ranges = Vec::new();
-    // SAFETY: as `take`'s.
-    world.arena().live(|offset, len| {
-        let at = base as usize + offset;
-        ranges.push((
-            at,
-            unsafe { std::slice::from_raw_parts(at as *const u8, len) }.to_vec(),
-        ));
-    });
+    for zone in 0..world::ZONES {
+        let base = world.arena().zone_base(zone);
+        // SAFETY: as `take`'s.
+        world.arena().live(zone, |offset, len| {
+            let at = base as usize + offset;
+            ranges.push((
+                at,
+                unsafe { std::slice::from_raw_parts(at as *const u8, len) }.to_vec(),
+            ));
+        });
+    }
     for &(low, top) in stacks {
         ranges.push((
             low,

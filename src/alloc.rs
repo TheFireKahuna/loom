@@ -120,7 +120,12 @@ impl<T> Track<T> {
 /// A model under it must not leave state it created reachable from outside
 /// the model — a process-wide registry, a lazily built `static`, a
 /// thread-local of the OS thread — because a restore rewinds the memory such
-/// state points into. Freeing that memory from another thread aborts.
+/// state points into. A block the code under test allocated that is still
+/// live when its execution ends fails the check there, naming this rule;
+/// state that must outlive executions is built inside [`outside`]. State that
+/// allocates nothing (a `static` atomic, a fixed-size thread-local) is not
+/// rewound either, so it must not carry anything from one execution into
+/// the next. Freeing model memory from another thread aborts.
 #[derive(Debug, Default)]
 pub struct Model<A>(pub A);
 
