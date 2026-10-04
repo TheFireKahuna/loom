@@ -52,7 +52,7 @@ pub(crate) fn available() -> bool {
     *AVAILABLE.get_or_init(|| {
         // Any allocation outside a world marks the allocator as installed.
         drop(std::hint::black_box(Box::new(0u64)));
-        cfg!(all(windows, target_arch = "x86_64"))
+        cfg!(all(windows, any(target_arch = "x86_64", target_arch = "aarch64")))
             && world::INSTALLED.load(std::sync::atomic::Ordering::Relaxed)
     })
 }

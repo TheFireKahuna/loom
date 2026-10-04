@@ -570,7 +570,18 @@ fn stack_top() -> usize {
     top
 }
 
-#[cfg(not(all(windows, target_arch = "x86_64")))]
+/// The top of the running stack: on a coroutine, its own (the generator
+/// switches the TEB's stack bounds with the registers).
+#[cfg(all(windows, target_arch = "aarch64"))]
+fn stack_top() -> usize {
+    let top: usize;
+    // SAFETY: reads `NT_TIB::StackBase` of the current thread's TEB, which
+    // `x18` addresses on AArch64 Windows.
+    unsafe { std::arch::asm!("ldr {}, [x18, #0x08]", out(reg) top, options(nostack, readonly, preserves_flags)) };
+    top
+}
+
+#[cfg(not(all(windows, any(target_arch = "x86_64", target_arch = "aarch64"))))]
 fn stack_top() -> usize {
     0
 }
